@@ -1,0 +1,109 @@
+# RustLakeDB High-Availability 3-Coordinator Raft Quorum + Dynamic Self-Registering Workers
+# Usage: docker compose -f docker/docker-compose.ha.yml up -d
+services:
+  coord-1:
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-ha-coord-1
+    command:
+      - "--mode"
+      - "coordinator"
+      - "--pg-addr"
+      - "0.0.0.0:5432"
+      - "--rest-addr"
+      - "0.0.0.0:8181"
+      - "--data-dir"
+      - "/warehouse"
+      - "--raft-node-id"
+      - "1"
+      - "--raft-bind"
+      - "0.0.0.0:9001"
+      - "--raft-peers"
+      - "1=http://coord-1:9001,2=http://coord-2:9002,3=http://coord-3:9003"
+    ports:
+      - "15433:5432"
+      - "18182:8181"
+    volumes:
+      - ha_warehouse:/warehouse
+
+  coord-2:
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-ha-coord-2
+    command:
+      - "--mode"
+      - "coordinator"
+      - "--pg-addr"
+      - "0.0.0.0:5432"
+      - "--rest-addr"
+      - "0.0.0.0:8181"
+      - "--data-dir"
+      - "/warehouse"
+      - "--raft-node-id"
+      - "2"
+      - "--raft-bind"
+      - "0.0.0.0:9002"
+      - "--raft-peers"
+      - "1=http://coord-1:9001,2=http://coord-2:9002,3=http://coord-3:9003"
+    volumes:
+      - ha_warehouse:/warehouse
+
+  coord-3:
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-ha-coord-3
+    command:
+      - "--mode"
+      - "coordinator"
+      - "--pg-addr"
+      - "0.0.0.0:5432"
+      - "--rest-addr"
+      - "0.0.0.0:8181"
+      - "--data-dir"
+      - "/warehouse"
+      - "--raft-node-id"
+      - "3"
+      - "--raft-bind"
+      - "0.0.0.0:9003"
+      - "--raft-peers"
+      - "1=http://coord-1:9001,2=http://coord-2:9002,3=http://coord-3:9003"
+    volumes:
+      - ha_warehouse:/warehouse
+
+  worker-auto-1:
+    image: rustlakedb:1.0.0
+    depends_on: [coord-1]
+    command:
+      - "--mode"
+      - "worker"
+      - "--worker-id"
+      - "worker-auto-1"
+      - "--bind"
+      - "0.0.0.0:7001"
+      - "--advertise-url"
+      - "http://worker-auto-1:7001"
+      - "--coordinator-url"
+      - "http://coord-1:8181"
+      - "--data-dir"
+      - "/warehouse"
+    volumes:
+      - ha_warehouse:/warehouse
+
+  worker-auto-2:
+    image: rustlakedb:1.0.0
+    depends_on: [coord-1]
+    command:
+      - "--mode"
+      - "worker"
+      - "--worker-id"
+      - "worker-auto-2"
+      - "--bind"
+      - "0.0.0.0:7002"
+      - "--advertise-url"
+      - "http://worker-auto-2:7002"
+      - "--coordinator-url"
+      - "http://coord-1:8181"
+      - "--data-dir"
+      - "/warehouse"
+    volumes:
+      - ha_warehouse:/warehouse
+
+volumes:
+  ha_warehouse:

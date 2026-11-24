@@ -1,0 +1,38 @@
+name: RustLakeDB CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: Clippy + Full Regression Suite (Waves 1-10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Strict Clippy Check (-D warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build CLI binary
+        run: cargo build --bin rustlakedb
+      - name: Run Full Automated Regression Suite (55+ tests)
+        run: cargo test --workspace
+      - name: Verify Cloud Object-Store Feature Flag (S3/GCS/Azure)
+        run: cargo check -p rustlakedb-storage --features cloud
+
+  docker-build:
+    name: Multi-Stage Docker Image Build
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build RustLakeDB v2.0.0 Docker Image
+        run: docker build -t rustlakedb:2.0.0 .

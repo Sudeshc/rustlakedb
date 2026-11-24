@@ -1,0 +1,33 @@
+image:
+  repository: rustlakedb
+  tag: "2.0.0"
+  pullPolicy: IfNotPresent
+
+warehouse:
+  uri: "s3://rustlakedb-warehouse"
+  awsEndpointUrl: ""
+  awsRegion: "us-east-1"
+
+coordinator:
+  replicas: 1
+  pgPort: 5432
+  controlPlanePort: 8181
+  resources:
+    requests:
+      cpu: "1000m"
+      memory: "1Gi"
+
+workers:
+  replicas: 3
+  minReplicas: 2
+  maxReplicas: 32
+  targetCpuUtilizationPercentage: 70
+  rpcPort: 7001
+  spotTolerations: true
+  resources:
+    requests:
+      cpu: "2000m"
+      memory: "4Gi"
+
+maintainer:
+  enabled: true

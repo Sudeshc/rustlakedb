@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustlakedb-common",
+    "crates/rustlakedb-protocol",
+    "crates/rustlakedb-catalog",
+    "crates/rustlakedb-storage",
+    "crates/rustlakedb-shuffle",
+    "crates/rustlakedb-planner",
+    "crates/rustlakedb-worker",
+    "crates/rustlakedb-coordinator",
+    "crates/rustlakedb-gateway",
+    "crates/rustlakedb-cli",
+    "crates/rustlakedb-testkit",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+arrow-array = "54"
+arrow-ipc = "54"
+arrow-schema = "54"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+object_store = "0.11"
+parking_lot = "0.12"
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+ring = "0.17"
+roaring = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlparser = "0.53"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"

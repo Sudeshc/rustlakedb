@@ -1,0 +1,5 @@
+target/
+.git/
+rustlakedb_data/
+.tmp_demo_data/
+*.shuffle

@@ -1,0 +1,27 @@
+[package]
+name = "rustlakedb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustlakedb"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+reqwest.workspace = true
+rustlakedb-catalog = { path = "../rustlakedb-catalog" }
+rustlakedb-common = { path = "../rustlakedb-common" }
+rustlakedb-coordinator = { path = "../rustlakedb-coordinator" }
+rustlakedb-gateway = { path = "../rustlakedb-gateway" }
+rustlakedb-planner = { path = "../rustlakedb-planner" }
+rustlakedb-protocol = { path = "../rustlakedb-protocol" }
+rustlakedb-shuffle = { path = "../rustlakedb-shuffle" }
+rustlakedb-storage = { path = "../rustlakedb-storage" }
+rustlakedb-worker = { path = "../rustlakedb-worker" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

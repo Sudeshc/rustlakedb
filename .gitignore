@@ -1,0 +1,6 @@
+/target
+rustlakedb_data/
+.tmp_demo_data/
+*.shuffle
+.DS_Store
+Thumbs.db

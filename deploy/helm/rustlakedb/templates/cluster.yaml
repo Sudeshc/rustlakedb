@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustlakedb-workers
+  labels:
+    app: rustlakedb-worker
+spec:
+  clusterIP: None
+  selector:
+    app: rustlakedb-worker
+  ports:
+    - name: rpc
+      port: {{ .Values.workers.rpcPort }}
+      targetPort: {{ .Values.workers.rpcPort }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rustlakedb-worker
+spec:
+  serviceName: rustlakedb-workers
+  replicas: {{ .Values.workers.replicas }}
+  selector:
+    matchLabels:
+      app: rustlakedb-worker
+  template:
+    metadata:
+      labels:
+        app: rustlakedb-worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args:
+            - "--mode"
+            - "worker"
+            - "--worker-id"
+            - "$(POD_NAME)"
+            - "--bind"
+            - "0.0.0.0:{{ .Values.workers.rpcPort }}"
+            - "--advertise-url"
+            - "http://$(POD_NAME).rustlakedb-workers:{{ .Values.workers.rpcPort }}"
+            - "--data-dir"
+            - "{{ .Values.warehouse.uri }}"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: {{ .Values.workers.rpcPort }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.workers.rpcPort }}
+            periodSeconds: 5
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rustlakedb-worker-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: rustlakedb-worker
+  minReplicas: {{ .Values.workers.minReplicas }}
+  maxReplicas: {{ .Values.workers.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.workers.targetCpuUtilizationPercentage }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustlakedb-coordinator
+spec:
+  replicas: {{ .Values.coordinator.replicas }}
+  selector:
+    matchLabels:
+      app: rustlakedb-coordinator
+  template:
+    metadata:
+      labels:
+        app: rustlakedb-coordinator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "{{ .Values.coordinator.controlPlanePort }}"
+    spec:
+      containers:
+        - name: coordinator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args:
+            - "--mode"
+            - "coordinator"
+            - "--pg-addr"
+            - "0.0.0.0:{{ .Values.coordinator.pgPort }}"
+            - "--rest-addr"
+            - "0.0.0.0:{{ .Values.coordinator.controlPlanePort }}"
+            - "--data-dir"
+            - "{{ .Values.warehouse.uri }}"
+            - "--worker-urls"
+            - "http://rustlakedb-worker-0.rustlakedb-workers:{{ .Values.workers.rpcPort }},http://rustlakedb-worker-1.rustlakedb-workers:{{ .Values.workers.rpcPort }},http://rustlakedb-worker-2.rustlakedb-workers:{{ .Values.workers.rpcPort }}"
+          ports:
+            - name: pgwire
+              containerPort: {{ .Values.coordinator.pgPort }}
+            - name: control-plane
+              containerPort: {{ .Values.coordinator.controlPlanePort }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustlakedb-coordinator
+spec:
+  selector:
+    app: rustlakedb-coordinator
+  ports:
+    - name: pgwire
+      port: {{ .Values.coordinator.pgPort }}
+      targetPort: {{ .Values.coordinator.pgPort }}
+    - name: control-plane
+      port: {{ .Values.coordinator.controlPlanePort }}
+      targetPort: {{ .Values.coordinator.controlPlanePort }}

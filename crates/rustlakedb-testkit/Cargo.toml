@@ -1,0 +1,29 @@
+[package]
+name = "rustlakedb-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow-ipc.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+roaring.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
+rustlakedb-catalog = { path = "../rustlakedb-catalog" }
+rustlakedb-common = { path = "../rustlakedb-common" }
+rustlakedb-coordinator = { path = "../rustlakedb-coordinator" }
+rustlakedb-gateway = { path = "../rustlakedb-gateway" }
+rustlakedb-planner = { path = "../rustlakedb-planner" }
+rustlakedb-protocol = { path = "../rustlakedb-protocol" }
+rustlakedb-shuffle = { path = "../rustlakedb-shuffle" }
+rustlakedb-storage = { path = "../rustlakedb-storage" }
+rustlakedb-worker = { path = "../rustlakedb-worker" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true

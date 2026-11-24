@@ -1,0 +1,183 @@
+# RustLakeDB v1.0.0 Full Multi-Container Distributed Test Bench
+# Spins up:
+#   - 3 independent RustLakeDB Worker containers (private shuffle dirs, HTTP Zstd shuffle)
+#   - 1 RustLakeDB Coordinator container (PostgreSQL v3 on :5432 + Iceberg v3 REST Catalog on :8181)
+#   - 1 RustLakeDB Autonomous Maintainer container
+#   - MinIO S3-compatible object store (:9000 API, :9001 Console)
+#   - Official PostgreSQL 16 `psql` client container (profile: client)
+
+services:
+  worker-1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-bench-worker-1
+    command:
+      - --mode
+      - worker
+      - --worker-id
+      - worker-1
+      - --bind
+      - 0.0.0.0:7001
+      - --advertise-url
+      - http://worker-1:7001
+      - --data-dir
+      - /warehouse
+      - --shuffle-dir
+      - /tmp/shuffle-w1
+    volumes:
+      - warehouse_data:/warehouse
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:7001/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  worker-2:
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-bench-worker-2
+    depends_on:
+      - worker-1
+    command:
+      - --mode
+      - worker
+      - --worker-id
+      - worker-2
+      - --bind
+      - 0.0.0.0:7002
+      - --advertise-url
+      - http://worker-2:7002
+      - --data-dir
+      - /warehouse
+      - --shuffle-dir
+      - /tmp/shuffle-w2
+    volumes:
+      - warehouse_data:/warehouse
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:7002/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  worker-3:
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-bench-worker-3
+    depends_on:
+      - worker-1
+    command:
+      - --mode
+      - worker
+      - --worker-id
+      - worker-3
+      - --bind
+      - 0.0.0.0:7003
+      - --advertise-url
+      - http://worker-3:7003
+      - --data-dir
+      - /warehouse
+      - --shuffle-dir
+      - /tmp/shuffle-w3
+    volumes:
+      - warehouse_data:/warehouse
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:7003/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  coordinator:
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-bench-coordinator
+    depends_on:
+      worker-1:
+        condition: service_healthy
+      worker-2:
+        condition: service_healthy
+      worker-3:
+        condition: service_healthy
+    command:
+      - --mode
+      - coordinator
+      - --workers
+      - "3"
+      - --worker-urls
+      - http://worker-1:7001,http://worker-2:7002,http://worker-3:7003
+      - --pg-addr
+      - 0.0.0.0:5432
+      - --rest-addr
+      - 0.0.0.0:8181
+      - --data-dir
+      - /warehouse
+    ports:
+      - "15432:5432"
+      - "18181:8181"
+    volumes:
+      - warehouse_data:/warehouse
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8181/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  maintainer:
+    image: rustlakedb:1.0.0
+    container_name: rustlakedb-bench-maintainer
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    command:
+      - --mode
+      - maintainer
+      - --data-dir
+      - /warehouse
+    volumes:
+      - warehouse_data:/warehouse
+
+  minio:
+    image: quay.io/minio/minio:latest
+    profiles: ["s3"]
+    container_name: rustlakedb-bench-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: rustlakedb
+      MINIO_ROOT_PASSWORD: rustlakedb_dev_password
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 2s
+      retries: 15
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    profiles: ["s3"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 rustlakedb rustlakedb_dev_password;
+      mc mb -p local/rustlakedb-warehouse || true;
+      echo 'MinIO warehouse bucket ready';
+      "
+
+  psql:
+    image: postgres:16-alpine
+    profiles: ["client"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      PGHOST: coordinator
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGDATABASE: rustlakedb
+    volumes:
+      - ./live_bench.sql:/bench/live_bench.sql:ro
+    entrypoint: ["psql"]
+
+volumes:
+  warehouse_data:
