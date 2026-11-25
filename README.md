@@ -2,7 +2,7 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-100%25-orange.svg)](Cargo.toml)
-[![Version](https://img.shields.io/badge/Version-7.0.0-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-8.0.0-brightgreen.svg)](CHANGELOG.md)
 
 **RustLakeDB** is a 100% Rust, cloud-agnostic, distributed SQL and lakehouse database engine built natively over **Apache Iceberg v3** (Zstd Parquet, Shredded `VARIANT` JSON, Puffin Secondary Indexes, Roaring Bitmap Deletion Vectors, and Apache Avro OCF Manifests).
 
@@ -10,13 +10,13 @@ It speaks the **PostgreSQL v3 Wire Protocol** (DBeaver, `psql`, JDBC, BI) over *
 
 ---
 
-## Key Capabilities (`v7.0.0`)
+## Key Capabilities (`v8.0.0`)
 
-- **Native Arrow Columnar Engine (`27M rows/s`), DPP & Full Arrow Flight SQL:** Parallel Spark-style DAG scheduler with Adaptive Query Execution (AQE), Rendezvous split placement, speculative hedging, cooperative in-flight cancellation, Binary Arrow IPC Zstd shuffle (`ARW1`), **Zero-Copy Arrow Field-ID Aliasing (`18.9×` faster post-evolution scans)**, **Fused Arrow `BooleanArray` Filter + HashAggregate (`7.3×` faster filtered aggregations)**, **Dynamic Partition Pruning (DPP)** on star-schema joins, **Full Apache Arrow Flight SQL (`:8815`, live `adbc-driver-flightsql` verified)**, memory-bounded NVMe spilling (External Merge Sort & Grace Hash Join), and real **`ANALYZE TABLE`** column statistics fed into the CBO.
-- **Bi-Directional Iceberg v3 REST Catalog (Live `PyIceberg` `scan().to_arrow()` Verified), Schema Enforcement & Time Travel:** Strict write-time **`NOT NULL` (`23502`), `DEFAULT`, and `CHECK (...)` (`23514`)** schema enforcement, **zero-rewrite Field-ID `RENAME COLUMN`, `DROP COLUMN`, `ADD COLUMN [DEFAULT]`, and type widening**, **Timestamp & Snapshot Time Travel (`FOR SYSTEM_TIME AS OF TIMESTAMP '...'`)**, atomic **`RESTORE TABLE ... TO VERSION`** rollback, `SHOW SNAPSHOTS`, `PARQUET:field_id` + full-URI Iceberg v3 Avro OCF manifests (**live `pyiceberg` `table.scan().to_arrow()` verified**), and live **`s3://` (RustFS / AWS S3)** `COPY TO`/`COPY FROM` (`Parquet`, `CSV`, `JSON`).
-- **Centralized Governance, Multi-Node Raft HA (Zero-Downtime Rolling-Upgrade Verified) & Enterprise Security:** Built-in persistent Raft HA quorum with automatic log compaction, split-brain leader fencing, **zero-downtime 3-node rolling-upgrade failover**, **Catalog Tagging (`ALTER TABLE ... SET TAG`, `SHOW TAGS`)**, **Automatic Data Lineage (`system.lineage`)**, virtual governance tables (`system.tables`, `system.snapshots`, `system.tags`, `system.lineage`, `system.audit_log`, `system.query_history`) + `/v1/governance/*` REST APIs, **RBAC + RLS + Dynamic Column/JSON-Path Masking**, **Cluster mTLS**, **live OIDC/JWKS (`RS256`) poller**, and real **AWS STS `AssumeRole` SigV4** credential vending.
-- **Full 22-Query Analytical SQL, `psycopg3`/`dbt` PGWire & Live Redpanda CDC:** Full 22-query analytical decision-support SQL, **Predicate Pushdown Through Joins + Dependency-Aware Multi-Table CBO Join Reordering**, live **`psycopg3` / `dbt-postgres`** PGWire compatibility, and **pure-Rust Kafka/Redpanda RecordBatch v2 (`magic=2`, uncompressed/Snappy/Zstd, verified live against `redpandadata/redpanda`)** CDC consumer.
-- **Turnkey Pure-Rust Production Stack & Multi-Arch Releases:** One-command **`docker/docker-compose.prod.yml`** launching **RustFS S3 + Distributed RustLakeDB + Prometheus (with alerts) + Grafana (auto-provisioned dashboard)**, Kubernetes Helm Chart `v7.0.0` (`autoscaling/v2` HPA), **`dbt-postgres` Quickstart** ([examples/dbt_quickstart/](examples/dbt_quickstart/)), **Production Playbook** ([docs/PRODUCTION_DEPLOYMENT.md](docs/PRODUCTION_DEPLOYMENT.md)), and automated multi-arch GitHub Releases (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `windows-x86_64`) + multi-arch GHCR images (`ghcr.io/sudeshc/rustlakedb`).
+- **End-to-End Arrow Columnar Pipeline (`27M rows/s`), Zero-`RowBatch` Shuffle & Full Arrow Flight SQL:** Parallel Spark-style DAG scheduler with Adaptive Query Execution (AQE), Rendezvous split placement, speculative hedging, cooperative in-flight cancellation, **Zero-`RowBatch` Arrow IPC Zstd Shuffle (`ARW1`) feeding Columnar `HashJoin` & `Sort`**, **Zero-Copy Arrow Field-ID Aliasing (`18.9×` faster post-evolution scans)**, **Fused Arrow `BooleanArray` Filter + HashAggregate (`7.3×` faster filtered aggregations)**, **Dynamic Partition Pruning (DPP)**, **Full Apache Arrow Flight SQL (`:8815`, live `adbc-driver-flightsql` verified)**, NVMe spilling, and **`ANALYZE TABLE`** CBO statistics.
+- **Bi-Directional Iceberg v3 REST Catalog (Live `PyIceberg` `scan().to_arrow()` Verified), Partition OCC, Equality Deletes & Time Travel:** Strict write-time **`NOT NULL` (`23502`), `DEFAULT`, and `CHECK (...)` (`23514`)** enforcement, **Partition-Level Disjoint OCC** allowing concurrent writers on non-overlapping partitions, **Native Iceberg v3 Equality Delete Parquet files** for zero-read streaming CDC upserts/deletes, zero-rewrite Field-ID `RENAME`/`DROP`/`ADD`/widening, **Timestamp & Snapshot Time Travel + Atomic `RESTORE TABLE`**, `PARQUET:field_id` + full-URI Iceberg v3 Avro OCF manifests, and live **`s3://` (RustFS / AWS S3)** `COPY TO`/`COPY FROM`.
+- **Raft-Replicated Crash-Safe Governance & Enterprise Security:** Built-in persistent **Multi-Node Raft HA Quorum** replicating **tables, snapshots, tags, RBAC roles/grants, RLS policies, Dynamic Column/JSON Masking, and automatic Data Lineage (`system.lineage`)** across Coordinator restarts and 3-node HA failovers (`zero-downtime rolling upgrades verified`), virtual `system.*` tables + `/v1/governance/*` APIs, **Cluster mTLS**, **live OIDC/JWKS (`RS256`) poller**, and real **AWS STS `AssumeRole` SigV4** credential vending.
+- **Full 22-Query Analytical SQL, Window Frames, `QUALIFY`, `UNNEST` & Binary PGWire `Bind`:** Full 22-query analytical decision-support SQL, **`ROWS BETWEEN` sliding window frames**, **`QUALIFY`** post-window filtering, **`UNNEST(ARRAY[...])` & `JSONB_ARRAY_ELEMENTS(...)`**, **`EXPLAIN (FORMAT JSON)`**, full **PGWire Extended Query Protocol binary + text `$1`/`$2` parameter binding** (`psycopg3`/`dbt`/DBeaver/SQLAlchemy), and **live Redpanda RecordBatch v2 Snappy/Zstd CDC**.
+- **Supply-Chain Verified Multi-Arch Releases, OCI Helm & Pure-Rust Prod Stack:** One-command **`docker/docker-compose.prod.yml`** (**RustFS S3 + RustLakeDB + Prometheus + Grafana**), **SPDX 2.3 SBOM** attached to every release, **OCI Helm Chart (`oci://ghcr.io/sudeshc/charts/rustlakedb`)**, reproducible benchmark harness ([scripts/run-tpch-bench.ps1](scripts/run-tpch-bench.ps1), [docs/BENCHMARKS.md](docs/BENCHMARKS.md)), and automated multi-arch GitHub Releases + GHCR containers (`linux/amd64` + `linux/arm64`).
 
 ---
 
@@ -73,10 +73,10 @@ cargo run --bin rustlakedb -- --mode gateway --workers 3 --pg-addr 127.0.0.1:543
 docker compose -p rustlakedb-ha -f docker/docker-compose.ha.yml up -d
 ```
 
-### Automated Test Suite (90 Tests Across Waves 1–28, Full 22-Query Analytics & Rolling Chaos)
+### Automated Test Suite (99+ Tests Across Waves 1–33, Full 22-Query Analytics & Rolling Chaos)
 
 ```powershell
-# Run strict Clippy + all 90 regression tests
+# Run strict Clippy + all 99+ regression tests
 cargo clippy --all-targets -- -D warnings
 .\scripts\run-tests.ps1
 ```

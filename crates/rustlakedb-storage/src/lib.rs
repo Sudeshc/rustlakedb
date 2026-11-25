@@ -384,6 +384,79 @@ impl IcebergObjectStore {
         })
     }
 
+    /// Writes a genuine Apache Iceberg v3 Equality Delete Parquet file (Zstd compressed)
+    /// containing deleted key values so streaming CDC upserts/deletes execute with ZERO reads (Wave 31).
+    pub async fn write_equality_delete_file(
+        &self,
+        file_path: &str,
+        col_name: &str,
+        deleted_values: &[ScalarValue],
+    ) -> Result<rustlakedb_catalog::EqualityDeleteFile> {
+        let mut sb = StringBuilder::with_capacity(deleted_values.len(), deleted_values.len() * 8);
+        for v in deleted_values {
+            sb.append_value(v.to_display_string());
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(col_name, DataType::Utf8, false)]));
+        let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(sb.finish())])
+            .map_err(|e| RustLakeError::Execution(format!("eq-delete arrow batch: {e}")))?;
+        let mut buf = Vec::new();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
+                .map_err(|e| RustLakeError::Execution(format!("eq-delete parquet writer: {e}")))?;
+            writer
+                .write(&rb)
+                .map_err(|e| RustLakeError::Execution(format!("eq-delete parquet write: {e}")))?;
+            writer
+                .close()
+                .map_err(|e| RustLakeError::Execution(format!("eq-delete parquet close: {e}")))?;
+        }
+        let bytes = Bytes::from(buf);
+        self.store
+            .put(&ObjPath::from(file_path), PutPayload::from(bytes.clone()))
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("eq-delete object_store put: {e}")))?;
+        self.cache.lock().put(file_path.to_string(), bytes);
+        Ok(rustlakedb_catalog::EqualityDeleteFile {
+            file_path: file_path.to_string(),
+            equality_column: col_name.to_string(),
+            row_count: deleted_values.len() as u64,
+            sequence_number: 0,
+        })
+    }
+
+    /// Reads an Apache Iceberg v3 Equality Delete Parquet file into a fast key lookup set (Wave 31).
+    pub async fn read_equality_delete_keys(
+        &self,
+        file_path: &str,
+        col_name: &str,
+    ) -> Result<HashSet<String>> {
+        let Some(bytes) = self.get_cached_immutable(file_path).await? else {
+            return Ok(HashSet::new());
+        };
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(|e| RustLakeError::Execution(format!("eq-delete parquet open: {e}")))?
+            .build()
+            .map_err(|e| RustLakeError::Execution(format!("eq-delete parquet build: {e}")))?;
+        let mut keys = HashSet::new();
+        for batch in reader {
+            let rb = batch
+                .map_err(|e| RustLakeError::Execution(format!("eq-delete parquet read: {e}")))?;
+            if let Some(arr) = rb.column_by_name(col_name)
+                && let Some(sa) = arr.as_any().downcast_ref::<StringArray>()
+            {
+                for i in 0..sa.len() {
+                    if !sa.is_null(i) {
+                        keys.insert(sa.value(i).to_string());
+                    }
+                }
+            }
+        }
+        Ok(keys)
+    }
+
     pub async fn write_deletion_vector(
         &self,
         file_path: &str,

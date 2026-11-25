@@ -59,6 +59,7 @@ pub enum PlannedCommand {
     Query(StageDag),
     Explain(StageDag),
     ExplainAnalyze(StageDag),
+    ExplainJson(StageDag),
     CreateTable {
         table_name: String,
         schema: Vec<FieldSchema>,
@@ -550,7 +551,10 @@ impl DistributedPlanner {
                 )))
             }
             Statement::Explain {
-                analyze, statement, ..
+                analyze,
+                format,
+                statement,
+                ..
             } => match *statement {
                 Statement::Query(query) => {
                     let (raw, cbo_notes) = self
@@ -559,7 +563,11 @@ impl DistributedPlanner {
                     let pruned = push_projections_to_scans(raw, None);
                     let dist = self.ensure_requirements(pruned);
                     let dag = self.cut_stages(QueryId::new(), dist, cbo_notes);
-                    if analyze {
+                    if matches!(format, Some(sqlparser::ast::AnalyzeFormat::JSON))
+                        || (upper.starts_with("EXPLAIN") && upper.contains("FORMAT JSON"))
+                    {
+                        Ok(PlannedCommand::ExplainJson(dag))
+                    } else if analyze {
                         Ok(PlannedCommand::ExplainAnalyze(dag))
                     } else {
                         Ok(PlannedCommand::Explain(dag))
@@ -1470,6 +1478,13 @@ impl DistributedPlanner {
                     node = PhysicalNode::Window {
                         input: Box::new(node),
                         specs: windows,
+                    };
+                }
+                if let Some(qualify_expr) = select.qualify {
+                    let pred = parse_filter_expr(&qualify_expr)?;
+                    node = PhysicalNode::Filter {
+                        input: Box::new(node),
+                        predicate: pred,
                     };
                 }
                 let computed_aliases: HashSet<String> = projected_exprs
@@ -3698,11 +3713,44 @@ fn try_parse_window(expr: &Expr, alias: Option<String>) -> Result<Option<WindowS
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let (frame_preceding, frame_following) = if let Some(ref wf_frame) = ws.window_frame {
+        let parse_bound = |b: &sqlparser::ast::WindowFrameBound, is_start: bool| -> Option<i64> {
+            match b {
+                sqlparser::ast::WindowFrameBound::CurrentRow => Some(0),
+                sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
+                    parse_scalar(expr).ok().and_then(|s| s.as_f64()).map(|v| {
+                        let n = v as i64;
+                        if is_start { n } else { -n }
+                    })
+                }
+                sqlparser::ast::WindowFrameBound::Preceding(None) => None,
+                sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+                    parse_scalar(expr).ok().and_then(|s| s.as_f64()).map(|v| {
+                        let n = v as i64;
+                        if is_start { -n } else { n }
+                    })
+                }
+                sqlparser::ast::WindowFrameBound::Following(None) => None,
+            }
+        };
+        let start_p = parse_bound(&wf_frame.start_bound, true);
+        let end_f = wf_frame
+            .end_bound
+            .as_ref()
+            .map(|eb| parse_bound(eb, false))
+            .unwrap_or(Some(0));
+        (start_p, end_f)
+    } else {
+        (None, None)
+    };
+
     Ok(Some(WindowSpec {
         func: wf,
         partition_by,
         order_by,
         alias: alias.unwrap_or_else(|| name.to_lowercase()),
+        frame_preceding,
+        frame_following,
     }))
 }
 

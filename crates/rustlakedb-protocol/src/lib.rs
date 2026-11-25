@@ -395,6 +395,12 @@ pub struct WindowSpec {
     pub partition_by: Vec<String>,
     pub order_by: Vec<SortKey>,
     pub alias: String,
+    /// Optional sliding window frame lower bound (`Some(n)` = `n PRECEDING`, `Some(0)` = `CURRENT ROW`, `None` = `UNBOUNDED PRECEDING`, Wave 32).
+    #[serde(default)]
+    pub frame_preceding: Option<i64>,
+    /// Optional sliding window frame upper bound (`Some(n)` = `n FOLLOWING`, `Some(0)` = `CURRENT ROW`, `None` = `UNBOUNDED FOLLOWING`, Wave 32).
+    #[serde(default)]
+    pub frame_following: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

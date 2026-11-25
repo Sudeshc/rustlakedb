@@ -241,8 +241,8 @@ async fn handle_pg_stream<S: AsyncRead + AsyncWrite + Unpin>(
     write_ready_for_query(&mut handshake, b'I');
     stream.write_all(&handshake).await?;
 
-    // Session state for Extended Query Protocol (prepared statements, bound portals, error barrier).
-    let mut prepared_stmts: HashMap<String, String> = HashMap::new();
+    // Session state for Extended Query Protocol (prepared statements + OIDs, bound portals, error barrier).
+    let mut prepared_stmts: HashMap<String, (String, Vec<u32>)> = HashMap::new();
     let mut portals: HashMap<String, PortalState> = HashMap::new();
     let mut extended_error = false;
 
@@ -301,33 +301,57 @@ async fn handle_pg_stream<S: AsyncRead + AsyncWrite + Unpin>(
             b'P' => {
                 // Extended Query: Parse(stmt_name\0, query\0, int16 num_params, int32 param_oids[])
                 let (stmt_name, pos) = read_cstr(&body, 0);
-                let (sql, _) = read_cstr(&body, pos);
+                let (sql, mut pos) = read_cstr(&body, pos);
+                let num_oids = read_i16(&body, &mut pos).max(0) as usize;
+                let mut oids = Vec::with_capacity(num_oids);
+                for _ in 0..num_oids {
+                    oids.push(read_i32(&body, &mut pos) as u32);
+                }
                 tracing::debug!(stmt = %stmt_name, sql = %sql, "pgwire parse");
-                prepared_stmts.insert(stmt_name, sql);
+                prepared_stmts.insert(stmt_name, (sql, oids));
                 out.put_u8(b'1'); // ParseComplete
                 out.put_i32(4);
                 stream.write_all(&out).await?;
             }
             b'B' => {
                 // Extended Query: Bind(portal\0, stmt\0, format_codes, param_values, result_formats)
+                // Supports BOTH text (fmt=0) AND binary (fmt=1: int2/int4/int8/float4/float8/bool) PGWire params (Wave 32)!
                 let (portal_name, pos) = read_cstr(&body, 0);
                 let (stmt_name, mut pos) = read_cstr(&body, pos);
-                let num_pfmt = read_i16(&body, &mut pos) as usize;
-                pos += num_pfmt * 2;
-                let num_params = read_i16(&body, &mut pos) as usize;
+                let num_pfmt = read_i16(&body, &mut pos).max(0) as usize;
+                let mut pfmts = Vec::with_capacity(num_pfmt);
+                for _ in 0..num_pfmt {
+                    pfmts.push(read_i16(&body, &mut pos));
+                }
+                let num_params = read_i16(&body, &mut pos).max(0) as usize;
+                let stmt_oids = prepared_stmts
+                    .get(&stmt_name)
+                    .map(|(_, oids)| oids.as_slice())
+                    .unwrap_or(&[]);
                 let mut params: Vec<Option<String>> = Vec::with_capacity(num_params);
-                for _ in 0..num_params {
+                for i in 0..num_params {
                     let plen = read_i32(&body, &mut pos);
                     if plen < 0 {
                         params.push(None);
                     } else {
                         let plen = plen as usize;
-                        let val = String::from_utf8_lossy(&body[pos..pos + plen]).to_string();
+                        let raw = &body[pos..pos + plen];
                         pos += plen;
-                        params.push(Some(val));
+                        let fmt = if pfmts.len() == 1 {
+                            pfmts[0]
+                        } else {
+                            pfmts.get(i).copied().unwrap_or(0)
+                        };
+                        let oid = stmt_oids.get(i).copied().unwrap_or(0);
+                        let decoded = if fmt == 1 {
+                            decode_pg_binary_param(raw, oid)
+                        } else {
+                            String::from_utf8_lossy(raw).to_string()
+                        };
+                        params.push(Some(decoded));
                     }
                 }
-                if let Some(template) = prepared_stmts.get(&stmt_name) {
+                if let Some((template, _)) = prepared_stmts.get(&stmt_name) {
                     let bound_sql = substitute_params(template, &params);
                     portals.insert(
                         portal_name,
@@ -515,6 +539,22 @@ fn read_i32(buf: &[u8], pos: &mut usize) -> i32 {
     let v = i32::from_be_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]);
     *pos += 4;
     v
+}
+
+fn decode_pg_binary_param(raw: &[u8], oid: u32) -> String {
+    match (oid, raw.len()) {
+        (16, 1) => (raw[0] != 0).to_string(),
+        (21, 2) => i16::from_be_bytes([raw[0], raw[1]]).to_string(),
+        (23, 4) => i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]).to_string(),
+        (20, 8) => i64::from_be_bytes(raw.try_into().unwrap_or([0; 8])).to_string(),
+        (700, 4) => f32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]).to_string(),
+        (701, 8) => f64::from_be_bytes(raw.try_into().unwrap_or([0; 8])).to_string(),
+        // When client passes OID 0 (unspecified) with binary format, infer standard numeric widths
+        (0, 1) if raw[0] <= 1 => (raw[0] != 0).to_string(),
+        (0, 4) => i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]).to_string(),
+        (0, 8) => i64::from_be_bytes(raw.try_into().unwrap_or([0; 8])).to_string(),
+        _ => String::from_utf8_lossy(raw).to_string(),
+    }
 }
 
 fn substitute_params(template: &str, params: &[Option<String>]) -> String {

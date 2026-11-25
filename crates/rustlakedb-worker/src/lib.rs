@@ -41,6 +41,8 @@ pub struct WorkerNode {
     pub vectorized_rows_processed: AtomicU64,
     /// Parquet splits skipped before reading via Dynamic Partition Pruning / Semi-Join Min-Max pushdown (Wave 25).
     pub files_pruned_by_dpp: AtomicU64,
+    /// Arrow IPC shuffle blocks read directly as `RecordBatch` without `RowBatch` deserialization (Wave 30).
+    pub arrow_shuffle_batches_read: AtomicU64,
     /// Cooperatively cancelled query IDs checked between split/batch reads (Wave 22).
     pub cancelled_queries: std::sync::RwLock<HashSet<String>>,
 }
@@ -77,6 +79,7 @@ impl WorkerNode {
             tasks_executed: AtomicU64::new(0),
             vectorized_rows_processed: AtomicU64::new(0),
             files_pruned_by_dpp: AtomicU64::new(0),
+            arrow_shuffle_batches_read: AtomicU64::new(0),
             cancelled_queries: std::sync::RwLock::new(HashSet::new()),
         }
     }
@@ -200,6 +203,28 @@ impl WorkerNode {
                         .flat_map(|s| s.data_files.iter())
                         .map(|df| (df.file_path.as_str(), df))
                         .collect();
+                    // Wave 31: Compute each file's introduction sequence number (earliest snapshot_id)
+                    // and load any active Iceberg v3 Equality Delete files from the latest snapshot.
+                    let mut file_first_seq: HashMap<&str, u64> = HashMap::new();
+                    for (&sid, snap) in &meta.snapshots {
+                        for df in &snap.data_files {
+                            file_first_seq.entry(df.file_path.as_str()).or_insert(sid);
+                        }
+                    }
+                    let latest_eq_deletes: Vec<rustlakedb_catalog::EqualityDeleteFile> = meta
+                        .snapshots
+                        .values()
+                        .next_back()
+                        .map(|s| s.equality_deletes.clone())
+                        .unwrap_or_default();
+                    let mut loaded_eq_deletes: Vec<(u64, String, HashSet<String>)> = Vec::new();
+                    for eq in &latest_eq_deletes {
+                        let keys = self
+                            .store
+                            .read_equality_delete_keys(&eq.file_path, &eq.equality_column)
+                            .await?;
+                        loaded_eq_deletes.push((eq.sequence_number, eq.equality_column.clone(), keys));
+                    }
                     let mut out_rows = Vec::new();
 
                     for split in &task.assigned_splits {
@@ -255,6 +280,7 @@ impl WorkerNode {
                         // directly over Arrow RecordBatches and materialize ONLY matching rows!
                         if candidate_rows.is_none()
                             && meta.column_aliases.is_empty()
+                            && loaded_eq_deletes.is_empty()
                             && let Some(pred) = pushed_filter
                             && let Some(vec_rows) = self
                                 .try_eval_vectorized_filtered_scan(
@@ -288,7 +314,23 @@ impl WorkerNode {
                         if all_cols.is_empty() {
                             all_cols = file_batch.columns;
                         }
+                        let file_seq = file_first_seq
+                            .get(split.file_path.as_str())
+                            .copied()
+                            .unwrap_or(0);
                         for row in file_batch.rows {
+                            // Wave 31: Apply Apache Iceberg v3 Equality Deletes whose sequence_number > file_seq!
+                            let eq_deleted = loaded_eq_deletes.iter().any(|(eq_seq, eq_col, keys)| {
+                                *eq_seq > file_seq
+                                    && row
+                                        .get(eq_col)
+                                        .map(|v| keys.contains(&v.to_display_string()))
+                                        .unwrap_or(false)
+                            });
+                            if eq_deleted {
+                                self.store.rows_skipped_by_dv.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             if let Some(pred) = pushed_filter
                                 && !eval_filter(&row, pred) {
                                     continue;
@@ -359,6 +401,22 @@ impl WorkerNode {
                     Ok(RowBatch::new(batch.columns, out))
                 }
                 PhysicalNode::Sort { input, keys } => {
+                    // Wave 30 End-to-End Arrow Shuffle -> Columnar Sort fast path (zero intermediate RowBatch!).
+                    if let PhysicalNode::ShuffleRead {
+                        upstream_stage_id,
+                        output_partitioning,
+                        ..
+                    } = input.as_ref()
+                        && let Some(rb) = self
+                            .try_read_shuffle_arrow(*upstream_stage_id, output_partitioning, task)
+                            .await?
+                        && self.memory_pool.try_reserve(rb.get_array_memory_size()).is_ok()
+                        && let Ok(sorted_rb) = columnar::eval_columnar_sort(&rb, keys)
+                    {
+                        self.vectorized_rows_processed
+                            .fetch_add(sorted_rb.num_rows() as u64, Ordering::Relaxed);
+                        return Ok(rustlakedb_storage::record_batch_to_row_batch(&sorted_rb));
+                    }
                     let batch = self.eval_node(input, task).await?;
                     self.eval_sort_with_spill(batch, keys).await
                 }
@@ -502,6 +560,43 @@ impl WorkerNode {
                     join_type,
                     ..
                 } => {
+                    // Wave 30 End-to-End Arrow Shuffle -> Columnar HashJoin fast path (zero intermediate RowBatch!).
+                    if matches!(
+                        join_type,
+                        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+                    ) && let (
+                        PhysicalNode::ShuffleRead {
+                            upstream_stage_id: ls,
+                            output_partitioning: lp,
+                            ..
+                        },
+                        PhysicalNode::ShuffleRead {
+                            upstream_stage_id: rs,
+                            output_partitioning: rp,
+                            ..
+                        },
+                    ) = (left.as_ref(), right.as_ref())
+                        && let (Some(lrb), Some(rrb)) = (
+                            self.try_read_shuffle_arrow(*ls, lp, task).await?,
+                            self.try_read_shuffle_arrow(*rs, rp, task).await?,
+                        )
+                        && self
+                            .memory_pool
+                            .try_reserve(
+                                lrb.get_array_memory_size()
+                                    .saturating_add(rrb.get_array_memory_size()),
+                            )
+                            .is_ok()
+                        && let Ok(joined_rb) = columnar::eval_columnar_hash_join(
+                            &lrb, &rrb, left_key, right_key, *join_type,
+                        )
+                    {
+                        self.vectorized_rows_processed.fetch_add(
+                            (lrb.num_rows() + rrb.num_rows()) as u64,
+                            Ordering::Relaxed,
+                        );
+                        return Ok(rustlakedb_storage::record_batch_to_row_batch(&joined_rb));
+                    }
                     let left_batch = self.eval_node(left, task).await?;
                     let right_batch = self.eval_node(right, task).await?;
                     self.eval_hash_join_with_spill(
@@ -1123,7 +1218,28 @@ fn eval_window(mut batch: RowBatch, specs: &[WindowSpec]) -> RowBatch {
                     }
                 }
                 WindowFunc::Sum(col) => {
-                    if spec.order_by.is_empty() {
+                    let has_frame = spec.frame_preceding.is_some() || spec.frame_following.is_some();
+                    if has_frame {
+                        for (pos, &row_idx) in indices.iter().enumerate() {
+                            let lo = match spec.frame_preceding {
+                                Some(p) => (pos as i64 - p).clamp(0, part_len as i64 - 1) as usize,
+                                None => 0,
+                            };
+                            let hi = match spec.frame_following {
+                                Some(f) => (pos as i64 + f).clamp(0, part_len as i64 - 1) as usize,
+                                None => part_len - 1,
+                            };
+                            let sum: f64 = if lo <= hi {
+                                indices[lo..=hi]
+                                    .iter()
+                                    .filter_map(|&i| batch.rows[i].get(col).and_then(|v| v.as_f64()))
+                                    .sum()
+                            } else {
+                                0.0
+                            };
+                            computed.push((row_idx, ScalarValue::Float64(sum)));
+                        }
+                    } else if spec.order_by.is_empty() {
                         let total: f64 = indices
                             .iter()
                             .filter_map(|&i| batch.rows[i].get(col).and_then(|v| v.as_f64()))
@@ -1142,7 +1258,35 @@ fn eval_window(mut batch: RowBatch, specs: &[WindowSpec]) -> RowBatch {
                     }
                 }
                 WindowFunc::Avg(col) => {
-                    if spec.order_by.is_empty() {
+                    let has_frame = spec.frame_preceding.is_some() || spec.frame_following.is_some();
+                    if has_frame {
+                        for (pos, &row_idx) in indices.iter().enumerate() {
+                            let lo = match spec.frame_preceding {
+                                Some(p) => (pos as i64 - p).clamp(0, part_len as i64 - 1) as usize,
+                                None => 0,
+                            };
+                            let hi = match spec.frame_following {
+                                Some(f) => (pos as i64 + f).clamp(0, part_len as i64 - 1) as usize,
+                                None => part_len - 1,
+                            };
+                            let mut sum = 0.0;
+                            let mut cnt = 0usize;
+                            if lo <= hi {
+                                for &i in &indices[lo..=hi] {
+                                    if let Some(v) = batch.rows[i].get(col).and_then(|v| v.as_f64()) {
+                                        sum += v;
+                                        cnt += 1;
+                                    }
+                                }
+                            }
+                            let val = if cnt > 0 {
+                                ScalarValue::Float64(sum / cnt as f64)
+                            } else {
+                                ScalarValue::Null
+                            };
+                            computed.push((row_idx, val));
+                        }
+                    } else if spec.order_by.is_empty() {
                         let mut sum = 0.0;
                         let mut cnt = 0usize;
                         for &i in &indices {
@@ -2163,6 +2307,56 @@ impl WorkerNode {
 
     /// Wave 12 Vectorized Arrow Filtered Scan: evaluates simple column predicates directly over
     /// Arrow `RecordBatch` slices with `ProjectionMask` and materializes ONLY matching rows!
+    /// Reads matching upstream `ARW1` shuffle blocks directly into a concatenated Arrow
+    /// `RecordBatch` without intermediate `RowBatch` row-map materialization (Wave 30).
+    async fn try_read_shuffle_arrow(
+        &self,
+        upstream_stage_id: u32,
+        output_partitioning: &Partitioning,
+        task: &TaskSpec,
+    ) -> Result<Option<RecordBatch>> {
+        let matching: Vec<&ShuffleBlockLocation> = task
+            .upstream_blocks
+            .iter()
+            .filter(|b| {
+                b.key.stage_id == upstream_stage_id
+                    && (matches!(output_partitioning, Partitioning::Single)
+                        || if !task.assigned_reduce_partitions.is_empty() {
+                            task.assigned_reduce_partitions
+                                .contains(&b.key.reduce_partition)
+                        } else {
+                            b.key.reduce_partition == task.attempt_id.partition_id
+                        })
+            })
+            .collect();
+        if matching.is_empty() {
+            return Ok(None);
+        }
+        let mut rbs = Vec::with_capacity(matching.len());
+        for loc in matching {
+            if loc.row_count == 0 {
+                continue;
+            }
+            match self.shuffle.read_record_batch(loc).await? {
+                Some(rb) if rb.num_rows() > 0 => {
+                    self.arrow_shuffle_batches_read
+                        .fetch_add(1, Ordering::Relaxed);
+                    rbs.push(rb);
+                }
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
+        if rbs.is_empty() {
+            return Ok(None);
+        }
+        let first_schema = rbs[0].schema();
+        if !rbs.iter().all(|b| b.schema() == first_schema) {
+            return Ok(None);
+        }
+        Ok(Some(columnar::concat_record_batches(&rbs)?))
+    }
+
     async fn try_eval_vectorized_filtered_scan(
         &self,
         file_path: &str,
@@ -2338,6 +2532,14 @@ impl WorkerNode {
         }
 
         let meta_opt = self.catalog.get_table(table_name).await.ok();
+        if meta_opt
+            .as_ref()
+            .and_then(|m| m.snapshots.values().next_back())
+            .map(|s| !s.equality_deletes.is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
         let empty_aliases = HashMap::new();
         let aliases = meta_opt
             .as_ref()

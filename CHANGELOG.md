@@ -2,6 +2,28 @@
 
 All notable changes to **RustLakeDB** are documented in this file.
 
+## [8.0.0] - 2026-11-25 — GA Hyperscale Enterprise Release: Raft-Replicated Governance, End-to-End Arrow Shuffle, Partition OCC, Iceberg v3 Equality Deletes, Window Frames/`QUALIFY`/`UNNEST`, Binary PGWire Bind, SPDX SBOM & OCI Helm (Waves 29–33)
+
+### Wave 33 — Supply-Chain Security (SPDX 2.3 SBOM), OCI Helm Chart, Zero-Warning Node 24 CI & Benchmark Harness
+- **Zero-Warning Node 24 GitHub Actions:** Upgraded CI & Release pipelines to `actions/checkout@v7`, `upload-artifact@v7`, `download-artifact@v8`, `docker/login-action@v4`, `setup-buildx-action@v4`, `build-push-action@v7`, and `metadata-action@v6`, plus automated GPLv3 SPDX header & locked dependency graph verification.
+- **SPDX 2.3 SBOM & OCI Helm Registry:** Automated SPDX 2.3 JSON SBOM + SHA-256 generation attached to every GitHub Release, plus automated Helm chart linting, packaging, and OCI publishing to `oci://ghcr.io/sudeshc/charts`.
+- **Reproducible Benchmark Harness:** Added [scripts/run-tpch-bench.ps1](scripts/run-tpch-bench.ps1) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+### Wave 32 — Advanced Analytical SQL (`ROWS BETWEEN`, `QUALIFY`, `UNNEST`, `EXPLAIN FORMAT JSON`) & Binary PGWire `Bind`
+- **Sliding Window Frames & `QUALIFY`:** Added `ROWS BETWEEN <start> AND <end>` sliding window frame evaluation across both columnar Arrow (`eval_columnar_window`) and general `eval_window` paths, plus Snowflake/DuckDB-style `QUALIFY` post-window filtering.
+- **Array Unnesting & JSON Explain:** Added `UNNEST(ARRAY[...])`, `JSONB_ARRAY_ELEMENTS(...)`, and `EXPLAIN (FORMAT JSON)`.
+- **Full PGWire Binary + Text Parameterized `Bind`:** Upgraded `Parse`/`Bind` in `rustlakedb-gateway` to track parameter OIDs and decode PostgreSQL big-endian binary parameters (`int2`/`int4`/`int8`/`float4`/`float8`/`bool`) alongside text parameters for `psycopg3`, SQLAlchemy, Metabase, and Superset.
+
+### Wave 31 — Partition-Level Disjoint OCC & Native Iceberg v3 Equality Deletes
+- **Partition-Level Disjoint OCC:** Concurrent mutating writers (`is_append_only = false`) targeting strictly disjoint partitions auto-rebase cleanly without false OCC aborts, while overlapping partitions strictly reject with `OccConflict`.
+- **Native Iceberg v3 Equality Deletes:** Added Zstd Parquet equality-delete file writes (`write_equality_delete_file`), sequence-number-aware read filtering, and zero-read streaming CDC upserts/deletes (`Coordinator::ingest_cdc_equality_deletes`).
+
+### Wave 30 — Zero-`RowBatch` End-to-End Arrow `RecordBatch` Shuffle & Multi-Stage Columnar Pipeline
+- **Direct Arrow IPC Shuffle:** Added `ShuffleTransport::write_record_batch` / `read_record_batch` (`ARW1`) bypassing `RowBatch` entirely, plus pure-Arrow `eval_columnar_hash_join` (Inner/Left/Right/Full) and `eval_columnar_sort` wired directly into multi-stage `ShuffleRead` execution.
+
+### Wave 29 — Raft-Replicated, Crash-Safe Enterprise Governance
+- **Durable HA Governance:** Persisted RBAC roles/grants, RLS policies, Dynamic Column/JSON Masking rules, and Data Lineage atomically to `_catalog/governance.json` and replicated every mutation through `CatalogCommand::ApplyGovernance` across 3-Coordinator HA Raft Quorums.
+
 ## [7.0.0] - 2026-11-24 — Flagship Lakehouse Release: 18.9× Vectorized Engine Boost, Strict Schema Enforcement, Time Travel Rollback, Centralized Governance & Lineage, Live PyIceberg Direct Scan, Live RustFS S3 & Zero-Downtime Rolling Upgrades (Waves 24–28)
 
 ### Wave 28 — Turnkey Pure-Rust Production Stack & Zero-Downtime Rolling-Upgrade Chaos

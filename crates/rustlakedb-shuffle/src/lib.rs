@@ -44,6 +44,29 @@ pub trait ShuffleTransport: Send + Sync {
         encode_shuffle_block(&batch)
     }
 
+    /// Writes an Apache Arrow `RecordBatch` directly as a Zstd-compressed Arrow IPC (`ARW1`)
+    /// shuffle block with zero `RowBatch` row-map materialization (Wave 30).
+    async fn write_record_batch(
+        &self,
+        worker_id: &WorkerId,
+        key: ShufflePartitionKey,
+        mode: ShuffleMode,
+        rb: &RecordBatch,
+    ) -> Result<ShuffleBlockLocation> {
+        let row_batch = record_batch_to_row_batch_fallback(rb);
+        self.write_batch(worker_id, key, mode, &row_batch).await
+    }
+
+    /// Reads an `ARW1` shuffle block directly into an Apache Arrow `RecordBatch` with zero
+    /// `RowBatch` deserialization (returns `Ok(None)` if block is `JSN1` JSON, Wave 30).
+    async fn read_record_batch(
+        &self,
+        location: &ShuffleBlockLocation,
+    ) -> Result<Option<RecordBatch>> {
+        let raw = self.read_raw_block(location).await?;
+        decode_record_batch_block(&raw)
+    }
+
     async fn invalidate_worker(&self, worker_id: &WorkerId) -> Result<usize>;
 
     async fn cleanup_query(&self, query_id: QueryId) -> Result<()>;
@@ -119,6 +142,83 @@ pub fn decode_shuffle_block(bytes: &[u8]) -> Result<RowBatch> {
     let decompressed = zstd::stream::decode_all(payload)
         .map_err(|e| RustLakeError::Shuffle(format!("zstd decompress json: {e}")))?;
     Ok(serde_json::from_slice(&decompressed)?)
+}
+
+/// Encodes an Arrow `RecordBatch` directly into an `ARW1` Zstd-compressed Arrow IPC frame
+/// with zero `RowBatch` conversion (Wave 30).
+pub fn encode_record_batch_block(rb: &RecordBatch) -> Result<Bytes> {
+    let mut ipc_buf = Vec::new();
+    {
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut ipc_buf, &rb.schema())
+            .map_err(|e| RustLakeError::Shuffle(format!("arrow ipc writer init: {e}")))?;
+        if rb.num_rows() > 0 && rb.num_columns() > 0 {
+            writer
+                .write(rb)
+                .map_err(|e| RustLakeError::Shuffle(format!("arrow ipc write: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| RustLakeError::Shuffle(format!("arrow ipc finish: {e}")))?;
+    }
+    let comp = zstd::bulk::compress(&ipc_buf, 1)
+        .map_err(|e| RustLakeError::Shuffle(format!("zstd compress arrow ipc: {e}")))?;
+    let mut framed = Vec::with_capacity(4 + comp.len());
+    framed.extend_from_slice(MAGIC_ARROW_ZSTD);
+    framed.extend_from_slice(&comp);
+    Ok(Bytes::from(framed))
+}
+
+/// Decodes an `ARW1` Zstd-compressed Arrow IPC shuffle block directly into an Arrow `RecordBatch`
+/// without creating a single `BTreeMap` row (returns `Ok(None)` for `JSN1` blocks, Wave 30).
+pub fn decode_record_batch_block(bytes: &[u8]) -> Result<Option<RecordBatch>> {
+    if bytes.len() < 4 || &bytes[..4] != MAGIC_ARROW_ZSTD {
+        return Ok(None);
+    }
+    let decompressed = zstd::stream::decode_all(&bytes[4..])
+        .map_err(|e| RustLakeError::Shuffle(format!("zstd decompress arrow ipc: {e}")))?;
+    let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(decompressed), None)
+        .map_err(|e| RustLakeError::Shuffle(format!("arrow ipc reader init: {e}")))?;
+    let schema = reader.schema();
+    let mut batches = Vec::new();
+    for rb in reader {
+        batches.push(rb.map_err(|e| RustLakeError::Shuffle(format!("arrow ipc read: {e}")))?);
+    }
+    if batches.is_empty() {
+        return Ok(Some(RecordBatch::new_empty(schema)));
+    }
+    if batches.len() == 1 {
+        return Ok(Some(batches.pop().unwrap()));
+    }
+    let merged = arrow_select::concat::concat_batches(&schema, &batches)
+        .map_err(|e| RustLakeError::Shuffle(format!("arrow concat shuffle batches: {e}")))?;
+    Ok(Some(merged))
+}
+
+fn record_batch_to_row_batch_fallback(rb: &RecordBatch) -> RowBatch {
+    let cols: Vec<String> = rb.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let mut rows = Vec::with_capacity(rb.num_rows());
+    for row_idx in 0..rb.num_rows() {
+        let mut r = BTreeMap::new();
+        for (ci, f) in rb.schema().fields().iter().enumerate() {
+            let arr = rb.column(ci);
+            let val = if arr.is_null(row_idx) {
+                ScalarValue::Null
+            } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                ScalarValue::Int64(a.value(row_idx))
+            } else if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                ScalarValue::Float64(a.value(row_idx))
+            } else if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+                ScalarValue::Bool(a.value(row_idx))
+            } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                ScalarValue::Utf8(a.value(row_idx).to_string())
+            } else {
+                ScalarValue::Null
+            };
+            r.insert(f.name().clone(), val);
+        }
+        rows.push(r);
+    }
+    RowBatch::new(cols, rows)
 }
 
 fn try_encode_arrow_ipc(batch: &RowBatch) -> Result<Option<Vec<u8>>> {
@@ -318,6 +418,102 @@ impl ShuffleTransport for HybridShuffleManager {
             byte_size,
             row_count,
         })
+    }
+
+    async fn write_record_batch(
+        &self,
+        worker_id: &WorkerId,
+        key: ShufflePartitionKey,
+        mode: ShuffleMode,
+        rb: &RecordBatch,
+    ) -> Result<ShuffleBlockLocation> {
+        let encoded = encode_record_batch_block(rb)?;
+        self.arrow_ipc_blocks_written
+            .fetch_add(1, Ordering::Relaxed);
+        let byte_size = encoded.len();
+        let row_count = rb.num_rows();
+        let adv_url = self.advertise_http_url.read().clone();
+        let uri = match mode {
+            ShuffleMode::Pipelined => {
+                self.pipelined_blocks
+                    .write()
+                    .insert(key.clone(), (worker_id.clone(), encoded));
+                if let Some(base) = adv_url {
+                    format!("{base}/v1/shuffle/read_bin")
+                } else {
+                    format!(
+                        "mem://{}/s{}_m{}_r{}",
+                        worker_id.0, key.stage_id, key.map_partition, key.reduce_partition
+                    )
+                }
+            }
+            ShuffleMode::Staged => {
+                let path = self.staged_file_path(&key);
+                tokio::fs::write(&path, &encoded).await?;
+                self.staged_index
+                    .write()
+                    .insert(key.clone(), (worker_id.clone(), path.clone()));
+                if let Some(base) = adv_url {
+                    format!("{base}/v1/shuffle/read_bin")
+                } else {
+                    format!("nvme://{}", path.display())
+                }
+            }
+        };
+        Ok(ShuffleBlockLocation {
+            key,
+            worker_id: worker_id.clone(),
+            mode,
+            uri,
+            byte_size,
+            row_count,
+        })
+    }
+
+    async fn read_record_batch(
+        &self,
+        location: &ShuffleBlockLocation,
+    ) -> Result<Option<RecordBatch>> {
+        if let Some((_, bytes)) = self.pipelined_blocks.read().get(&location.key).cloned() {
+            return decode_record_batch_block(&bytes);
+        }
+        let local_path = {
+            let guard = self.staged_index.read();
+            guard
+                .get(&location.key)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| self.staged_file_path(&location.key))
+        };
+        if local_path.exists() {
+            let bytes = tokio::fs::read(&local_path).await?;
+            return decode_record_batch_block(&bytes);
+        }
+        if location.uri.starts_with("http://") || location.uri.starts_with("https://") {
+            let resp = self
+                .http
+                .post(&location.uri)
+                .json(location)
+                .send()
+                .await
+                .map_err(|e| {
+                    RustLakeError::Shuffle(format!(
+                        "remote arrow shuffle fetch from {} failed: {e}",
+                        location.uri
+                    ))
+                })?;
+            if !resp.status().is_success() {
+                return Err(RustLakeError::Shuffle(format!(
+                    "remote arrow shuffle fetch {} returned HTTP {}",
+                    location.uri,
+                    resp.status()
+                )));
+            }
+            let raw = resp.bytes().await.map_err(|e| {
+                RustLakeError::Shuffle(format!("read remote arrow shuffle bytes: {e}"))
+            })?;
+            return decode_record_batch_block(&raw);
+        }
+        Ok(None)
     }
 
     async fn read_raw_block(&self, location: &ShuffleBlockLocation) -> Result<Bytes> {

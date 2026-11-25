@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::{
-    Catalog, ColumnStats, ColumnType, IcebergTableMetadata, InMemoryRaftCatalog, PuffinIndexSpec,
+    Catalog, ColumnStats, ColumnType, DataFileEntry, EqualityDeleteFile, GovernanceOp,
+    IcebergTableMetadata, InMemoryRaftCatalog, PersistedGovernanceState, PuffinIndexSpec,
     TableCommitProposal, ViewDefinition,
 };
 use async_trait::async_trait;
@@ -110,6 +111,13 @@ pub enum CatalogCommand {
     SetColumnStats {
         table_name: String,
         stats: HashMap<String, ColumnStats>,
+    },
+    ApplyGovernance(GovernanceOp),
+    CommitEqualityDelete {
+        table_name: String,
+        branch: String,
+        eq_delete: EqualityDeleteFile,
+        upserted_files: Vec<DataFileEntry>,
     },
 }
 
@@ -899,6 +907,22 @@ impl RaftCatalogNode {
                     .await?;
                 Ok(json!({ "ok": true }))
             }
+            CatalogCommand::ApplyGovernance(op) => {
+                self.state_machine.apply_governance(op).await?;
+                Ok(json!({ "ok": true }))
+            }
+            CatalogCommand::CommitEqualityDelete {
+                table_name,
+                branch,
+                eq_delete,
+                upserted_files,
+            } => {
+                let s = self
+                    .state_machine
+                    .commit_equality_delete(&table_name, &branch, eq_delete, upserted_files)
+                    .await?;
+                Ok(json!({ "snapshot_id": s }))
+            }
         }
     }
 }
@@ -1149,6 +1173,33 @@ impl Catalog for RaftCatalogNode {
         })
         .await?;
         Ok(())
+    }
+
+    async fn apply_governance(&self, op: GovernanceOp) -> Result<()> {
+        self.propose(CatalogCommand::ApplyGovernance(op)).await?;
+        Ok(())
+    }
+
+    async fn get_governance(&self) -> Result<PersistedGovernanceState> {
+        self.state_machine.get_governance().await
+    }
+
+    async fn commit_equality_delete(
+        &self,
+        table_name: &str,
+        branch: &str,
+        eq_delete: EqualityDeleteFile,
+        upserted_files: Vec<DataFileEntry>,
+    ) -> Result<u64> {
+        let v = self
+            .propose(CatalogCommand::CommitEqualityDelete {
+                table_name: table_name.to_string(),
+                branch: branch.to_string(),
+                eq_delete,
+                upserted_files,
+            })
+            .await?;
+        Ok(v["snapshot_id"].as_u64().unwrap_or(1))
     }
 }
 

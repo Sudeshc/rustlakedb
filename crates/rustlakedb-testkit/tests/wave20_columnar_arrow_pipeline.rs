@@ -174,6 +174,8 @@ fn wave20_native_arrow_record_batch_columnar_pipeline_end_to_end() {
                     descending: false,
                 }],
                 alias: "rn".into(),
+                frame_preceding: None,
+                frame_following: None,
             },
             WindowSpec {
                 func: WindowFunc::Sum("net_price".into()),
@@ -183,6 +185,8 @@ fn wave20_native_arrow_record_batch_columnar_pipeline_end_to_end() {
                     descending: false,
                 }],
                 alias: "running_net".into(),
+                frame_preceding: None,
+                frame_following: None,
             },
         ],
     )

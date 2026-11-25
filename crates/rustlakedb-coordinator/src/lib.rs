@@ -348,6 +348,14 @@ impl Coordinator {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let lower = trimmed.to_lowercase();
 
+        // Wave 29: Hydrate latest Raft-replicated RBAC/RLS/Masking state on non-superuser sessions
+        // so restarted or follower HA Coordinators enforce identical governance immediately!
+        if !session.is_superuser()
+            && let Ok(gov) = self.catalog.get_governance().await
+        {
+            self.governance.hydrate_from_catalog(gov);
+        }
+
         // Active query cancellation (`CANCEL QUERY '<query_id>'`, Wave 21)
         if lower.starts_with("cancel query ") {
             let target_id = trimmed["cancel query ".len()..]
@@ -367,6 +375,14 @@ impl Coordinator {
                 ),
                 stats: QueryExecutionStats::default(),
             });
+        }
+
+        // Wave 32: `UNNEST(ARRAY[...])` & `JSONB_ARRAY_ELEMENTS(...)` table-valued array unnesting!
+        if (lower.contains("unnest(") || lower.contains("jsonb_array_elements("))
+            && let Some(unnest_res) =
+                Box::pin(self.try_execute_unnest(trimmed, branch, session)).await?
+        {
+            return Ok(unnest_res);
         }
 
         // Virtual governance & observability system tables (Wave 3)
@@ -433,6 +449,9 @@ impl Coordinator {
             });
         }
         if lower.contains("system.lineage") {
+            if let Ok(gov) = self.catalog.get_governance().await {
+                self.governance.hydrate_from_catalog(gov);
+            }
             let entries = self.governance.lineage_snapshot();
             let cols = vec![
                 "source_table".into(),
@@ -567,7 +586,7 @@ impl Coordinator {
         self.governance
             .register_active_query(&qid, &session.user, trimmed)?;
         let t0 = std::time::Instant::now();
-        let res = self.execute_sql_inner(trimmed, branch, session).await;
+        let res = Box::pin(self.execute_sql_inner(trimmed, branch, session)).await;
         self.governance.finish_active_query(&qid);
         let elapsed_ms = t0.elapsed().as_millis() as u64;
 
@@ -733,6 +752,40 @@ impl Coordinator {
                     stats: QueryExecutionStats::default(),
                 })
             }
+            PlannedCommand::ExplainJson(dag) => {
+                let stages_json: Vec<serde_json::Value> = dag
+                    .stages
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "stage_id": s.stage_id,
+                            "upstream_stages": s.upstream_stages,
+                            "num_partitions": s.num_partitions,
+                            "shuffle_mode": format!("{:?}", s.shuffle_mode),
+                            "output_partitioning": format!("{:?}", s.output_partitioning),
+                        })
+                    })
+                    .collect();
+                let doc = serde_json::json!([{
+                    "Plan": {
+                        "Engine": "RustLakeDB",
+                        "QueryId": dag.query_id.0.to_string(),
+                        "CboNotes": dag.cbo_notes,
+                        "StageCount": dag.stages.len(),
+                        "Stages": stages_json,
+                    }
+                }]);
+                let rows = vec![BTreeMap::from([(
+                    "QUERY PLAN".to_string(),
+                    ScalarValue::Utf8(serde_json::to_string_pretty(&doc).unwrap_or_default()),
+                )])];
+                Ok(QueryExecutionResult {
+                    command_tag: "EXPLAIN 1".into(),
+                    dag: Some(dag),
+                    batch: RowBatch::new(vec!["QUERY PLAN".into()], rows),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
             PlannedCommand::CreateTable {
                 table_name,
                 schema,
@@ -774,6 +827,18 @@ impl Coordinator {
                 if let Some(src) = extract_primary_from_table(&query_sql) {
                     self.governance
                         .record_lineage(&src, &table_name, "CREATE TABLE AS", &session.user);
+                    let _ = self
+                        .catalog
+                        .apply_governance(rustlakedb_catalog::GovernanceOp::RecordLineage(
+                            rustlakedb_catalog::PersistedLineageEdge {
+                                source_table: src,
+                                target_table: table_name.clone(),
+                                operation: "CREATE TABLE AS".into(),
+                                user: session.user.clone(),
+                                timestamp_ms: crate::security::epoch_ms(),
+                            },
+                        ))
+                        .await;
                 }
                 Ok(QueryExecutionResult {
                     command_tag: format!("SELECT {rows_written}"),
@@ -2122,6 +2187,10 @@ impl Coordinator {
             }
             PlannedCommand::CreateRole { role } => {
                 self.governance.create_role(&role);
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::CreateRole(role.clone()))
+                    .await;
                 self.governance
                     .record_audit(&session.user, "CREATE ROLE", &role, "OK");
                 Ok(QueryExecutionResult {
@@ -2137,6 +2206,14 @@ impl Coordinator {
                 role,
             } => {
                 self.governance.grant(&role, &table_name, &privilege);
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::Grant {
+                        role: role.clone(),
+                        table: table_name.clone(),
+                        privilege: privilege.clone(),
+                    })
+                    .await;
                 self.governance.record_audit(
                     &session.user,
                     &format!("GRANT {privilege}"),
@@ -2156,6 +2233,14 @@ impl Coordinator {
                 role,
             } => {
                 self.governance.revoke(&role, &table_name, &privilege);
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::Revoke {
+                        role: role.clone(),
+                        table: table_name.clone(),
+                        privilege: privilege.clone(),
+                    })
+                    .await;
                 self.governance.record_audit(
                     &session.user,
                     &format!("REVOKE {privilege}"),
@@ -2175,7 +2260,16 @@ impl Coordinator {
                 role,
                 predicate,
             } => {
-                self.governance.add_rls_policy(&role, &table_name, predicate);
+                self.governance
+                    .add_rls_policy(&role, &table_name, predicate.clone());
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::AddRlsPolicy {
+                        role: role.clone(),
+                        table: table_name.clone(),
+                        predicate,
+                    })
+                    .await;
                 self.governance.record_audit(
                     &session.user,
                     "CREATE POLICY",
@@ -2202,9 +2296,21 @@ impl Coordinator {
                     MaskingRule {
                         name: name.clone(),
                         target: target.clone(),
-                        mask_value,
+                        mask_value: mask_value.clone(),
                     },
                 );
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::AddMaskingPolicy {
+                        role: role.clone(),
+                        table: table_name.clone(),
+                        rule: rustlakedb_catalog::PersistedMaskingRule {
+                            name: name.clone(),
+                            target: target.clone(),
+                            mask_value,
+                        },
+                    })
+                    .await;
                 self.governance.record_audit(
                     &session.user,
                     "CREATE MASKING POLICY",
@@ -3886,6 +3992,180 @@ fn detect_skewed_partitions(metrics: &HashMap<usize, PartitionMetrics>) -> Vec<u
 }
 
 impl Coordinator {
+    /// Evaluates `SELECT * FROM UNNEST(ARRAY[...])` and `SELECT <cols>, JSONB_ARRAY_ELEMENTS(col->'path') AS alias FROM <table>` (Wave 32).
+    async fn try_execute_unnest(
+        &self,
+        sql: &str,
+        branch: &str,
+        session: &SessionContext,
+    ) -> Result<Option<QueryExecutionResult>> {
+        let lower = sql.to_lowercase();
+        // Form 1: `SELECT * FROM UNNEST(ARRAY[1, 2, 3]) [AS t(val)]`
+        if let Some(arr_pos) = lower.find("unnest(array[") {
+            let after = &sql[arr_pos + "unnest(array[".len()..];
+            if let Some(end_bracket) = after.find(']') {
+                let items_str = &after[..end_bracket];
+                let mut rows = Vec::new();
+                for item in items_str.split(',') {
+                    let t = item.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    let val = if let Some(s) = t.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+                        ScalarValue::Utf8(s.to_string())
+                    } else if let Ok(i) = t.parse::<i64>() {
+                        ScalarValue::Int64(i)
+                    } else if let Ok(f) = t.parse::<f64>() {
+                        ScalarValue::Float64(f)
+                    } else {
+                        ScalarValue::Utf8(t.to_string())
+                    };
+                    rows.push(BTreeMap::from([("unnest".into(), val)]));
+                }
+                let n = rows.len();
+                return Ok(Some(QueryExecutionResult {
+                    command_tag: format!("SELECT {n}"),
+                    dag: None,
+                    batch: RowBatch::new(vec!["unnest".into()], rows),
+                    stats: QueryExecutionStats::default(),
+                }));
+            }
+        }
+        // Form 2: `SELECT <prefix_cols>, JSONB_ARRAY_ELEMENTS(<json_col>->'<path>') [AS <alias>] FROM <table>`
+        let fn_marker = if lower.contains("jsonb_array_elements(") {
+            "jsonb_array_elements("
+        } else if lower.contains("unnest(") {
+            "unnest("
+        } else {
+            return Ok(None);
+        };
+        let Some(fn_pos) = lower.find(fn_marker) else {
+            return Ok(None);
+        };
+        let Some(from_pos) = lower.find(" from ") else {
+            return Ok(None);
+        };
+        if fn_pos > from_pos {
+            return Ok(None);
+        }
+        let after_fn = &sql[fn_pos + fn_marker.len()..from_pos];
+        let Some(close_p) = after_fn.find(')') else {
+            return Ok(None);
+        };
+        let arg_expr = after_fn[..close_p].trim();
+        let after_close = after_fn[close_p + 1..].trim();
+        let out_alias = if let Some(rest) = after_close
+            .strip_prefix("AS ")
+            .or_else(|| after_close.strip_prefix("as "))
+        {
+            rest.split_whitespace().next().unwrap_or("element").trim_matches('"').to_string()
+        } else {
+            "element".to_string()
+        };
+        let (json_col, json_path) = if let Some((c, p)) = arg_expr.split_once("->>").or_else(|| arg_expr.split_once("->")) {
+            (c.trim().trim_matches('"').to_string(), Some(p.trim().trim_matches('\'').to_string()))
+        } else {
+            (arg_expr.trim().trim_matches('"').to_string(), None)
+        };
+        let prefix_select = sql[..fn_pos]
+            .trim()
+            .strip_prefix("SELECT ")
+            .or_else(|| sql[..fn_pos].trim().strip_prefix("select "))
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(',');
+        let keep_cols: Vec<String> = prefix_select
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let from_tail = sql[from_pos..].trim();
+        let base_sql = format!("SELECT * {from_tail}");
+        let base_res = Box::pin(self.execute_sql_inner(&base_sql, branch, session)).await?;
+
+        let mut out_cols = keep_cols.clone();
+        out_cols.push(out_alias.clone());
+        let mut out_rows = Vec::new();
+        for row in &base_res.batch.rows {
+            let arr_val = match row.get(&json_col) {
+                Some(ScalarValue::Json(doc)) => match &json_path {
+                    Some(p) => doc.get(p).and_then(|v| v.as_array()).cloned(),
+                    None => doc.as_array().cloned(),
+                },
+                Some(ScalarValue::Utf8(s)) => serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|doc| match &json_path {
+                        Some(p) => doc.get(p).and_then(|v| v.as_array()).cloned(),
+                        None => doc.as_array().cloned(),
+                    }),
+                _ => None,
+            };
+            if let Some(elems) = arr_val {
+                for el in elems {
+                    let mut nr = BTreeMap::new();
+                    for kc in &keep_cols {
+                        nr.insert(kc.clone(), row.get(kc).cloned().unwrap_or(ScalarValue::Null));
+                    }
+                    let sv = match el {
+                        serde_json::Value::String(s) => ScalarValue::Utf8(s),
+                        serde_json::Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                ScalarValue::Int64(i)
+                            } else {
+                                ScalarValue::Float64(n.as_f64().unwrap_or(0.0))
+                            }
+                        }
+                        serde_json::Value::Bool(b) => ScalarValue::Bool(b),
+                        serde_json::Value::Null => ScalarValue::Null,
+                        other => ScalarValue::Json(other),
+                    };
+                    nr.insert(out_alias.clone(), sv);
+                    out_rows.push(nr);
+                }
+            }
+        }
+        let n = out_rows.len();
+        Ok(Some(QueryExecutionResult {
+            command_tag: format!("SELECT {n}"),
+            dag: None,
+            batch: RowBatch::new(out_cols, out_rows),
+            stats: base_res.stats,
+        }))
+    }
+
+    /// Zero-read streaming CDC upsert/delete using Apache Iceberg v3 Equality Delete Parquet files (Wave 31).
+    /// Never scans or rewrites existing Parquet data files — writes only the deleted key set + optional
+    /// new upserted data file and commits both atomically at the next snapshot sequence number!
+    pub async fn ingest_cdc_equality_deletes(
+        &self,
+        table_name: &str,
+        branch: &str,
+        key_col: &str,
+        delete_keys: Vec<ScalarValue>,
+        mut upsert_rows: RowBatch,
+    ) -> Result<u64> {
+        let meta = self.catalog.get_table(table_name).await?;
+        let eq_path = format!("{table_name}/data/eq-delete-{}.parquet", Uuid::new_v4());
+        let eq_entry = self
+            .store
+            .write_equality_delete_file(&eq_path, key_col, &delete_keys)
+            .await?;
+        let upserted_files = if upsert_rows.num_rows() > 0 {
+            enforce_table_schema(&meta, &mut upsert_rows)?;
+            self.write_partitioned_data_files(&meta, "cdc-upsert", &upsert_rows)
+                .await?
+        } else {
+            vec![]
+        };
+        let new_snap = self
+            .catalog
+            .commit_equality_delete(table_name, branch, eq_entry, upserted_files)
+            .await?;
+        let updated = self.catalog.get_table(table_name).await?;
+        self.store.write_iceberg_metadata(&updated, branch).await?;
+        Ok(new_snap)
+    }
+
     async fn exec_analyze_table(
         &self,
         table_name: String,

@@ -376,6 +376,56 @@ impl GovernanceState {
         self.lineage.read().iter().cloned().collect()
     }
 
+    /// Hydrates in-memory RBAC, RLS, masking policies, and lineage from the Raft-replicated
+    /// Catalog governance state so Coordinator crashes & HA failovers lose zero security rules (Wave 29).
+    pub fn hydrate_from_catalog(&self, snap: rustlakedb_catalog::PersistedGovernanceState) {
+        if !snap.roles.is_empty() {
+            let mut roles = self.roles.write();
+            for r in snap.roles {
+                roles.insert(r);
+            }
+        }
+        {
+            let mut grants = self.grants.write();
+            if !snap.grants.is_empty() {
+                grants.clear();
+                for (r, t, p) in snap.grants {
+                    grants.entry((r, t)).or_default().insert(p);
+                }
+            }
+        }
+        if !snap.rls_policies.is_empty() {
+            let mut rls = self.rls_policies.write();
+            for (r, t, pred) in snap.rls_policies {
+                rls.insert((r, t), pred);
+            }
+        }
+        if !snap.masking_policies.is_empty() {
+            let mut m = self.masking_policies.write();
+            m.clear();
+            for (r, t, rule) in snap.masking_policies {
+                m.entry((r, t)).or_default().push(MaskingRule {
+                    name: rule.name,
+                    target: rule.target,
+                    mask_value: rule.mask_value,
+                });
+            }
+        }
+        if !snap.lineage.is_empty() {
+            let mut lin = self.lineage.write();
+            lin.clear();
+            for e in snap.lineage {
+                lin.push_back(LineageEdge {
+                    source_table: e.source_table,
+                    target_table: e.target_table,
+                    operation: e.operation,
+                    user: e.user,
+                    timestamp_ms: e.timestamp_ms,
+                });
+            }
+        }
+    }
+
     /// Loads RFC 7517 OIDC JWKS RSA public keys (`{"keys":[{"kty":"RSA","kid":"...","n":"...","e":"..."}]}`) (Wave 21).
     pub fn set_jwks_json(&self, jwks_json: &str) -> Result<usize> {
         let doc: serde_json::Value = serde_json::from_str(jwks_json)

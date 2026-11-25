@@ -10,14 +10,16 @@
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-    RecordBatch, StringArray,
+    RecordBatch, StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
+use arrow_select::take::take;
 use rustlakedb_common::{Result, RustLakeError};
 use rustlakedb_protocol::{
-    AggExpr, AggFunc, ArithOp, CmpOp, ColumnExpr, FilterExpr, MathFunc, ScalarValue, SortKey,
-    StringFunc, WindowFunc, WindowSpec,
+    AggExpr, AggFunc, ArithOp, CmpOp, ColumnExpr, FilterExpr, JoinType, MathFunc, ScalarValue,
+    SortKey, StringFunc, WindowFunc, WindowSpec,
 };
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -584,8 +586,40 @@ pub fn eval_columnar_window(rb: &RecordBatch, specs: &[WindowSpec]) -> Result<Re
                     RustLakeError::Execution(format!("window column '{col}' not found"))
                 })?;
                 let mut out_vals = vec![None; n];
+                let has_frame = spec.frame_preceding.is_some() || spec.frame_following.is_some();
                 for indices in partitions.values() {
-                    if spec.order_by.is_empty() {
+                    if has_frame {
+                        let plen = indices.len();
+                        for (pos, &row_i) in indices.iter().enumerate() {
+                            let lo = match spec.frame_preceding {
+                                Some(p) => (pos as i64 - p).clamp(0, plen as i64 - 1) as usize,
+                                None => 0,
+                            };
+                            let hi = match spec.frame_following {
+                                Some(f) => (pos as i64 + f).clamp(0, plen as i64 - 1) as usize,
+                                None => plen - 1,
+                            };
+                            let mut sum = 0.0;
+                            let mut cnt = 0usize;
+                            if lo <= hi {
+                                for &w_idx in &indices[lo..=hi] {
+                                    if let Some(v) = array_as_f64(src, w_idx) {
+                                        sum += v;
+                                        cnt += 1;
+                                    }
+                                }
+                            }
+                            out_vals[row_i] = if cnt > 0 {
+                                Some(if matches!(spec.func, WindowFunc::Avg(_)) {
+                                    sum / cnt as f64
+                                } else {
+                                    sum
+                                })
+                            } else {
+                                None
+                            };
+                        }
+                    } else if spec.order_by.is_empty() {
                         let mut sum = 0.0;
                         let mut cnt = 0usize;
                         for &row_i in indices {
@@ -779,4 +813,156 @@ fn match_cmp(ord: Option<CmpOrdering>, op: CmpOp) -> bool {
             | (Some(CmpOrdering::Greater), CmpOp::Gt | CmpOp::GtEq | CmpOp::NotEq)
             | (Some(CmpOrdering::Less), CmpOp::Lt | CmpOp::LtEq | CmpOp::NotEq)
     )
+}
+
+/// Concatenates multiple Arrow `RecordBatch`es sharing a compatible schema (Wave 30).
+pub fn concat_record_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+    }
+    if batches.len() == 1 {
+        return Ok(batches[0].clone());
+    }
+    let schema = batches[0].schema();
+    concat_batches(&schema, batches)
+        .map_err(|e| RustLakeError::Execution(format!("arrow concat_batches: {e}")))
+}
+
+/// Pure Arrow `RecordBatch` columnar `Sort` using `arrow_select::take::take` with zero `BTreeMap`
+/// row materialization (Wave 30).
+pub fn eval_columnar_sort(rb: &RecordBatch, keys: &[SortKey]) -> Result<RecordBatch> {
+    let n = rb.num_rows();
+    if n <= 1 || keys.is_empty() {
+        return Ok(rb.clone());
+    }
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by(|&a, &b| {
+        for k in keys {
+            if let Some(arr) = rb.column_by_name(&k.column) {
+                let ord = compare_array_cells(arr, a as usize, arr, b as usize)
+                    .unwrap_or(CmpOrdering::Equal);
+                let dir = if k.descending { ord.reverse() } else { ord };
+                if dir != CmpOrdering::Equal {
+                    return dir;
+                }
+            }
+        }
+        CmpOrdering::Equal
+    });
+    let idx_arr = UInt32Array::from(order);
+    let cols: Vec<ArrayRef> = rb
+        .columns()
+        .iter()
+        .map(|c| {
+            take(c.as_ref(), &idx_arr, None)
+                .map_err(|e| RustLakeError::Execution(format!("arrow sort take: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(rb.schema(), cols)
+        .map_err(|e| RustLakeError::Execution(format!("arrow sort batch build: {e}")))
+}
+
+/// Pure Arrow `RecordBatch` columnar `HashJoin` (Inner / Left / Right / Full) executing directly
+/// over Arrow arrays + `arrow_select::take::take` with zero `BTreeMap` row allocation (Wave 30).
+pub fn eval_columnar_hash_join(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_key: &str,
+    right_key: &str,
+    join_type: JoinType,
+) -> Result<RecordBatch> {
+    let lk_idx = left
+        .schema()
+        .index_of(left_key)
+        .map_err(|e| RustLakeError::Execution(format!("arrow join left key '{left_key}': {e}")))?;
+    let rk_idx = right
+        .schema()
+        .index_of(right_key)
+        .map_err(|e| RustLakeError::Execution(format!("arrow join right key '{right_key}': {e}")))?;
+
+    let lk_arr = left.column(lk_idx);
+    let rk_arr = right.column(rk_idx);
+
+    let mut right_index: HashMap<String, Vec<u32>> = HashMap::with_capacity(right.num_rows());
+    for ri in 0..right.num_rows() {
+        if let Some(k) = array_as_string(rk_arr, ri) {
+            right_index.entry(k).or_default().push(ri as u32);
+        }
+    }
+
+    let mut left_indices: Vec<Option<u32>> = Vec::new();
+    let mut right_indices: Vec<Option<u32>> = Vec::new();
+    let mut right_matched = vec![false; right.num_rows()];
+
+    for li in 0..left.num_rows() {
+        let mut matched = false;
+        if let Some(k) = array_as_string(lk_arr, li)
+            && let Some(rlist) = right_index.get(&k)
+        {
+            for &ri in rlist {
+                left_indices.push(Some(li as u32));
+                right_indices.push(Some(ri));
+                right_matched[ri as usize] = true;
+                matched = true;
+            }
+        }
+        if !matched && matches!(join_type, JoinType::Left | JoinType::Full) {
+            left_indices.push(Some(li as u32));
+            right_indices.push(None);
+        }
+    }
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        for (ri, &was_matched) in right_matched.iter().enumerate() {
+            if !was_matched {
+                left_indices.push(None);
+                right_indices.push(Some(ri as u32));
+            }
+        }
+    }
+
+    // Build unified output schema (deduplicating colliding column names from right side).
+    let mut out_fields: Vec<Field> = left
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+        .collect();
+    let left_schema = left.schema();
+    let left_names: HashSet<&str> = left_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let mut right_take_cols: Vec<usize> = Vec::new();
+    for (ci, f) in right.schema().fields().iter().enumerate() {
+        if !left_names.contains(f.name().as_str()) {
+            out_fields.push(Field::new(f.name(), f.data_type().clone(), true));
+            right_take_cols.push(ci);
+        }
+    }
+
+    let out_schema = Arc::new(Schema::new(out_fields));
+    if left_indices.is_empty() {
+        return Ok(RecordBatch::new_empty(out_schema));
+    }
+
+    let l_idx_arr = UInt32Array::from(left_indices);
+    let r_idx_arr = UInt32Array::from(right_indices);
+
+    let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(out_schema.fields().len());
+    for col in left.columns() {
+        out_cols.push(
+            take(col.as_ref(), &l_idx_arr, None)
+                .map_err(|e| RustLakeError::Execution(format!("arrow join take left: {e}")))?,
+        );
+    }
+    for ci in right_take_cols {
+        out_cols.push(
+            take(right.column(ci).as_ref(), &r_idx_arr, None)
+                .map_err(|e| RustLakeError::Execution(format!("arrow join take right: {e}")))?,
+        );
+    }
+
+    RecordBatch::try_new(out_schema, out_cols)
+        .map_err(|e| RustLakeError::Execution(format!("arrow join record batch build: {e}")))
 }

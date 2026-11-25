@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use rustlakedb_common::{Result, RustLakeError};
-use rustlakedb_protocol::IcebergSplit;
+use rustlakedb_protocol::{FilterExpr, IcebergSplit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -151,12 +151,24 @@ pub struct ViewDefinition {
     pub last_source_snapshot_id: Option<u64>,
 }
 
+/// Apache Iceberg v3 Equality Delete file descriptor (zero-read CDC deletes/upserts, Wave 31).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EqualityDeleteFile {
+    pub file_path: String,
+    pub equality_column: String,
+    pub row_count: u64,
+    pub sequence_number: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IcebergSnapshot {
     pub snapshot_id: u64,
     pub parent_snapshot_id: Option<u64>,
     pub timestamp_ms: u64,
     pub data_files: Vec<DataFileEntry>,
+    /// Active Apache Iceberg v3 Equality Delete Parquet files for zero-read CDC upserts/deletes (Wave 31).
+    #[serde(default)]
+    pub equality_deletes: Vec<EqualityDeleteFile>,
     /// Arbitrary Iceberg snapshot summary properties (e.g. `kafka.offset.<topic>.<part>`, Wave 14/15).
     #[serde(default)]
     pub summary: HashMap<String, String>,
@@ -253,6 +265,7 @@ impl IcebergTableMetadata {
             parent_snapshot_id: None,
             timestamp_ms: 0,
             data_files: Vec::new(),
+            equality_deletes: Vec::new(),
             summary: HashMap::new(),
         };
         let mut snapshots = BTreeMap::new();
@@ -369,6 +382,71 @@ pub struct TableCommitProposal {
     pub is_append_only: bool,
 }
 
+/// Persisted dynamic column/JSON masking rule replicated via Raft (Wave 29).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedMaskingRule {
+    pub name: String,
+    pub target: String,
+    pub mask_value: String,
+}
+
+/// Persisted table-level data lineage edge replicated via Raft (Wave 29).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedLineageEdge {
+    pub source_table: String,
+    pub target_table: String,
+    pub operation: String,
+    pub user: String,
+    pub timestamp_ms: u64,
+}
+
+/// Crash-safe, Raft-replicated Enterprise Governance State (RBAC, RLS, Masking, Lineage, Wave 29).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistedGovernanceState {
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// `(role, table, privilege)` tuples
+    #[serde(default)]
+    pub grants: Vec<(String, String, String)>,
+    /// `(role, table, predicate)` RLS policies
+    #[serde(default)]
+    pub rls_policies: Vec<(String, String, FilterExpr)>,
+    /// `(role, table, rule)` masking rules
+    #[serde(default)]
+    pub masking_policies: Vec<(String, String, PersistedMaskingRule)>,
+    /// Table-level data lineage graph edges
+    #[serde(default)]
+    pub lineage: Vec<PersistedLineageEdge>,
+}
+
+/// Replicated governance mutation committed through the Raft WAL (Wave 29).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GovernanceOp {
+    CreateRole(String),
+    Grant {
+        role: String,
+        table: String,
+        privilege: String,
+    },
+    Revoke {
+        role: String,
+        table: String,
+        privilege: String,
+    },
+    AddRlsPolicy {
+        role: String,
+        table: String,
+        predicate: FilterExpr,
+    },
+    AddMaskingPolicy {
+        role: String,
+        table: String,
+        rule: PersistedMaskingRule,
+    },
+    RecordLineage(PersistedLineageEdge),
+}
+
+/// Persists `ANALYZE TABLE` column-level statistics into catalog metadata (Wave 26).
 #[async_trait]
 pub trait Catalog: Send + Sync {
     async fn create_table(&self, metadata: IcebergTableMetadata) -> Result<()>;
@@ -405,6 +483,18 @@ pub trait Catalog: Send + Sync {
     async fn set_column_default(&self, table_name: &str, col_name: &str, default_val: String) -> Result<()>;
     /// Persists `ANALYZE TABLE` column-level statistics into catalog metadata (Wave 26).
     async fn set_column_stats(&self, table_name: &str, stats: HashMap<String, ColumnStats>) -> Result<()>;
+    /// Applies a crash-safe, Raft-replicated governance mutation (RBAC, RLS, Masking, Lineage, Wave 29).
+    async fn apply_governance(&self, op: GovernanceOp) -> Result<()>;
+    /// Reads the latest Raft-replicated governance state snapshot (Wave 29).
+    async fn get_governance(&self) -> Result<PersistedGovernanceState>;
+    /// Atomically commits a zero-read Apache Iceberg v3 Equality Delete file + optional upserted data files (Wave 31).
+    async fn commit_equality_delete(
+        &self,
+        table_name: &str,
+        branch: &str,
+        eq_delete: EqualityDeleteFile,
+        upserted_files: Vec<DataFileEntry>,
+    ) -> Result<u64>;
 }
 
 /// Embedded Iceberg v3 catalog modeling the `openraft` state machine (RFC-002).
@@ -412,8 +502,10 @@ pub trait Catalog: Send + Sync {
 pub struct InMemoryRaftCatalog {
     tables: RwLock<HashMap<String, IcebergTableMetadata>>,
     views: RwLock<HashMap<String, ViewDefinition>>,
+    governance: RwLock<PersistedGovernanceState>,
     state_file: Option<PathBuf>,
     views_file: Option<PathBuf>,
+    governance_file: Option<PathBuf>,
 }
 
 impl Default for InMemoryRaftCatalog {
@@ -427,8 +519,10 @@ impl InMemoryRaftCatalog {
         Self {
             tables: RwLock::new(HashMap::new()),
             views: RwLock::new(HashMap::new()),
+            governance: RwLock::new(PersistedGovernanceState::default()),
             state_file: None,
             views_file: None,
+            governance_file: None,
         }
     }
 
@@ -438,6 +532,7 @@ impl InMemoryRaftCatalog {
         std::fs::create_dir_all(&catalog_dir)?;
         let state_file = catalog_dir.join("state.json");
         let views_file = catalog_dir.join("views.json");
+        let governance_file = catalog_dir.join("governance.json");
 
         let tables = if state_file.exists() {
             let bytes = std::fs::read(&state_file)?;
@@ -451,12 +546,20 @@ impl InMemoryRaftCatalog {
         } else {
             HashMap::new()
         };
+        let governance = if governance_file.exists() {
+            let bytes = std::fs::read(&governance_file)?;
+            serde_json::from_slice(&bytes).unwrap_or_default()
+        } else {
+            PersistedGovernanceState::default()
+        };
 
         Ok(Self {
             tables: RwLock::new(tables),
             views: RwLock::new(views),
+            governance: RwLock::new(governance),
             state_file: Some(state_file),
             views_file: Some(views_file),
+            governance_file: Some(governance_file),
         })
     }
 
@@ -474,6 +577,16 @@ impl InMemoryRaftCatalog {
         if let Some(ref path) = self.views_file {
             let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
             let bytes = serde_json::to_vec_pretty(views)?;
+            std::fs::write(&tmp, bytes)?;
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(())
+    }
+
+    fn persist_governance_locked(&self, gov: &PersistedGovernanceState) -> Result<()> {
+        if let Some(ref path) = self.governance_file {
+            let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+            let bytes = serde_json::to_vec_pretty(gov)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
         }
@@ -651,13 +764,62 @@ impl Catalog for InMemoryRaftCatalog {
                 RustLakeError::Catalog(format!("branch '{}' not found", prop.branch))
             })?;
             if current_id != prop.expected_snapshot_id && !prop.is_append_only {
-                return Err(RustLakeError::OccConflict {
-                    table: prop.table_name.clone(),
-                    reason: format!(
-                        "expected snapshot {}, found {}",
-                        prop.expected_snapshot_id, current_id
-                    ),
-                });
+                // Wave 31: Partition-Level Disjoint OCC Resolution —
+                // If this mutating commit AND every intervening commit only touched strictly disjoint
+                // non-empty partition sets (and disjoint removed_files), auto-rebase cleanly!
+                let mut prop_parts: HashSet<BTreeMap<String, String>> = HashSet::new();
+                for f in &prop.added_files {
+                    if !f.partition_values.is_empty() {
+                        prop_parts.insert(f.partition_values.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+                    }
+                }
+                if let Some(exp_snap) = table.snapshots.get(&prop.expected_snapshot_id) {
+                    let rem_set: HashSet<&str> = prop.removed_files.iter().map(|s| s.as_str()).collect();
+                    for f in &exp_snap.data_files {
+                        if rem_set.contains(f.file_path.as_str()) && !f.partition_values.is_empty() {
+                            prop_parts.insert(f.partition_values.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+                        }
+                    }
+                }
+                let mut disjoint_ok = !prop_parts.is_empty();
+                if disjoint_ok {
+                    let prop_rem: HashSet<&str> = prop.removed_files.iter().map(|s| s.as_str()).collect();
+                    for sid in (prop.expected_snapshot_id + 1)..=current_id {
+                        let Some(inter) = table.snapshots.get(&sid) else {
+                            disjoint_ok = false;
+                            break;
+                        };
+                        let Some(raw_parts) = inter.summary.get("touched_partitions") else {
+                            disjoint_ok = false;
+                            break;
+                        };
+                        let inter_parts: Vec<BTreeMap<String, String>> =
+                            serde_json::from_str(raw_parts).unwrap_or_default();
+                        if inter_parts.is_empty()
+                            || inter_parts.iter().any(|p| prop_parts.contains(p))
+                        {
+                            disjoint_ok = false;
+                            break;
+                        }
+                        if let Some(raw_rem) = inter.summary.get("removed_files") {
+                            let inter_rem: Vec<String> =
+                                serde_json::from_str(raw_rem).unwrap_or_default();
+                            if inter_rem.iter().any(|r| prop_rem.contains(r.as_str())) {
+                                disjoint_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !disjoint_ok {
+                    return Err(RustLakeError::OccConflict {
+                        table: prop.table_name.clone(),
+                        reason: format!(
+                            "expected snapshot {}, found {}",
+                            prop.expected_snapshot_id, current_id
+                        ),
+                    });
+                }
             }
         }
 
@@ -666,17 +828,56 @@ impl Catalog for InMemoryRaftCatalog {
         for prop in proposals {
             let table = guard.get_mut(&prop.table_name).expect("validated above");
             let current_id = *table.refs.get(&prop.branch).expect("validated above");
-            let removed_set: HashSet<String> = prop.removed_files.into_iter().collect();
-            let mut files: Vec<DataFileEntry> = table
+            let cur_snap = table
                 .snapshots
                 .get(&current_id)
-                .expect("validated snapshot")
+                .expect("validated snapshot");
+            let removed_set: HashSet<String> = prop.removed_files.iter().cloned().collect();
+            let mut touched_parts: Vec<BTreeMap<String, String>> = Vec::new();
+            for f in &cur_snap.data_files {
+                if removed_set.contains(&f.file_path) && !f.partition_values.is_empty() {
+                    let pm: BTreeMap<String, String> = f
+                        .partition_values
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    if !touched_parts.contains(&pm) {
+                        touched_parts.push(pm);
+                    }
+                }
+            }
+            for f in &prop.added_files {
+                if !f.partition_values.is_empty() {
+                    let pm: BTreeMap<String, String> = f
+                        .partition_values
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    if !touched_parts.contains(&pm) {
+                        touched_parts.push(pm);
+                    }
+                }
+            }
+            let prev_eq_deletes = cur_snap.equality_deletes.clone();
+            let mut files: Vec<DataFileEntry> = cur_snap
                 .data_files
                 .iter()
                 .filter(|f| !removed_set.contains(&f.file_path))
                 .cloned()
                 .collect();
             files.extend(prop.added_files);
+
+            let mut summary = HashMap::new();
+            if !touched_parts.is_empty()
+                && let Ok(s) = serde_json::to_string(&touched_parts)
+            {
+                summary.insert("touched_partitions".into(), s);
+            }
+            if !prop.removed_files.is_empty()
+                && let Ok(s) = serde_json::to_string(&prop.removed_files)
+            {
+                summary.insert("removed_files".into(), s);
+            }
 
             let new_id = table.next_snapshot_id;
             table.next_snapshot_id += 1;
@@ -687,7 +888,8 @@ impl Catalog for InMemoryRaftCatalog {
                     parent_snapshot_id: Some(current_id),
                     timestamp_ms: new_id * 1000,
                     data_files: files,
-                    summary: HashMap::new(),
+                    equality_deletes: prev_eq_deletes,
+                    summary,
                 },
             );
             table.refs.insert(prop.branch, new_id);
@@ -811,6 +1013,7 @@ impl Catalog for InMemoryRaftCatalog {
                 parent_snapshot_id: Some(current_id),
                 timestamp_ms: new_id * 1000,
                 data_files: Vec::new(),
+                equality_deletes: Vec::new(),
                 summary: HashMap::new(),
             },
         );
@@ -931,6 +1134,7 @@ impl Catalog for InMemoryRaftCatalog {
                 parent_snapshot_id: parent_id,
                 timestamp_ms: now_ms,
                 data_files: target_files,
+                equality_deletes: Vec::new(),
                 summary,
             },
         );
@@ -985,6 +1189,115 @@ impl Catalog for InMemoryRaftCatalog {
         table.column_stats = stats;
         self.persist_locked(&guard)?;
         Ok(())
+    }
+
+    async fn apply_governance(&self, op: GovernanceOp) -> Result<()> {
+        let mut g = self.governance.write();
+        match op {
+            GovernanceOp::CreateRole(role) => {
+                if !g.roles.contains(&role) {
+                    g.roles.push(role);
+                }
+            }
+            GovernanceOp::Grant {
+                role,
+                table,
+                privilege,
+            } => {
+                if !g.roles.contains(&role) {
+                    g.roles.push(role.clone());
+                }
+                let entry = (role, table, privilege.to_uppercase());
+                if !g.grants.contains(&entry) {
+                    g.grants.push(entry);
+                }
+            }
+            GovernanceOp::Revoke {
+                role,
+                table,
+                privilege,
+            } => {
+                let p = privilege.to_uppercase();
+                g.grants.retain(|(r, t, priv_name)| {
+                    !(r == &role && t == &table && (p == "ALL" || priv_name == &p))
+                });
+            }
+            GovernanceOp::AddRlsPolicy {
+                role,
+                table,
+                predicate,
+            } => {
+                g.rls_policies.retain(|(r, t, _)| !(r == &role && t == &table));
+                g.rls_policies.push((role, table, predicate));
+            }
+            GovernanceOp::AddMaskingPolicy { role, table, rule } => {
+                g.masking_policies.push((role, table, rule));
+            }
+            GovernanceOp::RecordLineage(edge) => {
+                if g.lineage.len() >= 1000 {
+                    g.lineage.remove(0);
+                }
+                g.lineage.push(edge);
+            }
+        }
+        self.persist_governance_locked(&g)?;
+        Ok(())
+    }
+
+    async fn get_governance(&self) -> Result<PersistedGovernanceState> {
+        if let Some(ref path) = self.governance_file
+            && path.exists()
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(disk_gov) = serde_json::from_slice::<PersistedGovernanceState>(&bytes)
+        {
+            *self.governance.write() = disk_gov;
+        }
+        Ok(self.governance.read().clone())
+    }
+
+    async fn commit_equality_delete(
+        &self,
+        table_name: &str,
+        branch: &str,
+        mut eq_delete: EqualityDeleteFile,
+        upserted_files: Vec<DataFileEntry>,
+    ) -> Result<u64> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        let current_id = *table
+            .refs
+            .get(branch)
+            .ok_or_else(|| RustLakeError::Catalog(format!("branch '{branch}' not found")))?;
+        let cur_snap = table
+            .snapshots
+            .get(&current_id)
+            .ok_or_else(|| RustLakeError::Catalog(format!("snapshot {current_id} missing")))?;
+        let mut files = cur_snap.data_files.clone();
+        files.extend(upserted_files);
+        let mut eq_deletes = cur_snap.equality_deletes.clone();
+        let new_id = table.next_snapshot_id;
+        table.next_snapshot_id += 1;
+        eq_delete.sequence_number = new_id;
+        eq_deletes.push(eq_delete);
+        let mut summary = HashMap::new();
+        summary.insert("operation".into(), "equality-delete-upsert".into());
+        table.snapshots.insert(
+            new_id,
+            IcebergSnapshot {
+                snapshot_id: new_id,
+                parent_snapshot_id: Some(current_id),
+                timestamp_ms: new_id * 1000,
+                data_files: files,
+                equality_deletes: eq_deletes,
+                summary,
+            },
+        );
+        table.refs.insert(branch.to_string(), new_id);
+        self.persist_locked(&guard)?;
+        Ok(new_id)
     }
 }
 
