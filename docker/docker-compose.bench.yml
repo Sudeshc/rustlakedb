@@ -107,11 +107,14 @@ services:
       - 0.0.0.0:5432
       - --rest-addr
       - 0.0.0.0:8181
+      - --flight-addr
+      - 0.0.0.0:8815
       - --data-dir
       - /warehouse
     ports:
       - "15432:5432"
       - "18181:8181"
+      - "18815:8815"
     volumes:
       - warehouse_data:/warehouse
     healthcheck:

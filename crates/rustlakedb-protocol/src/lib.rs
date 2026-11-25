@@ -74,8 +74,92 @@ pub enum ScalarValue {
     Bool(bool),
     Int64(i64),
     Float64(f64),
+    /// Native Arrow Date32 (days since 1970-01-01, Wave 14).
+    Date(i32),
+    /// Native Arrow Decimal128 fixed-point value `(unscaled_i128, scale)` for exact financial math (Wave 14).
+    Decimal(i128, u8),
     Utf8(String),
     Json(serde_json::Value),
+}
+
+/// Converts civil `(year, month, day)` to days since 1970-01-01 (Howard Hinnant algorithm).
+pub fn parse_iso_date_days(s: &str) -> Option<i32> {
+    let date_part = s.trim().split(['T', ' ']).next()?;
+    let mut parts = date_part.split('-');
+    let y = parts.next()?.parse::<i64>().ok()?;
+    let m = parts.next()?.parse::<u32>().ok()?;
+    let d = parts.next()?.parse::<u32>().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = (y_adj - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146_097 + doe as i64 - 719_468) as i32)
+}
+
+/// Formats days since 1970-01-01 as ISO `YYYY-MM-DD`.
+pub fn format_iso_date_days(days: i32) -> String {
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
+/// Parses a decimal string or number into `(unscaled_i128, scale)`.
+pub fn parse_decimal_i128(s: &str, scale: u8) -> Option<i128> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (neg, body) = if let Some(rest) = t.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = t.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, t)
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let int_v: i128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let mut frac_digits = frac_part.chars().take(scale as usize).collect::<String>();
+    while frac_digits.len() < scale as usize {
+        frac_digits.push('0');
+    }
+    let frac_v: i128 = if frac_digits.is_empty() {
+        0
+    } else {
+        frac_digits.parse().ok()?
+    };
+    let factor = 10i128.pow(scale as u32);
+    let combined = int_v.checked_mul(factor)?.checked_add(frac_v)?;
+    Some(if neg { -combined } else { combined })
+}
+
+/// Formats `(unscaled_i128, scale)` as exact fixed-point decimal text (e.g. `12345, 2` -> `"123.45"`).
+pub fn format_decimal_i128(val: i128, scale: u8) -> String {
+    if scale == 0 {
+        return val.to_string();
+    }
+    let neg = val < 0;
+    let abs = val.unsigned_abs();
+    let factor = 10u128.pow(scale as u32);
+    let whole = abs / factor;
+    let frac = abs % factor;
+    let sign = if neg { "-" } else { "" };
+    format!("{sign}{whole}.{frac:0width$}", width = scale as usize)
 }
 
 impl ScalarValue {
@@ -85,6 +169,8 @@ impl ScalarValue {
             ScalarValue::Bool(b) => format!("B:{b}"),
             ScalarValue::Int64(i) => format!("I:{i}"),
             ScalarValue::Float64(f) => format!("F:{}", f.to_bits()),
+            ScalarValue::Date(d) => format!("D:{d}"),
+            ScalarValue::Decimal(v, s) => format!("M:{v}:{s}"),
             ScalarValue::Utf8(s) => format!("S:{s}"),
             ScalarValue::Json(v) => format!("J:{v}"),
         };
@@ -95,6 +181,7 @@ impl ScalarValue {
         match self {
             ScalarValue::Int64(i) => Some(*i as f64),
             ScalarValue::Float64(f) => Some(*f),
+            ScalarValue::Decimal(v, s) => Some((*v as f64) / 10f64.powi(*s as i32)),
             ScalarValue::Utf8(s) => s.parse::<f64>().ok(),
             _ => None,
         }
@@ -113,6 +200,8 @@ impl ScalarValue {
             ScalarValue::Bool(b) => Some(if *b { "t".into() } else { "f".into() }),
             ScalarValue::Int64(i) => Some(i.to_string()),
             ScalarValue::Float64(f) => Some(f.to_string()),
+            ScalarValue::Date(d) => Some(format_iso_date_days(*d)),
+            ScalarValue::Decimal(v, s) => Some(format_decimal_i128(*v, *s)),
             ScalarValue::Utf8(s) => Some(s.clone()),
             ScalarValue::Json(v) => Some(v.to_string()),
         }
@@ -398,6 +487,9 @@ pub enum PhysicalNode {
         group_by: Vec<ColumnExpr>,
         aggs: Vec<AggExpr>,
         is_partial: bool,
+        /// Optional SQL `ROLLUP` / `CUBE` / `GROUPING SETS` column subsets evaluated on final agg (Wave 14).
+        #[serde(default)]
+        grouping_sets: Vec<Vec<String>>,
     },
     HashJoin {
         left: Box<PhysicalNode>,

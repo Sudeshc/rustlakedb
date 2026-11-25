@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Unified Release QA test runner for RustLakeDB v2.0.0.
+  Unified Release QA test runner for RustLakeDB v4.0.0.
 .EXAMPLE
   .\scripts\run-tests.ps1
   .\scripts\run-tests.ps1 -Suite live
@@ -8,7 +8,7 @@
   .\scripts\run-tests.ps1 -StartMinio
 #>
 param(
-    [ValidateSet("all", "unit", "sql", "chaos", "acid", "pgwire", "dbeaver", "network", "persistence", "production", "wave1", "wave2", "wave3", "wave4", "wave5", "wave6", "wave7", "wave8", "wave9", "wave10", "wave11", "wave12", "wave13", "tpch", "live", "bench")]
+    [ValidateSet("all", "unit", "sql", "chaos", "acid", "pgwire", "dbeaver", "network", "persistence", "production", "wave1", "wave2", "wave3", "wave4", "wave5", "wave6", "wave7", "wave8", "wave9", "wave10", "wave11", "wave12", "wave13", "wave14", "wave15", "wave16", "tpch", "live", "bench")]
     [string]$Suite = "all",
     [switch]$Offline,
     [switch]$StartMinio
@@ -56,6 +56,9 @@ switch ($Suite) {
     "wave11"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave11_ha_snapshots_s3_interop -- --nocapture }
     "wave12"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave12_vectorized_spill_and_sql -- --nocapture }
     "wave13"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave13_cdc_tracing_and_tpch -- --nocapture }
+    "wave14"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave14_native_types_partitioning_rollup -- --nocapture }
+    "wave15"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave15_arrow_flight_grpc_and_kafka_cdc -- --nocapture }
+    "wave16"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave16_mtls_real_sts_and_interop -- --nocapture }
     "tpch"        { & cargo @CommonArgs -p rustlakedb-testkit --test wave13_cdc_tracing_and_tpch tpch -- --nocapture }
     "live"        { & cargo @CommonArgs -p rustlakedb-testkit --test live_multiprocess }
     "bench"       { & cargo @CommonArgs -p rustlakedb-testkit --test benchmarks -- --nocapture }

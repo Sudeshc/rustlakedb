@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod autoloader;
+pub mod kafka_ingest;
 pub mod maintainer;
 pub mod pg_catalog;
 pub mod security;
@@ -84,6 +85,21 @@ pub struct HttpWorkerClient {
 
 impl HttpWorkerClient {
     pub fn new(worker_id: impl Into<String>, base_url: impl Into<String>) -> Self {
+        let worker_id = worker_id.into();
+        let base_url = base_url.into();
+        // Automatically enable cluster mTLS when RUSTLAKEDB_MTLS_CA/CERT/KEY are configured (Wave 16).
+        if let (Ok(ca_p), Ok(cert_p), Ok(key_p)) = (
+            std::env::var("RUSTLAKEDB_MTLS_CA"),
+            std::env::var("RUSTLAKEDB_MTLS_CERT"),
+            std::env::var("RUSTLAKEDB_MTLS_KEY"),
+        ) && let (Ok(ca), Ok(cert), Ok(key)) = (
+            std::fs::read(&ca_p),
+            std::fs::read(&cert_p),
+            std::fs::read(&key_p),
+        ) && let Ok(client) = Self::new_mtls(&worker_id, &base_url, &ca, &cert, &key)
+        {
+            return client;
+        }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(400))
             .timeout(Duration::from_secs(30))
@@ -91,10 +107,46 @@ impl HttpWorkerClient {
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             worker_id: WorkerId::new(worker_id),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             http,
             unhealthy_until_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Constructs a mutual-TLS (mTLS) Worker RPC client presenting a cluster-CA-signed client certificate
+    /// and strictly validating the remote worker certificate against `ca_pem` (Wave 16).
+    pub fn new_mtls(
+        worker_id: impl Into<String>,
+        base_url: impl Into<String>,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+    ) -> Result<Self> {
+        let ca_cert = reqwest::Certificate::from_pem(ca_pem)
+            .map_err(|e| RustLakeError::Execution(format!("invalid mTLS CA PEM: {e}")))?;
+        let mut identity_pem = Vec::with_capacity(client_cert_pem.len() + client_key_pem.len() + 2);
+        identity_pem.extend_from_slice(client_cert_pem);
+        identity_pem.push(b'\n');
+        identity_pem.extend_from_slice(client_key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .map_err(|e| RustLakeError::Execution(format!("invalid mTLS client identity PEM: {e}")))?;
+
+        let http = reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca_cert)
+            .identity(identity)
+            .connect_timeout(Duration::from_millis(800))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| RustLakeError::Execution(format!("build mTLS worker client: {e}")))?;
+
+        Ok(Self {
+            worker_id: WorkerId::new(worker_id),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http,
+            unhealthy_until_ms: AtomicU64::new(0),
+        })
     }
 
     fn trip_circuit_breaker(&self) {
@@ -481,7 +533,7 @@ impl Coordinator {
                     )]));
                 }
                 let summary = format!(
-                    "Execution Summary: elapsed={:.2} ms | rows={} | stages={} | tasks={} | retries={} | aqe_coalesced={} | aqe_skew_splits={} | shuffled_bytes={} | cache_hits={} | puffin_pruned={} | zonemap_pruned={}",
+                    "Execution Summary: elapsed={:.2} ms | rows={} | stages={} | tasks={} | retries={} | aqe_coalesced={} | aqe_skew_splits={} | shuffled_bytes={} | cache_hits={} | partition_pruned={} | puffin_pruned={} | zonemap_pruned={}",
                     elapsed_ms,
                     res.batch.num_rows(),
                     res.stats.stages_executed,
@@ -491,6 +543,7 @@ impl Coordinator {
                     res.stats.aqe_skew_splits_applied,
                     res.stats.total_shuffled_bytes,
                     self.store.cache_hits.load(Ordering::Relaxed),
+                    self.store.files_pruned_by_partition.load(Ordering::Relaxed),
                     self.store.files_pruned_by_puffin.load(Ordering::Relaxed),
                     self.store.files_pruned_by_zonemap.load(Ordering::Relaxed),
                 );
@@ -604,16 +657,14 @@ impl Coordinator {
                         })
                         .collect();
                     let batch = RowBatch::new(target_cols, mapped_rows);
-                    let file_path = format!("{table_name}/data/ins-sel-{}.parquet", Uuid::new_v4());
-                    let entry = self
-                        .store
-                        .write_data_file(&file_path, &meta.schema, &batch)
+                    let added_files = self
+                        .write_partitioned_data_files(&meta, "ins-sel", &batch)
                         .await?;
                     let prop = TableCommitProposal {
                         table_name: table_name.clone(),
                         branch: branch.to_string(),
                         expected_snapshot_id: snap.snapshot_id,
-                        added_files: vec![entry],
+                        added_files,
                         removed_files: vec![],
                         is_append_only: true,
                     };
@@ -837,17 +888,15 @@ impl Coordinator {
                 self.governance.check_access(session, &table_name, "INSERT")?;
                 let meta = self.catalog.get_table(&table_name).await?;
                 let snap = meta.current_snapshot(branch)?;
-                let file_path = format!("{table_name}/data/part-{}.parquet", Uuid::new_v4());
-                let entry = self
-                    .store
-                    .write_data_file(&file_path, &meta.schema, &batch)
-                    .await?;
                 let count = batch.num_rows();
+                let added_files = self
+                    .write_partitioned_data_files(&meta, "part", &batch)
+                    .await?;
                 let prop = TableCommitProposal {
                     table_name: table_name.clone(),
                     branch: branch.to_string(),
                     expected_snapshot_id: snap.snapshot_id,
-                    added_files: vec![entry],
+                    added_files,
                     removed_files: vec![],
                     is_append_only: true,
                 };
@@ -2468,6 +2517,14 @@ impl Coordinator {
                     ColumnType::Variant => serde_json::from_str::<serde_json::Value>(trimmed)
                         .map(ScalarValue::Json)
                         .map_err(|e| e.to_string()),
+                    ColumnType::Date => rustlakedb_protocol::parse_iso_date_days(trimmed)
+                        .map(ScalarValue::Date)
+                        .ok_or_else(|| format!("invalid DATE literal '{trimmed}'")),
+                    ColumnType::Decimal { scale, .. } => {
+                        rustlakedb_protocol::parse_decimal_i128(trimmed, *scale)
+                            .map(|v| ScalarValue::Decimal(v, *scale))
+                            .ok_or_else(|| format!("invalid DECIMAL literal '{trimmed}'"))
+                    }
                     ColumnType::Utf8 | ColumnType::TimestampTz => {
                         Ok(ScalarValue::Utf8(trimmed.to_string()))
                     }
@@ -2516,6 +2573,80 @@ impl Coordinator {
             self.store.write_iceberg_metadata(&updated, branch).await?;
         }
         Ok((loaded, bad_count))
+    }
+
+    /// Wave 14 Write-Time Iceberg Hidden Partition Router:
+    /// When `meta.partition_by` is configured (`region`, `days(ts)`, `bucket(N, id)`, `truncate(W, s)`),
+    /// splits incoming rows into physical partition directories and stamps `DataFileEntry.partition_values`
+    /// so Layer 0 partition pruning skips non-matching files in O(1) without touching Parquet!
+    async fn write_partitioned_data_files(
+        &self,
+        meta: &IcebergTableMetadata,
+        file_prefix: &str,
+        batch: &RowBatch,
+    ) -> Result<Vec<rustlakedb_catalog::DataFileEntry>> {
+        if batch.num_rows() == 0 {
+            return Ok(vec![]);
+        }
+        if meta.partition_by.is_empty() {
+            let path = format!(
+                "{}/data/{}-{}.parquet",
+                meta.table_name,
+                file_prefix,
+                Uuid::new_v4()
+            );
+            return Ok(vec![
+                self.store.write_data_file(&path, &meta.schema, batch).await?,
+            ]);
+        }
+
+        type PartitionRowsMap = BTreeMap<Vec<(String, String)>, Vec<BTreeMap<String, ScalarValue>>>;
+        let mut grouped: PartitionRowsMap = BTreeMap::new();
+        for row in &batch.rows {
+            let mut key = Vec::with_capacity(meta.partition_by.len());
+            for spec in &meta.partition_by {
+                let src_col = rustlakedb_catalog::partition_spec_source_col(spec);
+                let raw_val = row
+                    .get(&src_col)
+                    .and_then(|v| v.to_pg_text())
+                    .unwrap_or_else(|| "__HIVE_DEFAULT_PARTITION__".into());
+                let (_, part_val) = rustlakedb_catalog::eval_partition_transform(spec, &raw_val);
+                key.push((spec.clone(), part_val));
+            }
+            grouped.entry(key).or_default().push(row.clone());
+        }
+
+        let mut entries = Vec::with_capacity(grouped.len());
+        for (part_kv, rows) in grouped {
+            let dir_segs: Vec<String> = part_kv
+                .iter()
+                .map(|(spec, val)| {
+                    let clean_spec = spec
+                        .replace(['(', ')', ',', ' '], "_")
+                        .trim_matches('_')
+                        .to_string();
+                    let clean_val = val.replace(['/', '\\', ' '], "_");
+                    format!("{clean_spec}={clean_val}")
+                })
+                .collect();
+            let path = format!(
+                "{}/data/{}/{}-{}.parquet",
+                meta.table_name,
+                dir_segs.join("/"),
+                file_prefix,
+                Uuid::new_v4()
+            );
+            let sub_batch = RowBatch::new(batch.columns.clone(), rows);
+            let mut entry = self
+                .store
+                .write_data_file(&path, &meta.schema, &sub_batch)
+                .await?;
+            for (spec, val) in part_kv {
+                entry.partition_values.insert(spec, val);
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
     }
 
     pub async fn execute_dag(&self, dag: StageDag) -> Result<QueryExecutionResult> {
@@ -3116,6 +3247,20 @@ fn coerce_json_value(
             .map(ScalarValue::Bool)
             .ok_or_else(|| format!("expected bool, got {val}")),
         ColumnType::Variant => Ok(ScalarValue::Json(val.clone())),
+        ColumnType::Date => val
+            .as_str()
+            .and_then(rustlakedb_protocol::parse_iso_date_days)
+            .map(ScalarValue::Date)
+            .ok_or_else(|| format!("expected ISO date YYYY-MM-DD, got {val}")),
+        ColumnType::Decimal { scale, .. } => {
+            let s = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            rustlakedb_protocol::parse_decimal_i128(&s, *scale)
+                .map(|v| ScalarValue::Decimal(v, *scale))
+                .ok_or_else(|| format!("expected decimal, got {val}"))
+        }
         ColumnType::Utf8 | ColumnType::TimestampTz => match val {
             serde_json::Value::String(s) => Ok(ScalarValue::Utf8(s.clone())),
             other => Ok(ScalarValue::Utf8(other.to_string())),

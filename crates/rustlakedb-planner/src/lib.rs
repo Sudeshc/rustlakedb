@@ -612,16 +612,56 @@ impl DistributedPlanner {
                     let mut row_map = BTreeMap::new();
                     for (col_name, expr) in col_names.iter().zip(val_row.iter()) {
                         let mut scalar = parse_scalar(expr)?;
-                        if matches!(col_types.get(col_name), Some(ColumnType::Variant))
-                            && let ScalarValue::Utf8(s) = scalar {
-                                let json_val: serde_json::Value = serde_json::from_str(&s)
-                                    .map_err(|e| {
-                                        RustLakeError::SqlParse(format!(
-                                            "invalid JSON for column '{col_name}': {e}"
-                                        ))
-                                    })?;
-                                scalar = ScalarValue::Json(json_val);
+                        match col_types.get(col_name) {
+                            Some(ColumnType::Variant) => {
+                                if let ScalarValue::Utf8(s) = scalar {
+                                    let json_val: serde_json::Value = serde_json::from_str(&s)
+                                        .map_err(|e| {
+                                            RustLakeError::SqlParse(format!(
+                                                "invalid JSON for column '{col_name}': {e}"
+                                            ))
+                                        })?;
+                                    scalar = ScalarValue::Json(json_val);
+                                }
                             }
+                            Some(ColumnType::Date) => {
+                                if let ScalarValue::Utf8(ref s) = scalar
+                                    && let Some(days) = rustlakedb_protocol::parse_iso_date_days(s)
+                                {
+                                    scalar = ScalarValue::Date(days);
+                                }
+                            }
+                            Some(ColumnType::Decimal { scale, .. }) => {
+                                let sc = *scale;
+                                scalar = match scalar {
+                                    ScalarValue::Int64(i) => ScalarValue::Decimal(
+                                        (i as i128) * 10i128.pow(sc as u32),
+                                        sc,
+                                    ),
+                                    ScalarValue::Float64(f) => {
+                                        if let Some(v) = rustlakedb_protocol::parse_decimal_i128(
+                                            &format!("{f:.*}", sc as usize),
+                                            sc,
+                                        ) {
+                                            ScalarValue::Decimal(v, sc)
+                                        } else {
+                                            ScalarValue::Float64(f)
+                                        }
+                                    }
+                                    ScalarValue::Utf8(ref s) => {
+                                        if let Some(v) =
+                                            rustlakedb_protocol::parse_decimal_i128(s, sc)
+                                        {
+                                            ScalarValue::Decimal(v, sc)
+                                        } else {
+                                            scalar
+                                        }
+                                    }
+                                    other => other,
+                                };
+                            }
+                            _ => {}
+                        }
                         row_map.insert(col_name.clone(), scalar);
                     }
                     rows.push(row_map);
@@ -1056,15 +1096,13 @@ impl DistributedPlanner {
                 };
             }
 
-            let group_by_exprs: Vec<ColumnExpr> = match select.group_by {
-                GroupByExpr::Expressions(exprs, _) => exprs
-                    .into_iter()
-                    .map(|e| parse_col_expr(&e, None))
-                    .collect::<Result<Vec<_>>>()?,
-                GroupByExpr::All(_) => {
-                    return Err(RustLakeError::Plan("GROUP BY ALL not yet supported".into()))
-                }
-            };
+            let (group_by_exprs, grouping_sets): (Vec<ColumnExpr>, Vec<Vec<String>>) =
+                match select.group_by {
+                    GroupByExpr::Expressions(exprs, _) => parse_group_by_exprs(exprs)?,
+                    GroupByExpr::All(_) => {
+                        return Err(RustLakeError::Plan("GROUP BY ALL not yet supported".into()))
+                    }
+                };
 
             let mut projected_exprs: Vec<ColumnExpr> = Vec::new();
             let mut aggs: Vec<AggExpr> = Vec::new();
@@ -1130,12 +1168,14 @@ impl DistributedPlanner {
                     group_by: aligned_group_by.clone(),
                     aggs: aggs.clone(),
                     is_partial: true,
+                    grouping_sets: vec![],
                 };
                 node = PhysicalNode::HashAggregate {
                     input: Box::new(partial),
                     group_by: aligned_group_by,
                     aggs,
                     is_partial: false,
+                    grouping_sets,
                 };
                 if let Some(hpred) = having_pred {
                     node = PhysicalNode::Filter {
@@ -1477,6 +1517,7 @@ impl DistributedPlanner {
                 group_by,
                 aggs,
                 is_partial,
+                grouping_sets,
             } => {
                 let child = self.ensure_requirements(*input);
                 if is_partial {
@@ -1485,10 +1526,11 @@ impl DistributedPlanner {
                         group_by,
                         aggs,
                         is_partial: true,
+                        grouping_sets: vec![],
                     }
                 } else {
                     let g_cols: Vec<String> = group_by.iter().map(|g| g.output_name()).collect();
-                    let req = if g_cols.is_empty() {
+                    let req = if g_cols.is_empty() || !grouping_sets.is_empty() {
                         Distribution::SinglePartition
                     } else {
                         Distribution::HashPartitioned(g_cols.clone())
@@ -1497,7 +1539,7 @@ impl DistributedPlanner {
                     let final_input = if satisfied {
                         child
                     } else {
-                        let target = if g_cols.is_empty() {
+                        let target = if g_cols.is_empty() || !grouping_sets.is_empty() {
                             Partitioning::Single
                         } else {
                             Partitioning::Hash {
@@ -1516,6 +1558,7 @@ impl DistributedPlanner {
                         group_by,
                         aggs,
                         is_partial: false,
+                        grouping_sets,
                     }
                 }
             }
@@ -1683,6 +1726,7 @@ impl DistributedPlanner {
                     group_by,
                     aggs,
                     is_partial,
+                    grouping_sets,
                 } => {
                     let (p, deps) = cut_rec(*input, stages, next_stage_id);
                     (
@@ -1691,6 +1735,7 @@ impl DistributedPlanner {
                             group_by,
                             aggs,
                             is_partial,
+                            grouping_sets,
                         },
                         deps,
                     )
@@ -1798,15 +1843,38 @@ fn extract_create_table_partition_by(sql: &str) -> (String, Vec<String>) {
         return (sql.to_string(), vec![]);
     };
     let before = sql[..pos].trim().to_string();
-    let tail = sql[pos + " PARTITION BY ".len()..]
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')');
-    let parts: Vec<String> = tail
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut tail = sql[pos + " PARTITION BY ".len()..].trim();
+    if let Some(inner) = tail.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        tail = inner;
+    }
+    // Split on top-level commas only so transforms like `bucket(16, id)` stay intact!
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    for ch in tail.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let last = cur.trim();
+    if !last.is_empty() {
+        parts.push(last.to_string());
+    }
     (before, parts)
 }
 
@@ -2125,9 +2193,18 @@ fn map_sql_data_type(dt: &SqlDataType) -> Result<ColumnType> {
         | SqlDataType::Double
         | SqlDataType::DoublePrecision
         | SqlDataType::Real
-        | SqlDataType::Decimal(_)
-        | SqlDataType::Numeric(_)
         | SqlDataType::Float64 => Ok(ColumnType::Float64),
+        SqlDataType::Decimal(info) | SqlDataType::Numeric(info) => {
+            let (precision, scale) = match info {
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    ((*p).clamp(1, 38) as u8, (*s).clamp(0, 18) as u8)
+                }
+                sqlparser::ast::ExactNumberInfo::Precision(p) => ((*p).clamp(1, 38) as u8, 0u8),
+                sqlparser::ast::ExactNumberInfo::None => (18u8, 2u8),
+            };
+            Ok(ColumnType::Decimal { precision, scale })
+        }
+        SqlDataType::Date => Ok(ColumnType::Date),
         SqlDataType::Text
         | SqlDataType::Varchar(_)
         | SqlDataType::Char(_)
@@ -2479,6 +2556,7 @@ fn push_projections_to_scans(
             group_by,
             aggs,
             is_partial,
+            grouping_sets,
         } => {
             if is_partial {
                 let mut child_req = HashSet::new();
@@ -2509,6 +2587,7 @@ fn push_projections_to_scans(
                     group_by,
                     aggs,
                     is_partial,
+                    grouping_sets,
                 }
             } else {
                 PhysicalNode::HashAggregate {
@@ -2516,6 +2595,7 @@ fn push_projections_to_scans(
                     group_by,
                     aggs,
                     is_partial,
+                    grouping_sets,
                 }
             }
         }
@@ -3087,6 +3167,80 @@ fn parse_alter_rename_table(sql: &str) -> Result<PlannedCommand> {
     let old_name = normalize_table_name(&sql["ALTER TABLE ".len()..ren_pos]);
     let new_name = normalize_table_name(&sql[ren_pos + " RENAME TO ".len()..]);
     Ok(PlannedCommand::AlterRenameTable { old_name, new_name })
+}
+
+/// Parses SQL `GROUP BY`, `GROUP BY ROLLUP(...)`, `GROUP BY CUBE(...)`, and `GROUP BY GROUPING SETS (...)` (Wave 14).
+fn parse_group_by_exprs(exprs: Vec<Expr>) -> Result<(Vec<ColumnExpr>, Vec<Vec<String>>)> {
+    let mut base_cols: Vec<ColumnExpr> = Vec::new();
+    let mut grouping_sets: Vec<Vec<String>> = Vec::new();
+
+    for e in exprs {
+        match e {
+            Expr::Rollup(groups) => {
+                let cols: Vec<ColumnExpr> = groups
+                    .into_iter()
+                    .flatten()
+                    .map(|ge| parse_col_expr(&ge, None))
+                    .collect::<Result<Vec<_>>>()?;
+                let names: Vec<String> = cols.iter().map(|c| c.output_name()).collect();
+                for c in cols {
+                    if !base_cols.contains(&c) {
+                        base_cols.push(c);
+                    }
+                }
+                // ROLLUP(a, b) -> [(a, b), (a), ()]
+                for len in (0..=names.len()).rev() {
+                    grouping_sets.push(names[..len].to_vec());
+                }
+            }
+            Expr::Cube(groups) => {
+                let cols: Vec<ColumnExpr> = groups
+                    .into_iter()
+                    .flatten()
+                    .map(|ge| parse_col_expr(&ge, None))
+                    .collect::<Result<Vec<_>>>()?;
+                let names: Vec<String> = cols.iter().map(|c| c.output_name()).collect();
+                for c in cols {
+                    if !base_cols.contains(&c) {
+                        base_cols.push(c);
+                    }
+                }
+                // CUBE(a, b) -> all 2^n subsets (highest cardinality first)
+                let n = names.len();
+                let mut subsets: Vec<Vec<String>> = Vec::with_capacity(1 << n);
+                for mask in (0..(1usize << n)).rev() {
+                    let mut sub = Vec::new();
+                    for (i, nm) in names.iter().enumerate() {
+                        if (mask & (1 << (n - 1 - i))) != 0 {
+                            sub.push(nm.clone());
+                        }
+                    }
+                    subsets.push(sub);
+                }
+                grouping_sets.extend(subsets);
+            }
+            Expr::GroupingSets(sets) => {
+                for set in sets {
+                    let mut sub_names = Vec::new();
+                    for ge in set {
+                        let ce = parse_col_expr(&ge, None)?;
+                        sub_names.push(ce.output_name());
+                        if !base_cols.contains(&ce) {
+                            base_cols.push(ce);
+                        }
+                    }
+                    grouping_sets.push(sub_names);
+                }
+            }
+            other => {
+                let ce = parse_col_expr(&other, None)?;
+                if !base_cols.contains(&ce) {
+                    base_cols.push(ce);
+                }
+            }
+        }
+    }
+    Ok((base_cols, grouping_sets))
 }
 
 fn parse_create_function(sql: &str) -> Result<PlannedCommand> {

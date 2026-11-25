@@ -4,9 +4,15 @@
 pub mod hnsw;
 pub mod iceberg_avro;
 
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::builder::{
+    BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, Int64Builder, StringBuilder,
+    TimestampMicrosecondBuilder,
+};
+use arrow_array::{
+    Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
+};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -131,6 +137,7 @@ pub struct IcebergObjectStore {
     pub parquet_files_read: AtomicU64,
     pub files_pruned_by_puffin: AtomicU64,
     pub files_pruned_by_zonemap: AtomicU64,
+    pub files_pruned_by_partition: AtomicU64,
     pub rows_skipped_by_dv: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
@@ -166,6 +173,7 @@ impl IcebergObjectStore {
             parquet_files_read: AtomicU64::new(0),
             files_pruned_by_puffin: AtomicU64::new(0),
             files_pruned_by_zonemap: AtomicU64::new(0),
+            files_pruned_by_partition: AtomicU64::new(0),
             rows_skipped_by_dv: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -322,6 +330,7 @@ impl IcebergObjectStore {
             ndv_estimates,
             column_min,
             column_max,
+            partition_values: HashMap::new(),
         })
     }
 
@@ -625,13 +634,17 @@ impl IcebergObjectStore {
             .schema
             .iter()
             .map(|f| {
-                let t = match f.data_type {
-                    ColumnType::Int64 => "long",
-                    ColumnType::Float64 => "double",
-                    ColumnType::Bool => "boolean",
-                    ColumnType::Utf8 => "string",
-                    ColumnType::TimestampTz => "timestamptz",
-                    ColumnType::Variant => "variant",
+                let t: String = match f.data_type {
+                    ColumnType::Int64 => "long".into(),
+                    ColumnType::Float64 => "double".into(),
+                    ColumnType::Bool => "boolean".into(),
+                    ColumnType::Utf8 => "string".into(),
+                    ColumnType::Date => "date".into(),
+                    ColumnType::TimestampTz => "timestamptz".into(),
+                    ColumnType::Decimal { precision, scale } => {
+                        format!("decimal({precision},{scale})")
+                    }
+                    ColumnType::Variant => "variant".into(),
                 };
                 serde_json::json!({
                     "id": f.field_id,
@@ -727,14 +740,13 @@ pub fn read_external_parquet(path: &Path) -> Result<RowBatch> {
     Ok(RowBatch::new(clean_cols, rows))
 }
 
-/// Serializes any `RowBatch` into a standard zero-copy **Apache Arrow IPC Stream** (`application/vnd.apache.arrow.stream`)
-/// for high-throughput Python (PyArrow, Polars, DuckDB) and BI clients!
-pub fn row_batch_to_arrow_ipc(batch: &RowBatch) -> Result<Vec<u8>> {
+/// Converts any `RowBatch` into an Apache Arrow `RecordBatch` preserving native Arrow types
+/// (`Int64`, `Float64`, `Boolean`, `Date32`, `Decimal128`, `Utf8`) for Arrow IPC & Arrow Flight SQL (Wave 14/15).
+pub fn row_batch_to_record_batch(batch: &RowBatch) -> Result<RecordBatch> {
     let mut fields = Vec::with_capacity(batch.columns.len());
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.columns.len());
 
     for col in &batch.columns {
-        // Infer column Arrow type from first non-null row value.
         let inferred = batch
             .rows
             .iter()
@@ -759,6 +771,29 @@ pub fn row_batch_to_arrow_ipc(batch: &RowBatch) -> Result<Vec<u8>> {
                     match r.get(col).and_then(|v| v.as_f64()) {
                         Some(v) => b.append_value(v),
                         None => b.append_null(),
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            Some(ScalarValue::Date(_)) => {
+                fields.push(Field::new(col, DataType::Date32, true));
+                let mut b = Date32Builder::new();
+                for r in &batch.rows {
+                    match r.get(col) {
+                        Some(ScalarValue::Date(d)) => b.append_value(*d),
+                        _ => b.append_null(),
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            Some(ScalarValue::Decimal(_, scale)) => {
+                let s = *scale;
+                fields.push(Field::new(col, DataType::Decimal128(38, s as i8), true));
+                let mut b = Decimal128Builder::new().with_data_type(DataType::Decimal128(38, s as i8));
+                for r in &batch.rows {
+                    match r.get(col) {
+                        Some(ScalarValue::Decimal(v, _)) => b.append_value(*v),
+                        _ => b.append_null(),
                     }
                 }
                 arrays.push(Arc::new(b.finish()));
@@ -789,13 +824,23 @@ pub fn row_batch_to_arrow_ipc(batch: &RowBatch) -> Result<Vec<u8>> {
     }
 
     let arrow_schema = Arc::new(Schema::new(fields));
+    if arrow_schema.fields().is_empty() {
+        return Ok(RecordBatch::new_empty(arrow_schema));
+    }
+    RecordBatch::try_new(arrow_schema, arrays)
+        .map_err(|e| RustLakeError::Execution(format!("arrow record batch build: {e}")))
+}
+
+/// Serializes any `RowBatch` into a standard zero-copy **Apache Arrow IPC Stream** (`application/vnd.apache.arrow.stream`)
+/// for high-throughput Python (PyArrow, Polars, DuckDB) and BI clients!
+pub fn row_batch_to_arrow_ipc(batch: &RowBatch) -> Result<Vec<u8>> {
+    let rb = row_batch_to_record_batch(batch)?;
+    let arrow_schema = rb.schema();
     let mut out = Vec::new();
     {
         let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut out, &arrow_schema)
             .map_err(|e| RustLakeError::Execution(format!("arrow ipc writer init: {e}")))?;
         if !arrow_schema.fields().is_empty() {
-            let rb = RecordBatch::try_new(arrow_schema.clone(), arrays)
-                .map_err(|e| RustLakeError::Execution(format!("arrow ipc batch: {e}")))?;
             writer
                 .write(&rb)
                 .map_err(|e| RustLakeError::Execution(format!("arrow ipc write: {e}")))?;
@@ -887,7 +932,109 @@ fn row_batch_to_arrow_and_puffin(
                 }
                 arrays.push(Arc::new(b.finish()));
             }
-            ColumnType::Utf8 | ColumnType::TimestampTz => {
+            ColumnType::Date => {
+                fields.push(Field::new(&col.name, DataType::Date32, col.nullable));
+                let mut b = Date32Builder::new();
+                let mut min_v: Option<i32> = None;
+                let mut max_v: Option<i32> = None;
+                for r in &batch.rows {
+                    let parsed = match r.get(&col.name) {
+                        Some(ScalarValue::Date(d)) => Some(*d),
+                        Some(ScalarValue::Utf8(s)) => rustlakedb_protocol::parse_iso_date_days(s),
+                        _ => None,
+                    };
+                    match parsed {
+                        Some(d) => {
+                            min_v = Some(min_v.map_or(d, |m| m.min(d)));
+                            max_v = Some(max_v.map_or(d, |m| m.max(d)));
+                            b.append_value(d);
+                        }
+                        None => b.append_null(),
+                    }
+                }
+                if let (Some(mn), Some(mx)) = (min_v, max_v) {
+                    col_min.insert(col.name.clone(), rustlakedb_protocol::format_iso_date_days(mn));
+                    col_max.insert(col.name.clone(), rustlakedb_protocol::format_iso_date_days(mx));
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            ColumnType::Decimal { precision, scale } => {
+                let dt = DataType::Decimal128(precision, scale as i8);
+                fields.push(Field::new(&col.name, dt.clone(), col.nullable));
+                let mut b = Decimal128Builder::new().with_data_type(dt);
+                let mut min_v: Option<i128> = None;
+                let mut max_v: Option<i128> = None;
+                for r in &batch.rows {
+                    let parsed = match r.get(&col.name) {
+                        Some(ScalarValue::Decimal(v, s)) => {
+                            if *s == scale {
+                                Some(*v)
+                            } else {
+                                let txt = rustlakedb_protocol::format_decimal_i128(*v, *s);
+                                rustlakedb_protocol::parse_decimal_i128(&txt, scale)
+                            }
+                        }
+                        Some(ScalarValue::Int64(i)) => {
+                            (*i as i128).checked_mul(10i128.pow(scale as u32))
+                        }
+                        Some(ScalarValue::Float64(f)) => {
+                            rustlakedb_protocol::parse_decimal_i128(&format!("{f:.*}", scale as usize), scale)
+                        }
+                        Some(ScalarValue::Utf8(s)) => rustlakedb_protocol::parse_decimal_i128(s, scale),
+                        _ => None,
+                    };
+                    match parsed {
+                        Some(v) => {
+                            min_v = Some(min_v.map_or(v, |m| m.min(v)));
+                            max_v = Some(max_v.map_or(v, |m| m.max(v)));
+                            b.append_value(v);
+                        }
+                        None => b.append_null(),
+                    }
+                }
+                if let (Some(mn), Some(mx)) = (min_v, max_v) {
+                    col_min.insert(
+                        col.name.clone(),
+                        rustlakedb_protocol::format_decimal_i128(mn, scale),
+                    );
+                    col_max.insert(
+                        col.name.clone(),
+                        rustlakedb_protocol::format_decimal_i128(mx, scale),
+                    );
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            ColumnType::TimestampTz => {
+                fields.push(Field::new(
+                    &col.name,
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    col.nullable,
+                ));
+                let mut b = TimestampMicrosecondBuilder::new().with_timezone("UTC");
+                let mut min_v: Option<String> = None;
+                let mut max_v: Option<String> = None;
+                for r in &batch.rows {
+                    match r.get(&col.name) {
+                        Some(ScalarValue::Utf8(s)) => {
+                            if let Some(us) = parse_iso_timestamp_micros(s) {
+                                min_v = Some(min_v.map_or_else(|| s.clone(), |m| if *s < m { s.clone() } else { m }));
+                                max_v = Some(max_v.map_or_else(|| s.clone(), |m| if *s > m { s.clone() } else { m }));
+                                b.append_value(us);
+                            } else {
+                                b.append_null();
+                            }
+                        }
+                        Some(ScalarValue::Int64(us)) => b.append_value(*us),
+                        _ => b.append_null(),
+                    }
+                }
+                if let (Some(mn), Some(mx)) = (min_v, max_v) {
+                    col_min.insert(col.name.clone(), mn);
+                    col_max.insert(col.name.clone(), mx);
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            ColumnType::Utf8 => {
                 fields.push(Field::new(&col.name, DataType::Utf8, col.nullable));
                 let mut b = StringBuilder::new();
                 let mut distinct = HashSet::new();
@@ -1049,6 +1196,19 @@ fn extract_scalar(
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
         return ScalarValue::Float64(a.value(row_idx));
     }
+    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+        return ScalarValue::Date(a.value(row_idx));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>() {
+        let scale = match a.data_type() {
+            DataType::Decimal128(_, s) => (*s).max(0) as u8,
+            _ => 2,
+        };
+        return ScalarValue::Decimal(a.value(row_idx), scale);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return ScalarValue::Utf8(format_iso_timestamp_micros(a.value(row_idx)));
+    }
     if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
         return ScalarValue::Bool(a.value(row_idx));
     }
@@ -1062,4 +1222,36 @@ fn extract_scalar(
         return ScalarValue::Utf8(s.to_string());
     }
     ScalarValue::Null
+}
+
+fn parse_iso_timestamp_micros(s: &str) -> Option<i64> {
+    let trimmed = s.trim().trim_end_matches('Z');
+    let (date_str, time_str) = trimmed
+        .split_once('T')
+        .or_else(|| trimmed.split_once(' '))
+        .unwrap_or((trimmed, "00:00:00"));
+    let days = rustlakedb_protocol::parse_iso_date_days(date_str)? as i64;
+    let mut tp = time_str.split(':');
+    let hh = tp.next().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let mm = tp.next().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let ss_part = tp.next().unwrap_or("0");
+    let (ss_s, frac_s) = ss_part.split_once('.').unwrap_or((ss_part, "0"));
+    let ss = ss_s.parse::<i64>().unwrap_or(0);
+    let mut frac_6 = frac_s.chars().take(6).collect::<String>();
+    while frac_6.len() < 6 {
+        frac_6.push('0');
+    }
+    let micros = frac_6.parse::<i64>().unwrap_or(0);
+    Some((days * 86_400 + hh * 3_600 + mm * 60 + ss) * 1_000_000 + micros)
+}
+
+fn format_iso_timestamp_micros(us: i64) -> String {
+    let total_secs = us.div_euclid(1_000_000);
+    let days = total_secs.div_euclid(86_400) as i32;
+    let sod = total_secs.rem_euclid(86_400);
+    let hh = sod / 3_600;
+    let mm = (sod % 3_600) / 60;
+    let ss = sod % 60;
+    let date = rustlakedb_protocol::format_iso_date_days(days);
+    format!("{date}T{hh:02}:{mm:02}:{ss:02}Z")
 }

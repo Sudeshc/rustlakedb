@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow-array.workspace = true
+arrow-flight.workspace = true
 arrow-ipc.workspace = true
+arrow-schema.workspace = true
 async-trait.workspace = true
+axum.workspace = true
 bytes.workspace = true
+futures.workspace = true
 parquet.workspace = true
 reqwest.workspace = true
 roaring.workspace = true
@@ -15,6 +20,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
+tonic.workspace = true
 rustlakedb-catalog = { path = "../rustlakedb-catalog" }
 rustlakedb-common = { path = "../rustlakedb-common" }
 rustlakedb-coordinator = { path = "../rustlakedb-coordinator" }

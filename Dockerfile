@@ -1,4 +1,4 @@
-# Multi-stage cloud-anywhere build for RustLakeDB v3.0.0 (AWS S3 / GCP GCS / Azure / On-Prem)
+# Multi-stage cloud-anywhere build for RustLakeDB v4.0.0 (AWS S3 / GCP GCS / Azure / On-Prem)
 FROM rust:1-bookworm AS builder
 WORKDIR /usr/src/rustlakedb
 COPY Cargo.toml Cargo.lock README.md ./
@@ -12,8 +12,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/src/rustlakedb/target/release/rustlakedb /usr/local/bin/rustlakedb
 
-# PostgreSQL v3 Wire Protocol (5432), Worker RPC (7001), Iceberg v3 REST Catalog (8181)
-EXPOSE 5432 7001 8181
+# PostgreSQL v3 Wire Protocol (5432), Worker RPC (7001), Iceberg v3 REST (8181), Arrow Flight gRPC (8815)
+EXPOSE 5432 7001 8181 8815
 VOLUME ["/warehouse"]
 
 ENTRYPOINT ["rustlakedb"]

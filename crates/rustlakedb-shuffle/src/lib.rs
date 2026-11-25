@@ -134,7 +134,9 @@ fn try_encode_arrow_ipc(batch: &RowBatch) -> Result<Option<Vec<u8>>> {
         for r in &batch.rows {
             match r.get(col) {
                 None | Some(ScalarValue::Null) => {}
-                Some(ScalarValue::Json(_)) => return Ok(None),
+                Some(ScalarValue::Json(_))
+                | Some(ScalarValue::Date(_))
+                | Some(ScalarValue::Decimal(_, _)) => return Ok(None),
                 Some(ScalarValue::Int64(_)) => match kind {
                     None | Some(1) => kind = Some(1),
                     Some(2) => {}

@@ -174,7 +174,9 @@ pub fn column_type_to_pg_oid(dt: &ColumnType) -> i64 {
         ColumnType::Int64 => 20,
         ColumnType::Utf8 => 25,
         ColumnType::Float64 => 701,
+        ColumnType::Date => 1082,
         ColumnType::TimestampTz => 1184,
+        ColumnType::Decimal { .. } => 1700,
         ColumnType::Variant => 3802, // jsonb
     }
 }

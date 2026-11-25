@@ -20,7 +20,12 @@ pub enum ColumnType {
     Float64,
     Utf8,
     Bool,
+    Date,
     TimestampTz,
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
     /// Apache Iceberg v3 VARIANT type (supports automatic Parquet sub-column shredding, RFC-003).
     Variant,
 }
@@ -128,6 +133,9 @@ pub struct DataFileEntry {
     /// Per-file zone-map maximum values (serialized text) for data skipping (Wave 4).
     #[serde(default)]
     pub column_max: HashMap<String, String>,
+    /// Iceberg hidden partition values (`spec_expr -> partition_value`, Wave 14).
+    #[serde(default)]
+    pub partition_values: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +157,49 @@ pub struct IcebergSnapshot {
     pub parent_snapshot_id: Option<u64>,
     pub timestamp_ms: u64,
     pub data_files: Vec<DataFileEntry>,
+    /// Arbitrary Iceberg snapshot summary properties (e.g. `kafka.offset.<topic>.<part>`, Wave 14/15).
+    #[serde(default)]
+    pub summary: HashMap<String, String>,
+}
+
+/// Evaluates an Apache Iceberg hidden-partition transform expression (`col`, `days(col)`,
+/// `bucket(N, col)`, `truncate(W, col)`) against a row value and returns `(source_column, partition_value)`.
+pub fn eval_partition_transform(spec_expr: &str, value_str: &str) -> (String, String) {
+    let trimmed = spec_expr.trim();
+    let lower = trimmed.to_lowercase();
+    if let Some(inner) = lower
+        .strip_prefix("days(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let col = trimmed[5..trimmed.len() - 1].trim().to_string();
+        let day = value_str.chars().take(10).collect::<String>();
+        let _ = inner;
+        return (col, day);
+    }
+    if lower.starts_with("bucket(") && lower.ends_with(')') {
+        let inner = &trimmed[7..trimmed.len() - 1];
+        if let Some((n_str, col_str)) = inner.split_once(',') {
+            let n = n_str.trim().parse::<u64>().unwrap_or(16).max(1);
+            let col = col_str.trim().to_string();
+            let b = xxh3_64(value_str.as_bytes()) % n;
+            return (col, b.to_string());
+        }
+    }
+    if lower.starts_with("truncate(") && lower.ends_with(')') {
+        let inner = &trimmed[9..trimmed.len() - 1];
+        if let Some((w_str, col_str)) = inner.split_once(',') {
+            let w = w_str.trim().parse::<usize>().unwrap_or(4);
+            let col = col_str.trim().to_string();
+            let trunc: String = value_str.chars().take(w).collect();
+            return (col, trunc);
+        }
+    }
+    (trimmed.to_string(), value_str.to_string())
+}
+
+/// Extracts the underlying source column name from a hidden partition spec expression.
+pub fn partition_spec_source_col(spec_expr: &str) -> String {
+    eval_partition_transform(spec_expr, "").0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +228,7 @@ impl IcebergTableMetadata {
             parent_snapshot_id: None,
             timestamp_ms: 0,
             data_files: Vec::new(),
+            summary: HashMap::new(),
         };
         let mut snapshots = BTreeMap::new();
         snapshots.insert(1, initial);
@@ -572,6 +624,7 @@ impl Catalog for InMemoryRaftCatalog {
                     parent_snapshot_id: Some(current_id),
                     timestamp_ms: new_id * 1000,
                     data_files: files,
+                    summary: HashMap::new(),
                 },
             );
             table.refs.insert(prop.branch, new_id);
@@ -695,6 +748,7 @@ impl Catalog for InMemoryRaftCatalog {
                 parent_snapshot_id: Some(current_id),
                 timestamp_ms: new_id * 1000,
                 data_files: Vec::new(),
+                summary: HashMap::new(),
             },
         );
         table.refs.insert(branch.to_string(), new_id);

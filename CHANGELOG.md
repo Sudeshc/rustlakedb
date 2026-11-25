@@ -2,6 +2,23 @@
 
 All notable changes to **RustLakeDB** are documented in this file.
 
+## [4.0.0] - 2026-11-24 — Frontier Lakehouse Release: Arrow Flight gRPC, Native Temporal/Decimal, Hidden Partitioning, Kafka CDC, Cluster mTLS & AWS STS SigV4 (Waves 14–16)
+
+### Wave 16 — Cluster-Internal mTLS, Real Cloud AWS STS `AssumeRole` SigV4 & Cross-Engine Interop
+- **Cluster-Internal Mutual TLS (mTLS):** Added `build_mtls_server_acceptor` (`WebPkiClientVerifier` over `rustls`), `WorkerHttpServer::serve_mtls`, and `HttpWorkerClient::new_mtls` (auto-enabled via `RUSTLAKEDB_MTLS_CA`, `RUSTLAKEDB_MTLS_CERT`, `RUSTLAKEDB_MTLS_KEY`) so Coordinator ↔ Worker RPC rejects any peer without a valid cluster-CA-signed client certificate.
+- **Real Cloud AWS STS `AssumeRole` SigV4 Credential Vending:** Implemented pure-Rust `AWS4-HMAC-SHA256` SigV4 signing (`sign_aws_sigv4` + `assume_role_sigv4` using `ring`) and XML `<Credentials>` parsing on `/v1/namespaces/{ns}/tables/{table}/credentials` whenever `RUSTLAKEDB_STS_ROLE_ARN` is configured.
+- **Live Cross-Engine Iceberg v3 Interop Verification:** Independently verified Iceberg v3 `v*.metadata.json`, Avro OCF manifests, and Zstd Parquet files with native Arrow types via external Apache Arrow / DuckDB / PyArrow readers.
+
+### Wave 15 — Apache Arrow Flight gRPC Server & Native Pure-Rust Kafka/Redpanda CDC Consumer
+- **Apache Arrow Flight gRPC Server (`--flight-addr 0.0.0.0:8815`):** Full `arrow-flight` + `tonic` gRPC service implementing `Handshake`, `ListFlights`, `GetFlightInfo`, `GetSchema`, and zero-copy `DoGet` streaming columnar Arrow `RecordBatch` frames for DuckDB, Polars, PyArrow, Spark, and BI clients.
+- **Native Pure-Rust Kafka / Redpanda Streaming CDC Consumer (`--mode kafka-ingest`):** Speaks the Kafka binary wire protocol (`Fetch v0` over raw TCP) directly to Kafka/Redpanda brokers, parses Debezium JSON payloads, checkpoints durable offsets to `_kafka/*.json`, and feeds atomic exactly-once `Coordinator::ingest_cdc_events`.
+- **Automated GitHub Releases & GHCR Publishing (`.github/workflows/release.yml`):** Automatically builds Linux x86_64 release tarballs + SHA256 checksums, pushes `ghcr.io/sudeshc/rustlakedb:<tag>` & `latest`, and publishes GitHub Releases on every `v*` tag push.
+
+### Wave 14 — Native Temporal/Decimal Arrow Types, Write-Time Hidden Partitioning & `ROLLUP`/`CUBE`/`GROUPING SETS`
+- **Native Arrow `Date32`, `Timestamp(Microsecond, UTC)` & `Decimal128(p, s)`:** End-to-end native physical encoding across `catalog`, `protocol`, `storage`, `shuffle`, `planner`, `coordinator`, `worker`, and PostgreSQL OIDs (`1082`, `1114`, `1700`), plus a vectorized Arrow Scan+Project fast path (`try_eval_vectorized_scan_project`).
+- **Write-Time Iceberg Hidden Partition Routing & Layer 0 Split Pruning:** Routes writes into Iceberg partition folders for identity, `days(ts)`, `bucket(N, col)`, and `truncate(W, col)` transforms, and prunes non-matching partition splits at Layer 0 (`files_pruned_by_partition`) before opening Parquet footers.
+- **OLAP Grouping Extensions:** Added `GROUP BY ROLLUP(...)`, `GROUP BY CUBE(...)`, and `GROUP BY GROUPING SETS (...)`.
+
 ## [3.0.0] - 2026-11-24 — Hyperscale Cloud, Vectorized Spill, Streaming CDC & TPC-H Release (Waves 11–13)
 
 ### Wave 13 — Debezium CDC Streaming, OpenTelemetry Tracing & TPC-H Analytical Suite

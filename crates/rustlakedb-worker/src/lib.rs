@@ -3,7 +3,10 @@
 
 pub mod rpc;
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
+};
 use roaring::RoaringBitmap;
 use rustlakedb_catalog::{Catalog, FilePuffinIndex};
 use rustlakedb_common::{MemoryPool, Result, RustLakeError, WorkerId};
@@ -179,6 +182,17 @@ impl WorkerNode {
                     let mut out_rows = Vec::new();
 
                     for split in &task.assigned_splits {
+                        // Layer 0: Iceberg Hidden-Partition Split Pruning (Wave 14) — O(1) skip before Zone-Maps/Parquet!
+                        if let Some(pred) = pushed_filter
+                            && let Some(df) = file_stats.get(split.file_path.as_str())
+                            && partition_can_skip_file(pred, &df.partition_values)
+                        {
+                            self.store
+                                .files_pruned_by_partition
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
                         // Layer 1: Zone-Map Min/Max file pruning (Wave 4 Liquid/Hilbert Clustering!)
                         if let Some(pred) = pushed_filter
                             && let Some(df) = file_stats.get(split.file_path.as_str())
@@ -276,6 +290,17 @@ impl WorkerNode {
                     Ok(RowBatch::new(batch.columns, rows))
                 }
                 PhysicalNode::Project { input, exprs } => {
+                    if let PhysicalNode::IcebergScan {
+                        table_name,
+                        pushed_filter: None,
+                        ..
+                    } = input.as_ref()
+                        && let Some(vec_proj) = self
+                            .try_eval_vectorized_scan_project(table_name, exprs, task)
+                            .await?
+                    {
+                        return Ok(vec_proj);
+                    }
                     let batch = self.eval_node(input, task).await?;
                     let out_cols: Vec<String> = exprs.iter().map(|e| e.output_name()).collect();
                     let rows = batch
@@ -399,6 +424,7 @@ impl WorkerNode {
                     group_by,
                     aggs,
                     is_partial,
+                    grouping_sets,
                 } => {
                     if *is_partial {
                         if let PhysicalNode::IcebergScan {
@@ -419,6 +445,14 @@ impl WorkerNode {
                         }
                     }
                     let batch = self.eval_node(input, task).await?;
+                    if !*is_partial && !grouping_sets.is_empty() {
+                        return Ok(eval_grouping_sets_aggregate(
+                            &batch,
+                            group_by,
+                            aggs,
+                            grouping_sets,
+                        ));
+                    }
                     self.eval_hash_aggregate_with_spill(&batch, group_by, aggs, *is_partial)
                         .await
                 }
@@ -1126,6 +1160,30 @@ fn values_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
     match (a, b) {
         (ScalarValue::Int64(x), ScalarValue::Float64(y)) => (*x as f64) == *y,
         (ScalarValue::Float64(x), ScalarValue::Int64(y)) => *x == (*y as f64),
+        (ScalarValue::Date(d), ScalarValue::Utf8(s))
+        | (ScalarValue::Utf8(s), ScalarValue::Date(d)) => {
+            rustlakedb_protocol::parse_iso_date_days(s) == Some(*d)
+        }
+        (ScalarValue::Decimal(v, s), other) | (other, ScalarValue::Decimal(v, s)) => {
+            match other {
+                ScalarValue::Decimal(v2, s2) => {
+                    if s == s2 {
+                        v == v2
+                    } else {
+                        ScalarValue::Decimal(*v, *s).as_f64() == ScalarValue::Decimal(*v2, *s2).as_f64()
+                    }
+                }
+                ScalarValue::Int64(i) => *v == (*i as i128) * 10i128.pow(*s as u32),
+                ScalarValue::Float64(f) => {
+                    rustlakedb_protocol::parse_decimal_i128(&format!("{f:.*}", *s as usize), *s)
+                        == Some(*v)
+                }
+                ScalarValue::Utf8(txt) => {
+                    rustlakedb_protocol::parse_decimal_i128(txt, *s) == Some(*v)
+                }
+                _ => false,
+            }
+        }
         _ => a == b,
     }
 }
@@ -1192,6 +1250,36 @@ fn compare_scalar(a: &ScalarValue, b: &ScalarValue) -> CmpOrdering {
         }
         (ScalarValue::Float64(x), ScalarValue::Int64(y)) => {
             x.partial_cmp(&(*y as f64)).unwrap_or(CmpOrdering::Equal)
+        }
+        (ScalarValue::Date(x), ScalarValue::Date(y)) => x.cmp(y),
+        (ScalarValue::Date(x), ScalarValue::Utf8(y)) => {
+            rustlakedb_protocol::parse_iso_date_days(y)
+                .map(|yd| x.cmp(&yd))
+                .unwrap_or_else(|| rustlakedb_protocol::format_iso_date_days(*x).cmp(y))
+        }
+        (ScalarValue::Utf8(x), ScalarValue::Date(y)) => {
+            rustlakedb_protocol::parse_iso_date_days(x)
+                .map(|xd| xd.cmp(y))
+                .unwrap_or_else(|| x.cmp(&rustlakedb_protocol::format_iso_date_days(*y)))
+        }
+        (ScalarValue::Decimal(v1, s1), ScalarValue::Decimal(v2, s2)) => {
+            if s1 == s2 {
+                v1.cmp(v2)
+            } else {
+                let f1 = ScalarValue::Decimal(*v1, *s1).as_f64().unwrap_or(0.0);
+                let f2 = ScalarValue::Decimal(*v2, *s2).as_f64().unwrap_or(0.0);
+                f1.partial_cmp(&f2).unwrap_or(CmpOrdering::Equal)
+            }
+        }
+        (ScalarValue::Decimal(_, _), other) => {
+            let f1 = a.as_f64().unwrap_or(0.0);
+            let f2 = other.as_f64().unwrap_or(0.0);
+            f1.partial_cmp(&f2).unwrap_or(CmpOrdering::Equal)
+        }
+        (other, ScalarValue::Decimal(_, _)) => {
+            let f1 = other.as_f64().unwrap_or(0.0);
+            let f2 = b.as_f64().unwrap_or(0.0);
+            f1.partial_cmp(&f2).unwrap_or(CmpOrdering::Equal)
         }
         (ScalarValue::Utf8(x), ScalarValue::Utf8(y)) => x.cmp(y),
         (ScalarValue::Bool(x), ScalarValue::Bool(y)) => x.cmp(y),
@@ -1403,6 +1491,92 @@ fn eval_hash_aggregate(
     }
 
     RowBatch::new(out_cols, out_rows)
+}
+
+/// Wave 14 SQL `ROLLUP` / `CUBE` / `GROUPING SETS` Final Aggregator:
+/// Evaluates each grouping set subset over the pre-aggregated partial rows and emits
+/// subtotal & grand-total rows with `ScalarValue::Null` on omitted dimensions!
+fn eval_grouping_sets_aggregate(
+    batch: &RowBatch,
+    all_group_by: &[ColumnExpr],
+    aggs: &[AggExpr],
+    grouping_sets: &[Vec<String>],
+) -> RowBatch {
+    let mut out_cols: Vec<String> = all_group_by.iter().map(|g| g.output_name()).collect();
+    for agg in aggs {
+        out_cols.push(agg.alias.clone());
+    }
+    let mut out_rows = Vec::new();
+    for subset in grouping_sets {
+        let sub_group_by: Vec<ColumnExpr> = all_group_by
+            .iter()
+            .filter(|g| subset.contains(&g.output_name()))
+            .cloned()
+            .collect();
+        let sub_res = eval_hash_aggregate(batch, &sub_group_by, aggs, false);
+        for mut row in sub_res.rows {
+            for g in all_group_by {
+                let name = g.output_name();
+                if !subset.contains(&name) {
+                    row.insert(name, ScalarValue::Null);
+                }
+            }
+            out_rows.push(row);
+        }
+    }
+    RowBatch::new(out_cols, out_rows)
+}
+
+/// Layer 0 Iceberg Hidden-Partition Split Pruning (Wave 14):
+/// Checks whether a file's stamped `partition_values` (`region`, `days(ts)`, `bucket(N, col)`, `truncate(W, col)`)
+/// guarantees zero rows can satisfy `pred`, allowing O(1) file skipping before reading Parquet!
+fn partition_can_skip_file(
+    pred: &FilterExpr,
+    part_vals: &HashMap<String, String>,
+) -> bool {
+    if part_vals.is_empty() {
+        return false;
+    }
+    match pred {
+        FilterExpr::And(a, b) => {
+            partition_can_skip_file(a, part_vals) || partition_can_skip_file(b, part_vals)
+        }
+        FilterExpr::Or(a, b) => {
+            partition_can_skip_file(a, part_vals) && partition_can_skip_file(b, part_vals)
+        }
+        FilterExpr::Eq { column, value } => {
+            let Some(val_text) = value.to_pg_text() else {
+                return false;
+            };
+            for (spec, file_pval) in part_vals {
+                let (src_col, pred_pval) =
+                    rustlakedb_catalog::eval_partition_transform(spec, &val_text);
+                if src_col == *column && &pred_pval != file_pval {
+                    return true;
+                }
+            }
+            false
+        }
+        FilterExpr::InList { column, values } => {
+            let pred_texts: Vec<String> = values.iter().filter_map(|v| v.to_pg_text()).collect();
+            if pred_texts.is_empty() {
+                return false;
+            }
+            for (spec, file_pval) in part_vals {
+                let src_col = rustlakedb_catalog::partition_spec_source_col(spec);
+                if src_col == *column {
+                    let any_match = pred_texts.iter().any(|vt| {
+                        rustlakedb_catalog::eval_partition_transform(spec, vt).1 == *file_pval
+                    });
+                    if !any_match {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 fn eval_hash_join(
@@ -1894,29 +2068,11 @@ impl WorkerNode {
                 let mut row = BTreeMap::new();
                 for (ci, field) in rb.schema().fields().iter().enumerate() {
                     let arr = rb.column(ci);
-                    let val = if arr.is_null(row_idx) {
-                        ScalarValue::Null
-                    } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-                        ScalarValue::Int64(a.value(row_idx))
-                    } else if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-                        ScalarValue::Float64(a.value(row_idx))
-                    } else if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-                        ScalarValue::Bool(a.value(row_idx))
-                    } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-                        let s = a.value(row_idx);
-                        if matches!(
-                            schema_types.get(field.name().as_str()),
-                            Some(rustlakedb_catalog::ColumnType::Variant)
-                        ) {
-                            serde_json::from_str::<serde_json::Value>(s)
-                                .map(ScalarValue::Json)
-                                .unwrap_or_else(|_| ScalarValue::Utf8(s.to_string()))
-                        } else {
-                            ScalarValue::Utf8(s.to_string())
-                        }
-                    } else {
-                        ScalarValue::Null
-                    };
+                    let val = extract_arrow_cell(
+                        arr.as_ref(),
+                        row_idx,
+                        schema_types.get(field.name().as_str()).copied(),
+                    );
                     row.insert(field.name().clone(), val);
                 }
                 out_rows.push(row);
@@ -1926,6 +2082,80 @@ impl WorkerNode {
         self.vectorized_rows_processed
             .fetch_add(rows_scanned, Ordering::Relaxed);
         Ok(Some(out_rows))
+    }
+
+    /// Wave 14 Vectorized Arrow Scan+Project Fast Path:
+    /// Projects columns directly from columnar Arrow `RecordBatch`es with Parquet `ProjectionMask`,
+    /// avoiding full-row deserialization of unprojected columns!
+    async fn try_eval_vectorized_scan_project(
+        &self,
+        table_name: &str,
+        exprs: &[ColumnExpr],
+        task: &TaskSpec,
+    ) -> Result<Option<RowBatch>> {
+        if task.assigned_splits.is_empty() || exprs.is_empty() {
+            return Ok(None);
+        }
+        // Fast path handles pure column projections and simple expressions over existing columns
+        let meta = self.catalog.get_table(table_name).await?;
+        let schema_types: HashMap<&str, &rustlakedb_catalog::ColumnType> = meta
+            .schema
+            .iter()
+            .map(|f| (f.name.as_str(), &f.data_type))
+            .collect();
+        let mut needed: Vec<String> = Vec::new();
+        for e in exprs {
+            if let ColumnExpr::Column(c) = e {
+                if !schema_types.contains_key(c.as_str()) {
+                    return Ok(None);
+                }
+                if !needed.contains(c) {
+                    needed.push(c.clone());
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        let out_cols: Vec<String> = exprs.iter().map(|e| e.output_name()).collect();
+        let mut out_rows = Vec::new();
+        let mut rows_scanned = 0u64;
+
+        for split in &task.assigned_splits {
+            let (batches, dv) = self
+                .store
+                .read_arrow_batches(&split.file_path, Some(&needed))
+                .await?;
+            let has_dv = !dv.is_empty();
+            let mut global_row_id = 0u32;
+
+            for rb in &batches {
+                let n = rb.num_rows();
+                for row_idx in 0..n {
+                    let cur_id = global_row_id;
+                    global_row_id += 1;
+                    if has_dv && dv.contains(cur_id) {
+                        self.store.rows_skipped_by_dv.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    rows_scanned += 1;
+                    let mut row = BTreeMap::new();
+                    for (ci, field) in rb.schema().fields().iter().enumerate() {
+                        let arr = rb.column(ci);
+                        let val = extract_arrow_cell(
+                            arr.as_ref(),
+                            row_idx,
+                            schema_types.get(field.name().as_str()).copied(),
+                        );
+                        row.insert(field.name().clone(), val);
+                    }
+                    out_rows.push(row);
+                }
+            }
+        }
+
+        self.vectorized_rows_processed
+            .fetch_add(rows_scanned, Ordering::Relaxed);
+        Ok(Some(RowBatch::new(out_cols, out_rows)))
     }
 
     /// Wave 1 Vectorized Arrow Partial-Aggregate & Shredded-JSON Zero-Parse Fast Path:
@@ -2822,6 +3052,57 @@ impl WorkerNode {
     }
 }
 
+fn extract_arrow_cell(
+    arr: &dyn Array,
+    row_idx: usize,
+    logical_type: Option<&rustlakedb_catalog::ColumnType>,
+) -> ScalarValue {
+    if arr.is_null(row_idx) {
+        return ScalarValue::Null;
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return ScalarValue::Int64(a.value(row_idx));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+        return ScalarValue::Float64(a.value(row_idx));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+        return ScalarValue::Date(a.value(row_idx));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>() {
+        let scale = match a.data_type() {
+            arrow_schema::DataType::Decimal128(_, s) => (*s).max(0) as u8,
+            _ => 2,
+        };
+        return ScalarValue::Decimal(a.value(row_idx), scale);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        let secs = a.value(row_idx).div_euclid(1_000_000);
+        let days = secs.div_euclid(86_400) as i32;
+        let sod = secs.rem_euclid(86_400);
+        return ScalarValue::Utf8(format!(
+            "{}T{:02}:{:02}:{:02}Z",
+            rustlakedb_protocol::format_iso_date_days(days),
+            sod / 3600,
+            (sod % 3600) / 60,
+            sod % 60
+        ));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+        return ScalarValue::Bool(a.value(row_idx));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        let s = a.value(row_idx);
+        if matches!(logical_type, Some(rustlakedb_catalog::ColumnType::Variant)) {
+            return serde_json::from_str::<serde_json::Value>(s)
+                .map(ScalarValue::Json)
+                .unwrap_or_else(|_| ScalarValue::Utf8(s.to_string()));
+        }
+        return ScalarValue::Utf8(s.to_string());
+    }
+    ScalarValue::Null
+}
+
 fn collect_simple_arrow_filter_cols(expr: &FilterExpr, out: &mut HashSet<String>) -> bool {
     match expr {
         FilterExpr::Eq { column, .. }
@@ -2858,6 +3139,28 @@ fn eval_arrow_filter_row(rb: &RecordBatch, row: usize, expr: &FilterExpr) -> boo
         }
         if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
             return ScalarValue::Float64(a.value(row));
+        }
+        if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+            return ScalarValue::Date(a.value(row));
+        }
+        if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>() {
+            let scale = match a.data_type() {
+                arrow_schema::DataType::Decimal128(_, s) => (*s).max(0) as u8,
+                _ => 2,
+            };
+            return ScalarValue::Decimal(a.value(row), scale);
+        }
+        if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+            let secs = a.value(row).div_euclid(1_000_000);
+            let days = secs.div_euclid(86_400) as i32;
+            let sod = secs.rem_euclid(86_400);
+            return ScalarValue::Utf8(format!(
+                "{}T{:02}:{:02}:{:02}Z",
+                rustlakedb_protocol::format_iso_date_days(days),
+                sod / 3600,
+                (sod % 3600) / 60,
+                sod % 60
+            ));
         }
         if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
             return ScalarValue::Utf8(a.value(row).to_string());

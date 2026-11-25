@@ -10,15 +10,22 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 roaring.workspace = true
 rustlakedb-catalog = { path = "../rustlakedb-catalog" }
 rustlakedb-common = { path = "../rustlakedb-common" }
 rustlakedb-protocol = { path = "../rustlakedb-protocol" }
 rustlakedb-shuffle = { path = "../rustlakedb-shuffle" }
 rustlakedb-storage = { path = "../rustlakedb-storage" }
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+tower.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 zstd.workspace = true

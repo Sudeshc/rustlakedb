@@ -5,6 +5,7 @@ use clap::{Parser, ValueEnum};
 use rustlakedb_catalog::rest::IcebergRestServer;
 use rustlakedb_catalog::InMemoryRaftCatalog;
 use rustlakedb_coordinator::{Coordinator, HttpWorkerClient, WorkerClient};
+use rustlakedb_gateway::flight::FlightGateway;
 use rustlakedb_gateway::PgGateway;
 use rustlakedb_planner::PlannerConfig;
 use rustlakedb_protocol::ShuffleMode;
@@ -25,6 +26,7 @@ enum CliMode {
     Gateway,
     Maintainer,
     Autoloader,
+    KafkaIngest,
     SeedLarge,
 }
 
@@ -97,6 +99,22 @@ struct Args {
     /// Embedded Iceberg v3 REST Catalog HTTP bind address (e.g. `127.0.0.1:8181`).
     #[arg(long)]
     rest_addr: Option<String>,
+
+    /// Optional Apache Arrow Flight gRPC bind address (e.g. `0.0.0.0:8815`, Wave 15).
+    #[arg(long)]
+    flight_addr: Option<String>,
+
+    /// Kafka / Redpanda TCP broker address for `--mode kafka-ingest` (e.g. `127.0.0.1:9092`).
+    #[arg(long, default_value = "127.0.0.1:9092")]
+    kafka_broker: String,
+
+    /// Kafka / Redpanda topic name for `--mode kafka-ingest`.
+    #[arg(long, default_value = "dbserver1.public.events")]
+    kafka_topic: String,
+
+    /// Kafka partition ID for `--mode kafka-ingest`.
+    #[arg(long, default_value_t = 0)]
+    kafka_partition: i32,
 
     /// Total rows to generate when running `--mode seed-large` (default 500,000).
     #[arg(long, default_value_t = 500_000)]
@@ -190,10 +208,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             let server = WorkerHttpServer::bind(&args.bind, worker).await?;
             let bound = server.local_addr()?;
+            let mtls_acceptor = match (
+                std::env::var("RUSTLAKEDB_MTLS_CA"),
+                std::env::var("RUSTLAKEDB_MTLS_CERT"),
+                std::env::var("RUSTLAKEDB_MTLS_KEY"),
+            ) {
+                (Ok(ca), Ok(cert), Ok(key)) => Some(
+                    rustlakedb_worker::rpc::build_mtls_server_acceptor_from_files(ca, cert, key)?,
+                ),
+                _ => None,
+            };
+            let scheme = if mtls_acceptor.is_some() { "https" } else { "http" };
             let adv = args
                 .advertise_url
                 .clone()
-                .unwrap_or_else(|| format!("http://{bound}"));
+                .unwrap_or_else(|| format!("{scheme}://{bound}"));
             shuffle_mgr.set_advertise_url(&adv);
             // Wave 7 + Wave 11 zero-touch HA multi-coordinator worker self-registration & heartbeat broadcast!
             let mut coord_targets: Vec<String> = Vec::new();
@@ -232,11 +261,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-            println!(
-                "Worker '{}' RPC listening on http://{} (advertising {})",
-                args.worker_id, bound, adv
-            );
-            server.serve().await?;
+            if let Some(acceptor) = mtls_acceptor {
+                println!(
+                    "Worker '{}' mTLS RPC listening on https://{} (advertising {})",
+                    args.worker_id, bound, adv
+                );
+                server.serve_mtls(acceptor).await?;
+            } else {
+                println!(
+                    "Worker '{}' RPC listening on http://{} (advertising {})",
+                    args.worker_id, bound, adv
+                );
+                server.serve().await?;
+            }
         }
         CliMode::Coordinator => {
             let clients: Vec<Arc<dyn WorkerClient>> = args
@@ -278,6 +315,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(async move {
                     if let Err(e) = cp.serve().await {
                         tracing::error!(error = %e, "Control plane server stopped");
+                    }
+                });
+            }
+            if let Some(ref flight_addr) = args.flight_addr {
+                let fg = FlightGateway::bind(flight_addr, coord.clone()).await?;
+                println!(
+                    "Apache Arrow Flight gRPC Gateway listening on grpc://{}",
+                    fg.local_addr()?
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = fg.serve().await {
+                        tracing::error!(error = %e, "Arrow Flight server stopped");
                     }
                 });
             }
@@ -323,6 +372,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(async move {
                     if let Err(e) = cp.serve().await {
                         tracing::error!(error = %e, "Control plane server stopped");
+                    }
+                });
+            }
+
+            if let Some(ref flight_addr) = args.flight_addr {
+                let fg = FlightGateway::bind(flight_addr, coord.clone()).await?;
+                println!(
+                    "Apache Arrow Flight gRPC Gateway listening on grpc://{}",
+                    fg.local_addr()?
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = fg.serve().await {
+                        tracing::error!(error = %e, "Arrow Flight server stopped");
                     }
                 });
             }
@@ -383,6 +445,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cp_dir.display()
             );
             loader.run_loop(std::time::Duration::from_secs(2)).await?;
+        }
+        CliMode::KafkaIngest => {
+            let coord = Arc::new(Coordinator::new(
+                catalog,
+                store,
+                shuffle,
+                vec![],
+                PlannerConfig::default(),
+            ));
+            let cp_dir = args.data_dir.join("_kafka");
+            let consumer = rustlakedb_coordinator::kafka_ingest::KafkaCdcConsumer::new(
+                coord,
+                &args.kafka_broker,
+                &args.kafka_topic,
+                args.kafka_partition,
+                &args.table,
+                &cp_dir,
+            )?;
+            println!(
+                "Kafka CDC consumer connected to {} topic='{}' partition={} -> Iceberg table '{}'",
+                args.kafka_broker, args.kafka_topic, args.kafka_partition, args.table
+            );
+            consumer.run_loop(std::time::Duration::from_secs(1)).await?;
         }
         CliMode::SeedLarge => {
             seed_large_dataset(&catalog, &store, args.rows, args.splits).await?;
