@@ -691,6 +691,7 @@ async fn commit_table_rest(
                                     column_max: Default::default(),
                                     partition_values: Default::default(),
                                     dv_path: None,
+                                    deleted_row_count: 0,
                                 });
                             }
                         }

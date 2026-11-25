@@ -2118,6 +2118,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "bytes",
  "futures",
  "object_store",

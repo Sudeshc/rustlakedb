@@ -382,7 +382,203 @@ impl IcebergObjectStore {
             column_max,
             partition_values: HashMap::new(),
             dv_path: None,
+            deleted_row_count: 0,
         })
+    }
+
+    /// Streaming columnar Arrow compaction & skew-splitting engine (Apache Iceberg `RewriteDataFiles`):
+    /// - Streams candidate Parquet files as columnar Arrow `RecordBatch`es (never materializing row maps)
+    /// - Strips Iceberg v3 Deletion Vector rows via SIMD `arrow_select::filter::filter_record_batch`
+    /// - Bin-packs thousands of tiny streaming files AND slices oversized/skewed files cleanly to `target_file_bytes`
+    /// - Computes fresh columnar min/max Zone Maps and preserves Iceberg hidden `partition_values`.
+    pub async fn compact_arrow_files_to_target_size(
+        &self,
+        table_name: &str,
+        file_prefix: &str,
+        files: &[(String, Option<String>)],
+        partition_values: &HashMap<String, String>,
+        target_file_bytes: u64,
+    ) -> Result<Vec<DataFileEntry>> {
+        struct CompactState {
+            active_schema: Option<Arc<Schema>>,
+            writer: Option<ArrowWriter<Vec<u8>>>,
+            cur_rows: u64,
+            cur_min: HashMap<String, String>,
+            cur_max: HashMap<String, String>,
+            part_idx: usize,
+            out_entries: Vec<DataFileEntry>,
+        }
+        impl CompactState {
+            async fn flush(
+                &mut self,
+                store: &IcebergObjectStore,
+                table_name: &str,
+                file_prefix: &str,
+                partition_values: &HashMap<String, String>,
+            ) -> Result<()> {
+                let Some(w) = self.writer.take() else {
+                    return Ok(());
+                };
+                let rows = self.cur_rows;
+                self.cur_rows = 0;
+                let cmin = std::mem::take(&mut self.cur_min);
+                let cmax = std::mem::take(&mut self.cur_max);
+                if rows == 0 {
+                    let _ = w.into_inner();
+                    return Ok(());
+                }
+                let buf = w
+                    .into_inner()
+                    .map_err(|e| RustLakeError::Execution(format!("compact parquet close: {e}")))?;
+                let byte_size = buf.len() as u64;
+                let bytes = Bytes::from(buf);
+                let file_path = format!("{table_name}/data/{file_prefix}-{:04}.parquet", self.part_idx);
+                self.part_idx += 1;
+                let obj_path = ObjPath::from(file_path.as_str());
+                store
+                    .store
+                    .put(&obj_path, PutPayload::from(bytes.clone()))
+                    .await
+                    .map_err(|e| {
+                        RustLakeError::Execution(format!("object_store put compacted: {e}"))
+                    })?;
+                store.cache.lock().put(file_path.clone(), bytes);
+                store.parquet_files_written.fetch_add(1, Ordering::Relaxed);
+
+                let sidecar = SerializedPuffinSidecar::default();
+                let puffin_bytes = Bytes::from(serde_json::to_vec(&sidecar)?);
+                let p_key = puffin_sidecar_path(&file_path);
+                let _ = store
+                    .store
+                    .put(&ObjPath::from(p_key.as_str()), PutPayload::from(puffin_bytes.clone()))
+                    .await;
+                store.cache.lock().put(p_key, puffin_bytes);
+
+                self.out_entries.push(DataFileEntry {
+                    file_path,
+                    row_group_id: 0,
+                    row_count: rows,
+                    byte_size,
+                    deletion_vector: RoaringBitmap::new(),
+                    puffin_index: FilePuffinIndex::default(),
+                    ndv_estimates: HashMap::new(),
+                    column_min: cmin,
+                    column_max: cmax,
+                    partition_values: partition_values.clone(),
+                    dv_path: None,
+                    deleted_row_count: 0,
+                });
+                Ok(())
+            }
+        }
+
+        let target_bytes = target_file_bytes.max(1024) as usize;
+        let mut st = CompactState {
+            active_schema: None,
+            writer: None,
+            cur_rows: 0,
+            cur_min: HashMap::new(),
+            cur_max: HashMap::new(),
+            part_idx: 0,
+            out_entries: Vec::new(),
+        };
+
+        for (src_path, dv_path) in files {
+            let (batches, dv) = self
+                .read_arrow_batches_with_dv(src_path, dv_path.as_deref(), None)
+                .await?;
+            let has_dv = !dv.is_empty();
+            let mut global_row_id = 0u32;
+
+            for rb in batches {
+                let n = rb.num_rows();
+                if n == 0 {
+                    continue;
+                }
+                let filtered_rb = if has_dv {
+                    let mut keep = Vec::with_capacity(n);
+                    let mut any_deleted = false;
+                    let mut any_kept = false;
+                    for _ in 0..n {
+                        let del = dv.contains(global_row_id);
+                        global_row_id += 1;
+                        keep.push(!del);
+                        if del {
+                            any_deleted = true;
+                        } else {
+                            any_kept = true;
+                        }
+                    }
+                    if !any_kept {
+                        continue;
+                    }
+                    if any_deleted {
+                        let mask = BooleanArray::from(keep);
+                        arrow_select::filter::filter_record_batch(&rb, &mask)
+                            .map_err(|e| RustLakeError::Execution(format!("compact dv filter: {e}")))?
+                    } else {
+                        rb
+                    }
+                } else {
+                    global_row_id += n as u32;
+                    rb
+                };
+
+                if filtered_rb.num_rows() == 0 {
+                    continue;
+                }
+
+                if let Some(ref cur_sch) = st.active_schema
+                    && cur_sch.as_ref() != filtered_rb.schema().as_ref()
+                {
+                    st.flush(self, table_name, file_prefix, partition_values).await?;
+                    st.active_schema = None;
+                }
+
+                let rb_mem = filtered_rb.get_array_memory_size().max(1);
+                let total_rows = filtered_rb.num_rows();
+                let bytes_per_row = (rb_mem / total_rows).max(1);
+                let max_slice_rows = (target_bytes / bytes_per_row).max(128).min(total_rows);
+                let mut offset = 0usize;
+                while offset < total_rows {
+                    let take = (total_rows - offset).min(max_slice_rows);
+                    let slice = if offset == 0 && take == total_rows {
+                        filtered_rb.clone()
+                    } else {
+                        filtered_rb.slice(offset, take)
+                    };
+                    offset += take;
+
+                    if st.writer.is_none() {
+                        let sch = slice.schema();
+                        let props = WriterProperties::builder()
+                            .set_compression(Compression::ZSTD(Default::default()))
+                            .build();
+                        let w = ArrowWriter::try_new(Vec::new(), sch.clone(), Some(props))
+                            .map_err(|e| {
+                                RustLakeError::Execution(format!("compact writer init: {e}"))
+                            })?;
+                        st.active_schema = Some(sch);
+                        st.writer = Some(w);
+                    }
+
+                    update_arrow_batch_zonemaps(&slice, &mut st.cur_min, &mut st.cur_max);
+                    if let Some(w) = st.writer.as_mut() {
+                        w.write(&slice).map_err(|e| {
+                            RustLakeError::Execution(format!("compact parquet write: {e}"))
+                        })?;
+                        st.cur_rows += slice.num_rows() as u64;
+                        let est_written = w.bytes_written() + w.in_progress_size();
+                        if est_written >= target_bytes {
+                            st.flush(self, table_name, file_prefix, partition_values).await?;
+                        }
+                    }
+                }
+            }
+        }
+
+        st.flush(self, table_name, file_prefix, partition_values).await?;
+        Ok(st.out_entries)
     }
 
     /// Writes a genuine Apache Iceberg v3 Equality Delete Parquet file (Zstd compressed)
@@ -1606,4 +1802,72 @@ fn format_iso_timestamp_micros(us: i64) -> String {
     let ss = sod % 60;
     let date = rustlakedb_protocol::format_iso_date_days(days);
     format!("{date}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Fast columnar Zone-Map min/max updater directly over an Arrow `RecordBatch` (no row deserialization).
+fn update_arrow_batch_zonemaps(
+    rb: &RecordBatch,
+    cmin: &mut HashMap<String, String>,
+    cmax: &mut HashMap<String, String>,
+) {
+    let n = rb.num_rows();
+    for (ci, field) in rb.schema().fields().iter().enumerate() {
+        let name = field.name();
+        let arr = rb.column(ci);
+        if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+            let mut mn: Option<i64> = cmin.get(name).and_then(|s| s.parse().ok());
+            let mut mx: Option<i64> = cmax.get(name).and_then(|s| s.parse().ok());
+            for i in 0..n {
+                if !a.is_null(i) {
+                    let v = a.value(i);
+                    mn = Some(mn.map_or(v, |cur| cur.min(v)));
+                    mx = Some(mx.map_or(v, |cur| cur.max(v)));
+                }
+            }
+            if let Some(v) = mn {
+                cmin.insert(name.clone(), v.to_string());
+            }
+            if let Some(v) = mx {
+                cmax.insert(name.clone(), v.to_string());
+            }
+        } else if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+            let mut mn: Option<f64> = cmin.get(name).and_then(|s| s.parse().ok());
+            let mut mx: Option<f64> = cmax.get(name).and_then(|s| s.parse().ok());
+            for i in 0..n {
+                if !a.is_null(i) {
+                    let v = a.value(i);
+                    if !v.is_nan() {
+                        mn = Some(mn.map_or(v, |cur| cur.min(v)));
+                        mx = Some(mx.map_or(v, |cur| cur.max(v)));
+                    }
+                }
+            }
+            if let Some(v) = mn {
+                cmin.insert(name.clone(), v.to_string());
+            }
+            if let Some(v) = mx {
+                cmax.insert(name.clone(), v.to_string());
+            }
+        } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+            let mut mn: Option<String> = cmin.get(name).cloned();
+            let mut mx: Option<String> = cmax.get(name).cloned();
+            for i in 0..n {
+                if !a.is_null(i) {
+                    let v = a.value(i);
+                    if mn.as_deref().is_none_or(|cur| v < cur) {
+                        mn = Some(v.to_string());
+                    }
+                    if mx.as_deref().is_none_or(|cur| v > cur) {
+                        mx = Some(v.to_string());
+                    }
+                }
+            }
+            if let Some(v) = mn {
+                cmin.insert(name.clone(), v);
+            }
+            if let Some(v) = mx {
+                cmax.insert(name.clone(), v);
+            }
+        }
+    }
 }

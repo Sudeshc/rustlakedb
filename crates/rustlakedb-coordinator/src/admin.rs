@@ -40,6 +40,19 @@ impl ControlPlaneServer {
     }
 
     pub async fn serve(self) -> Result<()> {
+        // Automatic streaming micro-batch flusher (coalesces `?buffered=true` record-by-record streams)
+        let flush_coord = self.coord.clone();
+        let flush_ms: u64 = std::env::var("RUSTLAKEDB_INGEST_FLUSH_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000)
+            .max(100);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(flush_ms)).await;
+                let _ = flush_coord.flush_all_ingest_buffers().await;
+            }
+        });
         let app = build_control_plane_router(self.coord);
         axum::serve(self.listener, app)
             .await
@@ -94,6 +107,13 @@ struct IngestQuery {
     on_error: Option<String>,
     #[serde(default = "default_branch")]
     branch: String,
+    /// When `true`, coalesces record-by-record streaming writes into micro-batched Parquet flushes
+    /// (every `RUSTLAKEDB_INGEST_FLUSH_MS` or `RUSTLAKEDB_INGEST_FLUSH_ROWS`), eliminating tiny files!
+    #[serde(default)]
+    buffered: bool,
+    /// When `true`, forces immediate flush of the micro-batch buffer.
+    #[serde(default)]
+    flush: bool,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +347,27 @@ async fn ingest_ndjson_http(
         .on_error
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("continue"));
+    if q.buffered || q.flush {
+        return match coord
+            .ingest_ndjson_buffered(&table, &q.branch, &body, on_err, q.flush)
+            .await
+        {
+            Ok((loaded, dlq, flushed)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "status": if flushed { "committed" } else { "buffered" },
+                    "table": table,
+                    "rows_loaded": loaded,
+                    "dlq_rows": dlq,
+                    "flushed": flushed
+                })),
+            ),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            ),
+        };
+    }
     match coord.ingest_ndjson(&table, &q.branch, &body, on_err).await {
         Ok((loaded, dlq)) => (
             StatusCode::OK,

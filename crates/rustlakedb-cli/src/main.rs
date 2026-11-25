@@ -346,6 +346,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::time::Duration::from_secs(300),
                 );
             }
+            if std::env::var("RUSTLAKEDB_AUTO_MAINTAIN")
+                .is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            {
+                let maint_coord = coord.clone();
+                let maint_cfg = rustlakedb_coordinator::maintainer::MaintainerConfig::default();
+                println!(
+                    "Embedded Autonomous Maintainer enabled on Coordinator (interval={}s, leader-only in Raft HA)",
+                    maint_cfg.interval.as_secs()
+                );
+                tokio::spawn(async move {
+                    let maintainer = rustlakedb_coordinator::maintainer::AutonomousMaintainer::new(
+                        maint_coord.clone(),
+                        maint_cfg.clone(),
+                    );
+                    loop {
+                        let is_leader = maint_coord
+                            .catalog
+                            .raft_telemetry()
+                            .map(|rt| rt.is_leader)
+                            .unwrap_or(true);
+                        if is_leader {
+                            let _ = maintainer.run_once().await;
+                        }
+                        tokio::time::sleep(maint_cfg.interval).await;
+                    }
+                });
+            }
             if let Some(ref rest_addr) = args.rest_addr {
                 let cp = rustlakedb_coordinator::admin::ControlPlaneServer::bind(
                     rest_addr,
@@ -403,6 +430,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ));
 
+            if std::env::var("RUSTLAKEDB_AUTO_MAINTAIN")
+                .is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            {
+                let maint_coord = coord.clone();
+                let maint_cfg = rustlakedb_coordinator::maintainer::MaintainerConfig::default();
+                println!(
+                    "Embedded Autonomous Maintainer enabled on Coordinator (interval={}s, leader-only in Raft HA)",
+                    maint_cfg.interval.as_secs()
+                );
+                tokio::spawn(async move {
+                    let maintainer = rustlakedb_coordinator::maintainer::AutonomousMaintainer::new(
+                        maint_coord.clone(),
+                        maint_cfg.clone(),
+                    );
+                    loop {
+                        let is_leader = maint_coord
+                            .catalog
+                            .raft_telemetry()
+                            .map(|rt| rt.is_leader)
+                            .unwrap_or(true);
+                        if is_leader {
+                            let _ = maintainer.run_once().await;
+                        }
+                        tokio::time::sleep(maint_cfg.interval).await;
+                    }
+                });
+            }
             if let Some(ref rest_addr) = args.rest_addr {
                 let cp = rustlakedb_coordinator::admin::ControlPlaneServer::bind(
                     rest_addr,

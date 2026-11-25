@@ -35,6 +35,7 @@ fn make_part_file(path: &str, region: &str) -> DataFileEntry {
         column_max: HashMap::new(),
         partition_values: pv,
         dv_path: None,
+        deleted_row_count: 0,
     }
 }
 

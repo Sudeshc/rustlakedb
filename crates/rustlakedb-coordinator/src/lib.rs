@@ -232,6 +232,167 @@ pub struct QueryExecutionResult {
     pub stats: QueryExecutionStats,
 }
 
+/// Target-size selective Iceberg `RewriteDataFiles` compaction policy:
+/// leaves healthy files untouched, bin-packs small streaming files, splits oversized/skewed files,
+/// and rewrites post-delete/merge files once their Deletion Vector bloat exceeds `delete_ratio_threshold`.
+#[derive(Debug, Clone)]
+pub struct CompactionPolicy {
+    pub target_file_bytes: u64,
+    pub min_file_bytes: u64,
+    pub max_file_bytes: u64,
+    pub min_small_files_per_partition: usize,
+    pub delete_ratio_threshold: f64,
+    pub max_bytes_per_run: u64,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            target_file_bytes: 128 * 1024 * 1024,
+            min_file_bytes: 32 * 1024 * 1024,
+            max_file_bytes: 256 * 1024 * 1024,
+            min_small_files_per_partition: 2,
+            delete_ratio_threshold: 0.20,
+            max_bytes_per_run: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl CompactionPolicy {
+    pub fn from_env() -> Self {
+        let mut p = Self::default();
+        if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_TARGET_BYTES")
+            && let Ok(b) = v.parse::<u64>()
+        {
+            p.target_file_bytes = b.max(1024);
+        } else if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_TARGET_MB")
+            && let Ok(mb) = v.parse::<u64>()
+        {
+            p.target_file_bytes = mb.max(1) * 1024 * 1024;
+        }
+        if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_MIN_BYTES")
+            && let Ok(b) = v.parse::<u64>()
+        {
+            p.min_file_bytes = b;
+        } else if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_MIN_MB")
+            && let Ok(mb) = v.parse::<u64>()
+        {
+            p.min_file_bytes = mb * 1024 * 1024;
+        }
+        if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_MAX_BYTES")
+            && let Ok(b) = v.parse::<u64>()
+        {
+            p.max_file_bytes = b.max(p.target_file_bytes);
+        } else if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_MAX_MB")
+            && let Ok(mb) = v.parse::<u64>()
+        {
+            p.max_file_bytes = (mb * 1024 * 1024).max(p.target_file_bytes);
+        }
+        if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_DELETE_RATIO")
+            && let Ok(r) = v.parse::<f64>()
+        {
+            p.delete_ratio_threshold = r.clamp(0.01, 1.0);
+        }
+        if let Ok(v) = std::env::var("RUSTLAKEDB_COMPACT_MAX_BYTES_PER_RUN")
+            && let Ok(b) = v.parse::<u64>()
+        {
+            p.max_bytes_per_run = b.max(p.target_file_bytes);
+        }
+        p
+    }
+}
+
+/// Partition-grouped compaction plan: `(partition_values, selected_files)` plus count of untouched healthy files.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionSelection {
+    pub groups: Vec<(HashMap<String, String>, Vec<rustlakedb_catalog::DataFileEntry>)>,
+    pub skipped_healthy_files: usize,
+    pub total_candidate_files: usize,
+}
+
+/// Selects ONLY small (< `min_file_bytes`), oversized/skewed (> `max_file_bytes`), or heavily-deleted
+/// (`deleted_row_count / row_count >= delete_ratio_threshold`) Parquet files per partition, leaving
+/// healthy files completely untouched and capping each run to `max_bytes_per_run`.
+pub fn select_compaction_candidates(
+    snap: &rustlakedb_catalog::IcebergSnapshot,
+    policy: &CompactionPolicy,
+    force_any_dv: bool,
+) -> CompactionSelection {
+    let mut by_part: BTreeMap<BTreeMap<String, String>, Vec<&rustlakedb_catalog::DataFileEntry>> =
+        BTreeMap::new();
+    for df in &snap.data_files {
+        let key: BTreeMap<String, String> = df
+            .partition_values
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        by_part.entry(key).or_default().push(df);
+    }
+
+    let mut sel = CompactionSelection::default();
+    let mut budget_used: u64 = 0;
+
+    for (pkey, files) in by_part {
+        let mut small = Vec::new();
+        let mut skewed_or_bloated = Vec::new();
+        let mut healthy = 0usize;
+
+        for df in files {
+            let del_ratio = if df.row_count > 0 {
+                df.deleted_row_count as f64 / df.row_count as f64
+            } else {
+                0.0
+            };
+            let is_oversized = df.byte_size > policy.max_file_bytes;
+            let is_bloated_dv = df.dv_path.is_some()
+                && (force_any_dv
+                    || del_ratio >= policy.delete_ratio_threshold
+                    || df.deleted_row_count == 0);
+            let is_small = df.byte_size < policy.min_file_bytes;
+
+            if is_oversized || is_bloated_dv {
+                skewed_or_bloated.push(df.clone());
+            } else if is_small {
+                small.push(df.clone());
+            } else {
+                healthy += 1;
+            }
+        }
+
+        let mut chosen = skewed_or_bloated;
+        if small.len() >= policy.min_small_files_per_partition
+            || (!chosen.is_empty() && !small.is_empty())
+        {
+            chosen.extend(small);
+        } else {
+            healthy += small.len();
+        }
+
+        sel.skipped_healthy_files += healthy;
+        if chosen.is_empty() {
+            continue;
+        }
+
+        // Enforce per-run byte budget while always allowing at least 1 oversized file to split!
+        let mut bounded = Vec::new();
+        for df in chosen {
+            if !bounded.is_empty() && budget_used.saturating_add(df.byte_size) > policy.max_bytes_per_run {
+                sel.skipped_healthy_files += 1;
+                continue;
+            }
+            budget_used = budget_used.saturating_add(df.byte_size);
+            bounded.push(df);
+        }
+        if !bounded.is_empty() {
+            sel.total_candidate_files += bounded.len();
+            let pv: HashMap<String, String> = pkey.into_iter().collect();
+            sel.groups.push((pv, bounded));
+        }
+    }
+
+    sel
+}
+
 /// Distributed RustLakeDB Coordinator (RFC-001 + RFC-002 + RFC-004 + Waves 1–10).
 pub struct Coordinator {
     pub catalog: Arc<dyn Catalog>,
@@ -245,6 +406,8 @@ pub struct Coordinator {
     pub speculative_threshold_ms: AtomicU64,
     pub max_task_retries: u32,
     pub governance: Arc<GovernanceState>,
+    /// Micro-batch staging buffer for record-by-record streaming ingest (`(table, branch) -> ndjson lines`).
+    pub ingest_buffers: RwLock<HashMap<(String, String), Vec<String>>>,
 }
 
 impl Coordinator {
@@ -279,7 +442,76 @@ impl Coordinator {
             speculative_threshold_ms: AtomicU64::new(0),
             max_task_retries: 3,
             governance: Arc::new(GovernanceState::default()),
+            ingest_buffers: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Buffers record-by-record streaming NDJSON lines in RAM and auto-flushes into a single clean
+    /// Parquet file once `flush_rows` (default `1,000`) is reached or `force_flush` is set.
+    /// Eliminates small-file amplification from high-frequency single-record streaming producers!
+    pub async fn ingest_ndjson_buffered(
+        &self,
+        table_name: &str,
+        branch: &str,
+        ndjson: &str,
+        on_error_continue: bool,
+        force_flush: bool,
+    ) -> Result<(usize, usize, bool)> {
+        let flush_rows: usize = std::env::var("RUSTLAKEDB_INGEST_FLUSH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000)
+            .max(1);
+        let key = (table_name.to_string(), branch.to_string());
+        let incoming: Vec<String> = ndjson
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        let buffered_count = incoming.len();
+        let to_flush: Option<Vec<String>> = {
+            let mut map = self.ingest_buffers.write();
+            let buf = map.entry(key.clone()).or_default();
+            buf.extend(incoming);
+            if force_flush || buf.len() >= flush_rows {
+                Some(std::mem::take(buf))
+            } else {
+                None
+            }
+        };
+        if let Some(lines) = to_flush {
+            if lines.is_empty() {
+                return Ok((0, 0, true));
+            }
+            let payload = lines.join("\n");
+            let (loaded, dlq) = self
+                .ingest_ndjson(table_name, branch, &payload, on_error_continue)
+                .await?;
+            Ok((loaded, dlq, true))
+        } else {
+            Ok((buffered_count, 0, false))
+        }
+    }
+
+    /// Flushes all pending buffered streaming micro-batches into clean Parquet files (called by
+    /// the background 1-second timer and on graceful shutdown).
+    pub async fn flush_all_ingest_buffers(&self) -> usize {
+        let pending: Vec<((String, String), Vec<String>)> = {
+            let mut map = self.ingest_buffers.write();
+            map.drain().filter(|(_, v)| !v.is_empty()).collect()
+        };
+        let mut flushed_rows = 0usize;
+        for ((table, branch), lines) in pending {
+            let payload = lines.join("\n");
+            match self.ingest_ndjson(&table, &branch, &payload, true).await {
+                Ok((loaded, _)) => flushed_rows += loaded,
+                Err(e) => {
+                    tracing::warn!(table = %table, error = %e, "buffered ingest flush failed");
+                }
+            }
+        }
+        flushed_rows
     }
 
     /// Dynamically registers or refreshes a remote HTTP worker node at runtime (Wave 7 + Wave 9 TTL).
@@ -1298,6 +1530,7 @@ impl Coordinator {
                         removed_files.push(df.file_path.clone());
                         let mut updated_df = df.clone();
                         updated_df.dv_path = Some(new_dv_path);
+                        updated_df.deleted_row_count = dv.len();
                         added_files.push(updated_df);
                     }
                 }
@@ -1378,6 +1611,7 @@ impl Coordinator {
                         removed_files.push(df.file_path.clone());
                         let mut updated_df = df.clone();
                         updated_df.dv_path = Some(new_dv_path);
+                        updated_df.deleted_row_count = dv.len();
                         added_files.push(updated_df);
                     }
                 }
@@ -1405,15 +1639,14 @@ impl Coordinator {
                 })
             }
             PlannedCommand::CompactTable { table_name } => {
-                // Autonomous/explicit compaction (RFC-002):
-                // Bin-packs all active small files, materializes Iceberg v3 Deletion Vectors,
-                // re-shreds hot JSON paths, and rebuilds Puffin secondary indexes atomically!
+                // Selective Partition-Aware Streaming Arrow Compaction (Iceberg RewriteDataFiles):
+                // - Leaves healthy files (min_file_bytes..=max_file_bytes, low delete ratio) untouched
+                // - Bin-packs small streaming files AND splits oversized/skewed files to target_file_bytes
+                // - Materializes Iceberg v3 Deletion Vectors in columnar Arrow (zero row-map materialization)
+                // - Commits via non-conflicting Iceberg RewriteFiles OCC alongside concurrent streaming appends!
                 let meta = self.catalog.get_table(&table_name).await?;
                 let snap = meta.current_snapshot(branch)?;
-                let old_paths: Vec<String> =
-                    snap.data_files.iter().map(|f| f.file_path.clone()).collect();
-
-                if old_paths.is_empty() {
+                if snap.data_files.is_empty() {
                     return Ok(QueryExecutionResult {
                         command_tag: "COMPACT 0->0".into(),
                         dag: None,
@@ -1422,50 +1655,68 @@ impl Coordinator {
                     });
                 }
 
-                let mut live_rows = Vec::new();
-                for df in &snap.data_files {
-                    let b = self
-                        .store
-                        .read_data_file_with_dv(
-                            &df.file_path,
-                            df.dv_path.as_deref(),
-                            &meta.schema,
-                            None,
-                        )
-                        .await?;
-                    live_rows.extend(b.rows);
+                let policy = CompactionPolicy::from_env();
+                let selection = select_compaction_candidates(snap, &policy, true);
+                if selection.total_candidate_files == 0 {
+                    return Ok(QueryExecutionResult {
+                        command_tag: format!("COMPACT 0->0 (skipped {})", selection.skipped_healthy_files),
+                        dag: None,
+                        batch: RowBatch::default(),
+                        stats: QueryExecutionStats::default(),
+                    });
                 }
 
-                let cols: Vec<String> = meta.schema.iter().map(|f| f.name.clone()).collect();
-                let compacted_batch = RowBatch::new(cols, live_rows);
-                let added_files = if compacted_batch.num_rows() > 0 {
-                    let path = format!("{table_name}/data/compacted-{}.parquet", Uuid::new_v4());
-                    vec![
-                        self.store
-                            .write_data_file(&path, &meta.schema, &compacted_batch)
-                            .await?,
-                    ]
-                } else {
-                    vec![]
-                };
+                let mut removed_paths = Vec::with_capacity(selection.total_candidate_files);
+                let mut added_files = Vec::new();
+                let run_id = Uuid::new_v4();
+
+                for (gidx, (pv, group_files)) in selection.groups.into_iter().enumerate() {
+                    let file_specs: Vec<(String, Option<String>)> = group_files
+                        .iter()
+                        .map(|df| {
+                            removed_paths.push(df.file_path.clone());
+                            (df.file_path.clone(), df.dv_path.clone())
+                        })
+                        .collect();
+                    let prefix = format!("compacted-{run_id}-p{gidx}");
+                    let new_entries = self
+                        .store
+                        .compact_arrow_files_to_target_size(
+                            &table_name,
+                            &prefix,
+                            &file_specs,
+                            &pv,
+                            policy.target_file_bytes,
+                        )
+                        .await?;
+                    added_files.extend(new_entries);
+                }
 
                 let new_count = added_files.len();
-                let old_count = old_paths.len();
+                let old_count = removed_paths.len();
                 self.catalog
                     .commit_table(TableCommitProposal {
                         table_name: table_name.clone(),
                         branch: branch.to_string(),
                         expected_snapshot_id: snap.snapshot_id,
                         added_files,
-                        removed_files: old_paths,
+                        removed_files: removed_paths,
                         is_append_only: false,
                     })
                     .await?;
                 let updated = self.catalog.get_table(&table_name).await?;
                 self.store.write_iceberg_metadata(&updated, branch).await?;
 
+                let tag = if selection.skipped_healthy_files == 0 {
+                    format!("COMPACT {old_count}->{new_count}")
+                } else {
+                    format!(
+                        "COMPACT {old_count}->{new_count} (skipped {})",
+                        selection.skipped_healthy_files
+                    )
+                };
                 Ok(QueryExecutionResult {
-                    command_tag: format!("COMPACT {old_count}->{new_count}"),
+                    command_tag: tag,
                     dag: None,
                     batch: RowBatch::default(),
                     stats: QueryExecutionStats::default(),
@@ -2025,6 +2276,7 @@ impl Coordinator {
                         removed_files.push(df.file_path.clone());
                         let mut updated_df = df.clone();
                         updated_df.dv_path = Some(new_dv_path);
+                        updated_df.deleted_row_count = dv.len();
                         added_files.push(updated_df);
                     }
                 }
@@ -2152,7 +2404,14 @@ impl Coordinator {
                 }
 
                 let cols: Vec<String> = meta.schema.iter().map(|f| f.name.clone()).collect();
-                let num_chunks = if live_rows.len() >= 16 { 4 } else { 1 };
+                let policy = CompactionPolicy::from_env();
+                let total_bytes: u64 = snap.data_files.iter().map(|f| f.byte_size).sum();
+                let target_chunks = total_bytes.div_ceil(policy.target_file_bytes.max(1)) as usize;
+                let num_chunks = if live_rows.len() >= 16 {
+                    target_chunks.max(4)
+                } else {
+                    1
+                };
                 let chunk_size = std::cmp::max(1, live_rows.len().div_ceil(num_chunks));
                 let mut added_files = Vec::new();
 
@@ -3121,6 +3380,7 @@ impl Coordinator {
                     removed_files.push(df.file_path.clone());
                     let mut updated_df = df.clone();
                     updated_df.dv_path = Some(new_dv_path);
+                    updated_df.deleted_row_count = dv.len();
                     added_files.push(updated_df);
                 }
             }

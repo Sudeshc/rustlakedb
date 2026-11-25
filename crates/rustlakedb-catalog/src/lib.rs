@@ -139,6 +139,9 @@ pub struct DataFileEntry {
     /// Immutable Iceberg v3 Deletion Vector blob path scoped to this snapshot (preserves Time Travel & RESTORE).
     #[serde(default)]
     pub dv_path: Option<String>,
+    /// Cardinality of the attached Deletion Vector (`dv.len()`), enabling O(1) delete-ratio compaction triggers.
+    #[serde(default)]
+    pub deleted_row_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -954,6 +957,46 @@ impl Catalog for InMemoryRaftCatalog {
                     }
                 }
                 if !disjoint_ok {
+                    // Apache Iceberg RewriteFiles OCC: a pure physical compaction/optimization
+                    // (removed_files non-empty and strictly disjoint from added_files) auto-rebases
+                    // cleanly over concurrent streaming appends as long as EVERY rewritten file is
+                    // still intact in the current snapshot with the exact same dv_path!
+                    let added_paths: HashSet<&str> = prop
+                        .added_files
+                        .iter()
+                        .map(|f| f.file_path.as_str())
+                        .collect();
+                    let is_pure_rewrite = !prop.removed_files.is_empty()
+                        && prop
+                            .removed_files
+                            .iter()
+                            .all(|r| !added_paths.contains(r.as_str()));
+                    if is_pure_rewrite
+                        && let Some(exp_snap) = table.snapshots.get(&prop.expected_snapshot_id)
+                        && let Some(cur_snap) = table.snapshots.get(&current_id)
+                    {
+                        let cur_by_path: HashMap<&str, Option<&str>> = cur_snap
+                            .data_files
+                            .iter()
+                            .map(|df| (df.file_path.as_str(), df.dv_path.as_deref()))
+                            .collect();
+                        let exp_by_path: HashMap<&str, Option<&str>> = exp_snap
+                            .data_files
+                            .iter()
+                            .map(|df| (df.file_path.as_str(), df.dv_path.as_deref()))
+                            .collect();
+                        let all_intact = prop.removed_files.iter().all(|r| {
+                            cur_by_path
+                                .get(r.as_str())
+                                .zip(exp_by_path.get(r.as_str()))
+                                .is_some_and(|(cur_dv, exp_dv)| cur_dv == exp_dv)
+                        });
+                        if all_intact {
+                            disjoint_ok = true;
+                        }
+                    }
+                }
+                if !disjoint_ok {
                     return Err(RustLakeError::OccConflict {
                         table: prop.table_name.clone(),
                         reason: format!(
@@ -1571,6 +1614,7 @@ mod tests {
                             column_max: HashMap::new(),
                             partition_values: HashMap::new(),
                             dv_path: None,
+                            deleted_row_count: 0,
                         }],
                         removed_files: vec![],
                         is_append_only: true,

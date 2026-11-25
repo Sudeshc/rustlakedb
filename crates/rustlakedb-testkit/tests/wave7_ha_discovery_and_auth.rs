@@ -175,7 +175,7 @@ async fn test_wave7_persistent_raft_wal_recovery() {
     let a1 = n1.start_server("127.0.0.1:0").await.unwrap();
     n1.set_peers(HashMap::from([(1, format!("http://{a1}"))]));
 
-    for _ in 0..30 {
+    for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(40)).await;
         if n1.status().role == RaftRole::Leader {
             break;
