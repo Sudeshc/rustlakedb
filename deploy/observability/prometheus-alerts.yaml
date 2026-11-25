@@ -91,10 +91,28 @@ groups:
           runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#worker-down"
 
       - alert: RustLakeDBHighQueryLatency
-        expr: sum(rate(rustlakedb_query_duration_ms_sum[5m])) / clamp_min(sum(rate(rustlakedb_queries_total[5m])), 1) > 2000
+        expr: histogram_quantile(0.99, sum(rate(rustlakedb_query_duration_ms_bucket[5m])) by (le)) > 2500
         for: 3m
         labels:
           severity: warning
         annotations:
-          summary: "RustLakeDB average query latency exceeds 2000ms"
+          summary: "RustLakeDB p99 query latency exceeds 2500ms"
           runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#high-latency"
+
+      - alert: RustLakeDBAuthDeniedSpike
+        expr: sum(rate(rustlakedb_auth_denied_total[5m])) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated RBAC/REST authorization denials ({{ $value | printf \"%.2f\" }}/s)"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#auth-denied-spike"
+
+      - alert: RustLakeDBSmallFileAccumulation
+        expr: max(rustlakedb_small_files_total) > 1000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Small Parquet file backlog exceeds 1,000 files (check AutonomousMaintainer)"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#small-file-backlog"

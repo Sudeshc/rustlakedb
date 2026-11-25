@@ -143,7 +143,20 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    // Wave 41: Support structured JSON logging (`RUSTLAKEDB_LOG_FORMAT=json`) for Datadog/Loki/ELK!
+    let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    if std::env::var("RUSTLAKEDB_LOG_FORMAT")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("json"))
+    {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(log_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter)
+            .init();
+    }
 
     let args = Args::parse();
     println!(
@@ -402,9 +415,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             let pg_addr = args.pg_addr.as_deref().unwrap_or("127.0.0.1:5432");
-            let gw = PgGateway::bind(pg_addr, coord).await?;
+            let gw = PgGateway::bind(pg_addr, coord.clone()).await?;
             println!("Coordinator PostgreSQL v3 Gateway listening on {}", gw.local_addr()?);
-            gw.serve().await?;
+            let drain_coord = coord.clone();
+            tokio::select! {
+                res = gw.serve() => { res?; }
+                _ = shutdown_signal() => {
+                    tracing::info!("Received shutdown signal — initiating graceful node drain...");
+                    let report = drain_coord.drain_gracefully(std::time::Duration::from_secs(15)).await;
+                    tracing::info!(report = %report, "Graceful node drain complete");
+                }
+            }
         }
         CliMode::Gateway | CliMode::Standalone | CliMode::Local => {
             let workers: Vec<Arc<WorkerNode>> = (1..=args.workers)
@@ -780,4 +801,24 @@ async fn run_local_demo(
         println!("  {row:?}");
     }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

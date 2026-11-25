@@ -103,8 +103,44 @@ Every Prometheus alert in [`deploy/observability/prometheus-alerts.yaml`](../dep
 
 ## `#high-latency` — `RustLakeDBHighQueryLatency`
 
-- **Trigger:** 5-minute average query latency `> 2,000 ms` for 3 minutes.
+- **Trigger:** 5-minute `p99` query latency (`rustlakedb_query_duration_ms_bucket`) `> 2,500 ms` for 3 minutes.
 - **Remediation:**
-  1. Check `rustlakedb_cache_hits_total`, `rustlakedb_zonemap_pruned_total`, and `rustlakedb_puffin_pruned_total` in Grafana.
-  2. Run `ANALYZE TABLE <table>` + `OPTIMIZE TABLE <table>` on hot fact tables to tighten zone-maps and bin-pack small streaming files.
-  3. Scale worker HPA `maxReplicas` if CPU > 70%.
+  1. Open the Unified Control Console (`http://<coordinator>:8181/`) -> **Workload & Traces** to inspect slow queries and distributed execution DAG profiles.
+  2. Check `rustlakedb_cache_hits_total`, `rustlakedb_zonemap_pruned_total`, and `rustlakedb_puffin_pruned_total`.
+  3. Run `ANALYZE TABLE <table>` + `OPTIMIZE TABLE <table>` on hot fact tables to tighten zone-maps and bin-pack small streaming files.
+  4. Scale worker HPA `maxReplicas` if CPU > 70%.
+
+---
+
+## `#auth-denied-spike` — `RustLakeDBAuthDeniedSpike`
+
+- **Trigger:** `rate(rustlakedb_auth_denied_total[5m]) > 1/s` for 2 minutes.
+- **Immediate Triage:**
+  1. Open Unified Control Console -> **Governance & Audit** -> **Audit Log** with **Denials Only** enabled (or query `GET /v1/governance/audit`).
+  2. Check whether a misconfigured BI/Spark OIDC token expired, a role lacks a required schema/column grant, or a credential brute-force probe is occurring.
+- **Remediation:** Verify OIDC issuer/JWKS rotation (`--oidc-issuer`), grant least-privilege roles via `GRANT`, or block abusive client IPs at the L4/L7 ingress.
+
+---
+
+## `#small-file-backlog` — `RustLakeDBSmallFileAccumulation`
+
+- **Trigger:** `max(rustlakedb_small_files_total) > 1000` for 15 minutes.
+- **Immediate Triage:**
+  1. Open Unified Control Console -> **Catalog & Iceberg** (or `GET /v1/tables/{table}/health`) to inspect file-size distribution histograms and identify affected tables.
+  2. Check `rustlakedb_compaction_runs_total` and `rustlakedb-maintainer` logs.
+- **Remediation:** Ensure streaming producers use `?buffered=true` micro-batching and run `COMPACT TABLE <table>` (or verify `RUSTLAKEDB_AUTO_MAINTAIN=true` / `rustlakedb-maintainer` is healthy).
+
+---
+
+## Day-2 Maintenance: Graceful Node Drain & Verified Catalog DR Backup
+
+- **Graceful Rolling Upgrade / Maintenance Drain:**
+  ```bash
+  curl -X POST http://<coord>:8181/v1/admin/drain -H 'Content-Type: application/json' -d '{"user":"postgres","timeout_ms":15000}'
+  ```
+  Marks `/readyz` as `503 Service Unavailable`, flushes all streaming ingest micro-batch buffers, drains active queries, and cleanly steps down Raft leadership. Also runs automatically on `SIGTERM` / `SIGINT`.
+- **On-Demand Verified Catalog DR Backup:**
+  ```bash
+  curl -X POST http://<coord>:8181/v1/admin/backup-catalog -H 'Content-Type: application/json' -d '{"user":"postgres"}'
+  ```
+  Writes a consistent `FullCatalogSnapshot` to object storage and reads it back to verify SHA-256 checksum & JSON integrity.

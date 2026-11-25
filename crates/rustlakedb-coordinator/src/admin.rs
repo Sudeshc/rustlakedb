@@ -78,6 +78,7 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
         .route("/v1/ingest/{table}", post(ingest_ndjson_http))
         .route("/v1/cdc/{table}", post(ingest_cdc_http))
         .route("/v1/traces", get(get_traces_http))
+        .route("/v1/governance/overview", get(get_governance_overview_http))
         .route("/v1/governance/lineage", get(get_lineage_http))
         .route("/v1/governance/tags", get(get_tags_http))
         .route("/v1/governance/audit", get(get_audit_http))
@@ -86,6 +87,10 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
         .route("/v1/federation/catalogs", get(get_external_catalogs_http))
         .route("/v1/federation/export/{table}", get(export_federation_descriptors_http))
         .route("/v1/tables/{table}/snapshots", get(get_table_snapshots_http))
+        .route("/v1/tables/{table}/health", get(get_table_health_http))
+        .route("/v1/admin/drain", post(admin_drain_http))
+        .route("/v1/admin/undrain", post(admin_undrain_http))
+        .route("/v1/admin/backup-catalog", post(admin_backup_catalog_http))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(coord)
         .merge(iceberg_rest)
@@ -324,6 +329,12 @@ async fn sql_json(
     headers: HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> (StatusCode, Json<Value>) {
+    if coord.is_draining() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "coordinator node is draining; retry request on a healthy peer" })),
+        );
+    }
     let session = match resolve_http_session(&coord, &headers, &req.user).await {
         Ok(s) => s,
         Err(e) => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))),
@@ -357,6 +368,24 @@ async fn sql_json(
                         .collect()
                 })
                 .collect();
+            let dag_stages: Vec<Value> = res
+                .dag
+                .as_ref()
+                .map(|d| {
+                    d.stages
+                        .iter()
+                        .map(|s| {
+                            json!({
+                                "stage_id": s.stage_id,
+                                "shuffle_mode": format!("{:?}", s.shuffle_mode),
+                                "partitions": s.num_partitions,
+                                "dependencies": s.upstream_stages,
+                                "operators": vec![format!("{:?}", s.plan)],
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             (
                 StatusCode::OK,
                 Json(json!({
@@ -366,7 +395,8 @@ async fn sql_json(
                     "row_count": res.batch.num_rows(),
                     "elapsed_ms": elapsed_ms,
                     "stages_executed": res.stats.stages_executed,
-                    "tasks_executed": res.stats.tasks_executed
+                    "tasks_executed": res.stats.tasks_executed,
+                    "dag_stages": dag_stages
                 })),
             )
         }
@@ -470,20 +500,48 @@ async fn cluster_status(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
         .map(|w| json!({ "id": w.id().0, "healthy": w.is_healthy() }))
         .collect();
     let history = coord.governance.query_history_snapshot();
+    let (p50_ms, p95_ms, p99_ms) = coord.governance.latency_percentiles_ms();
+    let policy = crate::CompactionPolicy::from_env();
+    let (small_files, total_files, total_bytes) =
+        coord.catalog.catalog_file_health_stats(policy.min_file_bytes);
+    let (_tables_total, max_snapshots) = coord.catalog.catalog_stats();
+    let raft = coord.catalog.raft_telemetry();
     Json(json!({
         "engine": "RustLakeDB",
         "version": env!("CARGO_PKG_VERSION"),
+        "draining": coord.is_draining(),
+        "storage_uri": coord.store.base_uri().unwrap_or("memory://"),
+        "raft": raft,
         "workers": workers,
         "tables": tables,
         "views": views,
         "active_queries": coord.governance.active_queries_snapshot(),
         "recent_queries": history.into_iter().rev().take(20).collect::<Vec<_>>(),
+        "ops": {
+            "queries_total": coord.governance.queries_total.load(Ordering::Relaxed),
+            "query_errors_total": coord.governance.query_errors_total.load(Ordering::Relaxed),
+            "worker_rpc_timeouts_total": coord.governance.worker_rpc_timeouts_total.load(Ordering::Relaxed),
+            "auth_denied_total": coord.governance.auth_denied_total.load(Ordering::Relaxed),
+            "compaction_runs_total": coord.governance.compaction_runs_total.load(Ordering::Relaxed),
+            "compaction_files_rewritten_total": coord.governance.compaction_files_rewritten_total.load(Ordering::Relaxed),
+            "otlp_spans_exported_total": coord.governance.otlp_spans_exported_total.load(Ordering::Relaxed),
+            "ingest_buffer_rows": coord.ingest_buffer_rows(),
+            "max_snapshots": max_snapshots,
+            "latency_ms": { "p50": p50_ms, "p95": p95_ms, "p99": p99_ms },
+            "latency_histogram": {
+                "bounds_ms": crate::security::LATENCY_BUCKET_BOUNDS_MS,
+                "buckets": coord.governance.latency_histogram_snapshot(),
+            }
+        },
         "storage": {
             "parquet_files_written": coord.store.parquet_files_written.load(Ordering::Relaxed),
             "parquet_files_read": coord.store.parquet_files_read.load(Ordering::Relaxed),
             "cache_hits": coord.store.cache_hits.load(Ordering::Relaxed),
             "files_pruned_by_puffin": coord.store.files_pruned_by_puffin.load(Ordering::Relaxed),
-            "files_pruned_by_zonemap": coord.store.files_pruned_by_zonemap.load(Ordering::Relaxed)
+            "files_pruned_by_zonemap": coord.store.files_pruned_by_zonemap.load(Ordering::Relaxed),
+            "small_files_total": small_files,
+            "total_data_files": total_files,
+            "total_data_bytes": total_bytes
         }
     }))
 }
@@ -492,10 +550,17 @@ async fn healthz_http(State(coord): State<Arc<Coordinator>>) -> (StatusCode, Jso
     let wsnap = coord.workers_snapshot();
     let healthy_workers = wsnap.iter().filter(|w| w.is_healthy()).count();
     let raft = coord.catalog.raft_telemetry();
+    let draining = coord.is_draining();
+    let code = if draining {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
     (
-        StatusCode::OK,
+        code,
         Json(json!({
-            "status": "ok",
+            "status": if draining { "draining" } else { "ok" },
+            "draining": draining,
             "healthy_workers": healthy_workers,
             "total_workers": wsnap.len(),
             "raft": raft,
@@ -517,6 +582,22 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
         .governance
         .worker_rpc_timeouts_total
         .load(Ordering::Relaxed);
+    let auth_denied = coord.governance.auth_denied_total.load(Ordering::Relaxed);
+    let compaction_runs = coord
+        .governance
+        .compaction_runs_total
+        .load(Ordering::Relaxed);
+    let compaction_files = coord
+        .governance
+        .compaction_files_rewritten_total
+        .load(Ordering::Relaxed);
+    let otlp_exported = coord
+        .governance
+        .otlp_spans_exported_total
+        .load(Ordering::Relaxed);
+    let ingest_buf_rows = coord.ingest_buffer_rows();
+    let draining_flag = if coord.is_draining() { 1 } else { 0 };
+    let hist = coord.governance.latency_histogram_snapshot();
     let pq_read = coord.store.parquet_files_read.load(Ordering::Relaxed);
     let pq_written = coord.store.parquet_files_written.load(Ordering::Relaxed);
     let cache_hits = coord.store.cache_hits.load(Ordering::Relaxed);
@@ -535,6 +616,9 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
         };
 
     let (tables_total, max_snapshots) = coord.catalog.catalog_stats();
+    let policy = crate::CompactionPolicy::from_env();
+    let (small_files_total, _total_files, _total_bytes) =
+        coord.catalog.catalog_file_health_stats(policy.min_file_bytes);
 
     let mut spill_bytes: u64 = 0;
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
@@ -548,6 +632,19 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
         }
     }
 
+    let mut hist_lines = String::new();
+    for (i, bound) in crate::security::LATENCY_BUCKET_BOUNDS_MS.iter().enumerate() {
+        hist_lines.push_str(&format!(
+            "rustlakedb_query_duration_ms_bucket{{le=\"{bound}\"}} {}\n",
+            hist[i]
+        ));
+    }
+    hist_lines.push_str(&format!(
+        "rustlakedb_query_duration_ms_bucket{{le=\"+Inf\"}} {}\n\
+         rustlakedb_query_duration_ms_count {}\n",
+        hist[12], hist[12]
+    ));
+
     let body = format!(
         "# HELP rustlakedb_queries_total Total SQL queries executed\n\
          # TYPE rustlakedb_queries_total counter\n\
@@ -555,12 +652,34 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
          # HELP rustlakedb_query_errors_total Total failed SQL queries\n\
          # TYPE rustlakedb_query_errors_total counter\n\
          rustlakedb_query_errors_total {errors}\n\
-         # HELP rustlakedb_query_duration_ms_sum Cumulative query latency in milliseconds\n\
-         # TYPE rustlakedb_query_duration_ms_sum counter\n\
+         # HELP rustlakedb_query_duration_ms Query latency histogram in milliseconds\n\
+         # TYPE rustlakedb_query_duration_ms histogram\n\
+         {hist_lines}\
          rustlakedb_query_duration_ms_sum {dur_ms}\n\
          # HELP rustlakedb_worker_rpc_timeouts_total Total worker RPC failures/timeouts triggering retry\n\
          # TYPE rustlakedb_worker_rpc_timeouts_total counter\n\
          rustlakedb_worker_rpc_timeouts_total {rpc_timeouts}\n\
+         # HELP rustlakedb_auth_denied_total Total RBAC/column-grant/REST authorization denials (42501/403)\n\
+         # TYPE rustlakedb_auth_denied_total counter\n\
+         rustlakedb_auth_denied_total {auth_denied}\n\
+         # HELP rustlakedb_compaction_runs_total Total table compaction and optimize runs completed\n\
+         # TYPE rustlakedb_compaction_runs_total counter\n\
+         rustlakedb_compaction_runs_total {compaction_runs}\n\
+         # HELP rustlakedb_compaction_files_rewritten_total Total Parquet files rewritten by compaction/optimize\n\
+         # TYPE rustlakedb_compaction_files_rewritten_total counter\n\
+         rustlakedb_compaction_files_rewritten_total {compaction_files}\n\
+         # HELP rustlakedb_small_files_total Active Parquet data files smaller than min_file_bytes compaction threshold\n\
+         # TYPE rustlakedb_small_files_total gauge\n\
+         rustlakedb_small_files_total {small_files_total}\n\
+         # HELP rustlakedb_ingest_buffer_rows Streaming micro-batch rows currently buffered awaiting flush\n\
+         # TYPE rustlakedb_ingest_buffer_rows gauge\n\
+         rustlakedb_ingest_buffer_rows {ingest_buf_rows}\n\
+         # HELP rustlakedb_otlp_spans_exported_total Total OpenTelemetry spans pushed to configured OTLP endpoint\n\
+         # TYPE rustlakedb_otlp_spans_exported_total counter\n\
+         rustlakedb_otlp_spans_exported_total {otlp_exported}\n\
+         # HELP rustlakedb_node_draining Whether this coordinator is draining for maintenance (1=draining, 0=active)\n\
+         # TYPE rustlakedb_node_draining gauge\n\
+         rustlakedb_node_draining {draining_flag}\n\
          # HELP rustlakedb_workers_healthy Number of healthy distributed workers\n\
          # TYPE rustlakedb_workers_healthy gauge\n\
          rustlakedb_workers_healthy {healthy_workers}\n\
@@ -770,55 +889,230 @@ async fn get_table_snapshots_http(
     }
 }
 
-async fn web_ui() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"/><title>RustLakeDB — Distributed Lakehouse Console</title>
-<style>
-body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:24px}
-h1{margin:0 0 8px;color:#58a6ff} .sub{color:#8b949e;margin-bottom:20px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}
-textarea{width:100%;height:90px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;font-family:monospace;font-size:13px}
-button{background:#238636;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer;margin-top:8px;font-weight:600}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
-th,td{border:1px solid #30363d;padding:6px 8px;text-align:left} th{background:#21262d}
-pre{background:#0d1117;padding:10px;border-radius:6px;overflow:auto;font-size:12px}
-</style></head>
-<body>
-<h1>RustLakeDB Lakehouse Console</h1>
-<div class="sub">100% Rust Distributed SQL &amp; Apache Iceberg v3 Engine &bull; PG v3 Wire (:5432) &bull; Arrow Flight SQL (:8815) &bull; Iceberg v3 REST &bull; OIDC/JWKS &bull; Prometheus <code>/metrics</code></div>
-<div class="grid">
-  <div class="card"><h3>Cluster Topology &amp; Worker Health</h3><div id="workers"></div><pre id="status">Loading...</pre></div>
-  <div class="card"><h3>Interactive SQL Workbench</h3>
-    <textarea id="sql">SELECT region, COUNT(*) AS orders, SUM(amount) AS total_rev FROM public.big_orders GROUP BY region ORDER BY region;</textarea><br/>
-    <button onclick="runSql()">Run Distributed SQL</button>
-    <div id="meta" style="margin-top:8px;color:#8b949e"></div>
-  </div>
-</div>
-<div class="card" style="margin-bottom:16px"><h3>Active Queries &amp; Workload Control</h3><div id="activeq">No active queries.</div></div>
-<div class="card"><h3>Query Result</h3><div id="out">Run a query above to inspect results.</div></div>
-<script>
-async function cancelQuery(qid){await fetch('/v1/queries/'+encodeURIComponent(qid)+'/cancel',{method:'POST'});refresh();}
-async function refresh(){
-  const r=await fetch('/v1/cluster/status');const st=await r.json();
-  document.getElementById('status').textContent=JSON.stringify(st,null,2);
-  document.getElementById('workers').innerHTML=(st.workers||[]).map(w=>'<span style="display:inline-block;margin:2px 6px 8px 0;padding:4px 10px;border-radius:12px;background:'+(w.healthy?'#1f6feb':'#da3633')+';font-size:12px">'+w.id+' ('+(w.healthy?'HEALTHY':'DOWN')+')</span>').join('');
-  const aq=st.active_queries||[];
-  document.getElementById('activeq').innerHTML=aq.length===0?'No active queries.':'<table><thead><tr><th>Query ID</th><th>User</th><th>SQL</th><th>Action</th></tr></thead><tbody>'+aq.map(q=>'<tr><td>'+q.query_id+'</td><td>'+q.user+'</td><td><code>'+q.sql+'</code></td><td><button style="background:#da3633;margin:0;padding:4px 10px" onclick="cancelQuery(\''+q.query_id+'\')">Cancel</button></td></tr>').join('')+'</tbody></table>';
+async fn get_governance_overview_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    if let Ok(gov) = coord.catalog.get_governance().await {
+        coord.governance.hydrate_from_catalog(gov);
+    }
+    Json(coord.governance.governance_overview_snapshot())
 }
-async function runSql(){
-  const sql=document.getElementById('sql').value;
-  const r=await fetch('/v1/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
-  const d=await r.json();
-  if(d.error){document.getElementById('meta').textContent='ERROR: '+d.error;return;}
-  document.getElementById('meta').textContent=d.command_tag+' ('+d.elapsed_ms+' ms, stages='+d.stages_executed+', tasks='+d.tasks_executed+')';
-  let h='<table><thead><tr>'+d.columns.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>';
-  for(const row of d.rows){h+='<tr>'+row.map(v=>'<td>'+(v===null?'NULL':typeof v==='object'?JSON.stringify(v):v)+'</td>').join('')+'</tr>';}
-  document.getElementById('out').innerHTML=h+'</tbody></table>';
-  refresh();
+
+async fn get_table_health_http(
+    State(coord): State<Arc<Coordinator>>,
+    Path(table): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    match coord.catalog.get_table(&table).await {
+        Ok(meta) => {
+            let policy = crate::CompactionPolicy::from_env();
+            let snap = meta.current_snapshot("main").ok();
+            let mut b_lt_1m = 0usize;
+            let mut b_1m_32m = 0usize;
+            let mut b_32m_128m = 0usize;
+            let mut b_128m_256m = 0usize;
+            let mut b_gt_256m = 0usize;
+            let mut small_files = 0usize;
+            let mut oversized_files = 0usize;
+            let mut files_with_dv = 0usize;
+            let mut total_rows = 0u64;
+            let mut deleted_rows = 0u64;
+            let mut total_bytes = 0u64;
+            let mut file_count = 0usize;
+            let mut min_bytes = u64::MAX;
+            let mut max_bytes = 0u64;
+
+            if let Some(s) = snap {
+                file_count = s.data_files.len();
+                for df in &s.data_files {
+                    total_rows = total_rows.saturating_add(df.row_count);
+                    deleted_rows = deleted_rows.saturating_add(df.deleted_row_count);
+                    total_bytes = total_bytes.saturating_add(df.byte_size);
+                    min_bytes = min_bytes.min(df.byte_size);
+                    max_bytes = max_bytes.max(df.byte_size);
+                    if df.byte_size < 1024 * 1024 {
+                        b_lt_1m += 1;
+                    } else if df.byte_size < 32 * 1024 * 1024 {
+                        b_1m_32m += 1;
+                    } else if df.byte_size < 128 * 1024 * 1024 {
+                        b_32m_128m += 1;
+                    } else if df.byte_size <= 256 * 1024 * 1024 {
+                        b_128m_256m += 1;
+                    } else {
+                        b_gt_256m += 1;
+                    }
+                    if df.byte_size < policy.min_file_bytes {
+                        small_files += 1;
+                    }
+                    if df.byte_size > policy.max_file_bytes {
+                        oversized_files += 1;
+                    }
+                    if df.dv_path.is_some() {
+                        files_with_dv += 1;
+                    }
+                }
+            }
+            if file_count == 0 {
+                min_bytes = 0;
+            }
+            let delete_ratio = if total_rows > 0 {
+                deleted_rows as f64 / total_rows as f64
+            } else {
+                0.0
+            };
+            let avg_bytes = if file_count > 0 {
+                total_bytes / file_count as u64
+            } else {
+                0
+            };
+            let needs_compaction = small_files >= policy.min_small_files_per_partition
+                || oversized_files > 0
+                || delete_ratio >= policy.delete_ratio_threshold;
+            let schema: Vec<Value> = meta
+                .schema
+                .iter()
+                .map(|f| {
+                    json!({
+                        "field_id": f.field_id,
+                        "name": f.name,
+                        "data_type": format!("{:?}", f.data_type),
+                        "nullable": f.nullable,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "table": meta.table_name,
+                    "schema": schema,
+                    "tags": meta.tags,
+                    "cluster_by": meta.cluster_by,
+                    "refs": meta.refs,
+                    "snapshot_count": meta.snapshots.len(),
+                    "file_count": file_count,
+                    "total_rows": total_rows,
+                    "deleted_rows": deleted_rows,
+                    "delete_ratio": delete_ratio,
+                    "total_bytes": total_bytes,
+                    "avg_file_bytes": avg_bytes,
+                    "min_file_bytes": min_bytes,
+                    "max_file_bytes": max_bytes,
+                    "small_files": small_files,
+                    "oversized_files": oversized_files,
+                    "files_with_dv": files_with_dv,
+                    "recommendation": if needs_compaction { "COMPACT_RECOMMENDED" } else { "HEALTHY" },
+                    "file_size_distribution": {
+                        "lt_1mb": b_lt_1m,
+                        "1mb_to_32mb": b_1m_32m,
+                        "32mb_to_128mb": b_32m_128m,
+                        "128mb_to_256mb": b_128m_256m,
+                        "gt_256mb": b_gt_256m,
+                    }
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
 }
-refresh();
-</script></body></html>"#,
+
+#[derive(Deserialize, Default)]
+struct DrainRequest {
+    #[serde(default = "default_drain_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_user")]
+    user: String,
+}
+fn default_drain_timeout_ms() -> u64 {
+    10_000
+}
+
+async fn admin_drain_http(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    body: Option<Json<DrainRequest>>,
+) -> (StatusCode, Json<Value>) {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let session = match resolve_http_session(&coord, &headers, &req.user).await {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))),
+    };
+    if let Err(e) = coord
+        .governance
+        .require_security_admin(&session, "ADMIN DRAIN", "coordinator")
+    {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": e.to_string() })));
+    }
+    let report = coord
+        .drain_gracefully(std::time::Duration::from_millis(req.timeout_ms.min(60_000)))
+        .await;
+    coord
+        .governance
+        .record_audit(&session.user, "ADMIN DRAIN", "coordinator", "OK");
+    (StatusCode::OK, Json(report))
+}
+
+async fn admin_undrain_http(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    body: Option<Json<DrainRequest>>,
+) -> (StatusCode, Json<Value>) {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let session = match resolve_http_session(&coord, &headers, &req.user).await {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))),
+    };
+    if let Err(e) = coord
+        .governance
+        .require_security_admin(&session, "ADMIN UNDRAIN", "coordinator")
+    {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": e.to_string() })));
+    }
+    coord.set_draining(false);
+    coord
+        .governance
+        .record_audit(&session.user, "ADMIN UNDRAIN", "coordinator", "OK");
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "active", "draining": false })),
     )
+}
+
+#[derive(Deserialize, Default)]
+struct BackupCatalogRequest {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default = "default_user")]
+    user: String,
+}
+
+async fn admin_backup_catalog_http(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    body: Option<Json<BackupCatalogRequest>>,
+) -> (StatusCode, Json<Value>) {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let session = match resolve_http_session(&coord, &headers, &req.user).await {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))),
+    };
+    if let Err(e) = coord
+        .governance
+        .require_security_admin(&session, "BACKUP CATALOG", "catalog")
+    {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": e.to_string() })));
+    }
+    match coord
+        .backup_catalog_snapshot(&session, req.prefix.as_deref())
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn web_ui() -> Html<&'static str> {
+    Html(include_str!("../ui/console.html"))
 }

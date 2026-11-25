@@ -408,6 +408,8 @@ pub struct Coordinator {
     pub governance: Arc<GovernanceState>,
     /// Micro-batch staging buffer for record-by-record streaming ingest (`(table, branch) -> ndjson lines`).
     pub ingest_buffers: RwLock<HashMap<(String, String), Vec<String>>>,
+    /// Graceful node drain flag (`POST /v1/admin/drain` / `SIGTERM`, Wave 41).
+    pub draining: std::sync::atomic::AtomicBool,
 }
 
 impl Coordinator {
@@ -443,7 +445,110 @@ impl Coordinator {
             max_task_retries: 3,
             governance: Arc::new(GovernanceState::default()),
             ingest_buffers: RwLock::new(HashMap::new()),
+            draining: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::SeqCst);
+    }
+
+    pub fn ingest_buffer_rows(&self) -> usize {
+        self.ingest_buffers
+            .read()
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Graceful Day-2 Ops Node Drain (Wave 41):
+    /// 1. Marks node as draining (`/readyz` -> 503, rejects new SQL/ingest requests)
+    /// 2. Flushes all pending streaming micro-batch buffers so zero rows are lost
+    /// 3. Waits up to `timeout` for in-flight queries to finish cleanly
+    /// 4. Steps down Raft leadership so a peer takes over immediately
+    pub async fn drain_gracefully(&self, timeout: std::time::Duration) -> serde_json::Value {
+        let t0 = std::time::Instant::now();
+        self.draining.store(true, Ordering::SeqCst);
+        let flushed_rows = self.flush_all_ingest_buffers().await;
+        while !self.governance.active_queries_snapshot().is_empty() && t0.elapsed() < timeout {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let remaining_active = self.governance.active_queries_snapshot().len();
+        let raft_stepped_down = self.catalog.step_down_leader();
+        serde_json::json!({
+            "status": "drained",
+            "draining": true,
+            "flushed_ingest_rows": flushed_rows,
+            "remaining_active_queries": remaining_active,
+            "raft_stepped_down": raft_stepped_down,
+            "elapsed_ms": t0.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// On-Demand Consistent Catalog DR Backup with Read-Back SHA-256 Checksum Verification (Wave 41):
+    /// Serializes the full Raft catalog state (tables, views, governance) to object storage and
+    /// immediately reads it back to verify byte-for-byte SHA-256 integrity.
+    pub async fn backup_catalog_snapshot(
+        &self,
+        session: &SessionContext,
+        prefix: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let snap = self.catalog.export_catalog_snapshot().ok_or_else(|| {
+            RustLakeError::Catalog("catalog backend does not support snapshot export".into())
+        })?;
+        let tables_count = snap.tables.len();
+        let views_count = snap.views.len();
+        let bytes = serde_json::to_vec(&snap)?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let sha256_hex: String = digest
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let ts = security::epoch_ms();
+        let clean_prefix = prefix
+            .unwrap_or("_backups/catalog")
+            .trim_matches('/');
+        let backup_key = format!("{clean_prefix}/catalog-backup-{ts}-{}.json", Uuid::new_v4());
+        self.store.put_raw_bytes(&backup_key, bytes.clone()).await?;
+        // Read-back DR integrity verification
+        let verify_bytes = self.store.get_raw_bytes(&backup_key).await?;
+        let verify_digest = ring::digest::digest(&ring::digest::SHA256, &verify_bytes);
+        let verify_hex: String = verify_digest
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if verify_hex != sha256_hex {
+            return Err(RustLakeError::Execution(format!(
+                "catalog backup checksum mismatch: expected {sha256_hex}, got {verify_hex}"
+            )));
+        }
+        // Also verify deserialization round-trip cleanly
+        let _: rustlakedb_catalog::FullCatalogSnapshot = serde_json::from_slice(&verify_bytes)?;
+        self.governance
+            .record_audit(&session.user, "BACKUP CATALOG", &backup_key, "OK");
+        let _ = self
+            .catalog
+            .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                security::make_persisted_audit(session, "BACKUP CATALOG", &backup_key, "OK", "ADMIN"),
+            ))
+            .await;
+        Ok(serde_json::json!({
+            "status": "verified",
+            "backup_path": backup_key,
+            "storage_uri": self.store.base_uri().unwrap_or("memory://"),
+            "sha256": sha256_hex,
+            "checksum_verified": true,
+            "byte_size": bytes.len(),
+            "tables": tables_count,
+            "views": views_count,
+            "timestamp_ms": ts,
+        }))
     }
 
     /// Buffers record-by-record streaming NDJSON lines in RAM and auto-flushes into a single clean
@@ -578,6 +683,11 @@ impl Coordinator {
         session: &SessionContext,
         trace_id: Option<&str>,
     ) -> Result<QueryExecutionResult> {
+        if self.is_draining() {
+            return Err(RustLakeError::Execution(
+                "coordinator node is draining; retry request on a healthy peer".into(),
+            ));
+        }
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let lower = trimmed.to_lowercase();
 
@@ -1809,6 +1919,7 @@ impl Coordinator {
                     .await?;
                 let updated = self.catalog.get_table(&table_name).await?;
                 self.store.write_iceberg_metadata(&updated, branch).await?;
+                self.governance.record_compaction(old_count as u64);
 
                 let tag = if selection.skipped_healthy_files == 0 {
                     format!("COMPACT {old_count}->{new_count}")
@@ -2553,6 +2664,7 @@ impl Coordinator {
                     .await?;
                 let updated = self.catalog.get_table(&table_name).await?;
                 self.store.write_iceberg_metadata(&updated, branch).await?;
+                self.governance.record_compaction(old_count as u64);
                 Ok(QueryExecutionResult {
                     command_tag: format!(
                         "OPTIMIZE {old_count}->{new_count} clustered_by=({}) shredded={}",

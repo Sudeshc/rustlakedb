@@ -1374,6 +1374,29 @@ impl Catalog for RaftCatalogNode {
     fn catalog_stats(&self) -> (usize, usize) {
         self.state_machine.catalog_stats()
     }
+
+    fn catalog_file_health_stats(&self, min_file_bytes: u64) -> (usize, usize, u64) {
+        self.state_machine.catalog_file_health_stats(min_file_bytes)
+    }
+
+    fn export_catalog_snapshot(&self) -> Option<FullCatalogSnapshot> {
+        Some(self.state_machine.export_snapshot())
+    }
+
+    fn step_down_leader(&self) -> bool {
+        let mut c = self.core.write();
+        if c.role == RaftRole::Leader {
+            c.role = RaftRole::Follower;
+            if c.leader_id == Some(self.node_id) {
+                c.leader_id = None;
+            }
+            c.last_heartbeat = Instant::now();
+            self.leader_changes.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 async fn handle_status(State(node): State<Arc<RaftCatalogNode>>) -> (StatusCode, Json<Value>) {

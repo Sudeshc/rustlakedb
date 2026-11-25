@@ -205,13 +205,25 @@ pub struct GovernanceState {
     trace_spans: RwLock<VecDeque<TraceSpan>>,
     /// Exactly-once CDC stream watermarks: `table::stream_id` -> last committed offset (Wave 13)
     cdc_offsets: RwLock<HashMap<String, u64>>,
-    /// Prometheus metrics counters
+    /// Prometheus metrics counters & latency histogram buckets (Wave 41)
     pub queries_total: AtomicU64,
     pub query_errors_total: AtomicU64,
     pub query_duration_ms_sum: AtomicU64,
     pub worker_rpc_timeouts_total: AtomicU64,
+    pub auth_denied_total: AtomicU64,
+    pub compaction_runs_total: AtomicU64,
+    pub compaction_files_rewritten_total: AtomicU64,
+    pub otlp_spans_exported_total: AtomicU64,
+    /// Cumulative histogram buckets (le in ms): [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf]
+    pub query_latency_buckets: [AtomicU64; 13],
+    pub otlp_endpoint: RwLock<Option<String>>,
     pub max_concurrent_queries: AtomicUsize,
 }
+
+/// Prometheus latency histogram upper bounds in milliseconds (12 finite bounds + `+Inf` at index 12).
+pub const LATENCY_BUCKET_BOUNDS_MS: [u64; 12] = [
+    1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+];
 
 impl Default for GovernanceState {
     fn default() -> Self {
@@ -254,6 +266,16 @@ impl Default for GovernanceState {
             query_errors_total: AtomicU64::new(0),
             query_duration_ms_sum: AtomicU64::new(0),
             worker_rpc_timeouts_total: AtomicU64::new(0),
+            auth_denied_total: AtomicU64::new(0),
+            compaction_runs_total: AtomicU64::new(0),
+            compaction_files_rewritten_total: AtomicU64::new(0),
+            otlp_spans_exported_total: AtomicU64::new(0),
+            query_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            otlp_endpoint: RwLock::new(
+                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+            ),
             max_concurrent_queries: AtomicUsize::new(64),
         }
     }
@@ -643,6 +665,12 @@ impl GovernanceState {
         self.queries_total.fetch_add(1, Ordering::Relaxed);
         self.query_duration_ms_sum
             .fetch_add(elapsed_ms, Ordering::Relaxed);
+        for (idx, bound) in LATENCY_BUCKET_BOUNDS_MS.iter().enumerate() {
+            if elapsed_ms <= *bound {
+                self.query_latency_buckets[idx].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.query_latency_buckets[12].fetch_add(1, Ordering::Relaxed);
         if status != "OK" {
             self.query_errors_total.fetch_add(1, Ordering::Relaxed);
         }
@@ -659,6 +687,111 @@ impl GovernanceState {
             elapsed_ms,
             timestamp_ms: epoch_ms(),
         });
+    }
+
+    pub fn latency_histogram_snapshot(&self) -> [u64; 13] {
+        std::array::from_fn(|i| self.query_latency_buckets[i].load(Ordering::Relaxed))
+    }
+
+    /// Computes approximate `(p50_ms, p95_ms, p99_ms)` from the lock-free latency histogram buckets.
+    pub fn latency_percentiles_ms(&self) -> (u64, u64, u64) {
+        let b = self.latency_histogram_snapshot();
+        let total = b[12];
+        if total == 0 {
+            return (0, 0, 0);
+        }
+        let pct = |q: f64| -> u64 {
+            let target = ((total as f64) * q).ceil().max(1.0) as u64;
+            for (i, bound) in LATENCY_BUCKET_BOUNDS_MS.iter().enumerate() {
+                if b[i] >= target {
+                    return *bound;
+                }
+            }
+            *LATENCY_BUCKET_BOUNDS_MS.last().unwrap_or(&10_000)
+        };
+        (pct(0.50), pct(0.95), pct(0.99))
+    }
+
+    pub fn record_compaction(&self, files_rewritten: u64) {
+        self.compaction_runs_total.fetch_add(1, Ordering::Relaxed);
+        self.compaction_files_rewritten_total
+            .fetch_add(files_rewritten, Ordering::Relaxed);
+    }
+
+    pub fn set_otlp_endpoint(&self, endpoint: Option<String>) {
+        *self.otlp_endpoint.write() = endpoint.filter(|s| !s.trim().is_empty());
+    }
+
+    pub fn governance_overview_snapshot(&self) -> serde_json::Value {
+        let mut roles: Vec<String> = self.roles.read().iter().cloned().collect();
+        roles.sort();
+        let role_memberships: std::collections::BTreeMap<String, Vec<String>> = self
+            .role_memberships
+            .read()
+            .iter()
+            .map(|(k, v)| {
+                let mut list: Vec<String> = v.iter().cloned().collect();
+                list.sort();
+                (k.clone(), list)
+            })
+            .collect();
+        let mut grants: Vec<serde_json::Value> = self
+            .grants
+            .read()
+            .iter()
+            .map(|((role, target), privs)| {
+                let mut p: Vec<String> = privs.iter().cloned().collect();
+                p.sort();
+                serde_json::json!({ "role": role, "target": target, "privileges": p })
+            })
+            .collect();
+        grants.sort_by(|a, b| a["role"].as_str().cmp(&b["role"].as_str()));
+        let mut column_grants: Vec<serde_json::Value> = self
+            .column_grants
+            .read()
+            .iter()
+            .map(|((role, table), cols)| {
+                let mut c: Vec<String> = cols.iter().cloned().collect();
+                c.sort();
+                serde_json::json!({ "role": role, "table": table, "columns": c })
+            })
+            .collect();
+        column_grants.sort_by(|a, b| a["role"].as_str().cmp(&b["role"].as_str()));
+        let rls_policies: Vec<serde_json::Value> = self
+            .rls_policies
+            .read()
+            .iter()
+            .map(|((role, table), pred)| {
+                serde_json::json!({ "role": role, "table": table, "predicate": format!("{pred:?}") })
+            })
+            .collect();
+        let masking_policies: Vec<serde_json::Value> = self
+            .masking_policies
+            .read()
+            .iter()
+            .flat_map(|((role, table), rules)| {
+                rules.iter().map(move |r| {
+                    serde_json::json!({
+                        "role": role,
+                        "table": table,
+                        "name": r.name,
+                        "target": r.target,
+                        "mask_value": r.mask_value,
+                    })
+                })
+            })
+            .collect();
+        let tag_masking_policies = self.tag_masking_policies.read().clone();
+        serde_json::json!({
+            "roles": roles,
+            "role_memberships": role_memberships,
+            "grants": grants,
+            "column_grants": column_grants,
+            "rls_policies": rls_policies,
+            "masking_policies": masking_policies,
+            "tag_masking_policies": tag_masking_policies,
+            "auth_denied_total": self.auth_denied_total.load(Ordering::Relaxed),
+        })
     }
 
     pub fn query_history_snapshot(&self) -> Vec<QueryHistoryEntry> {
@@ -977,6 +1110,9 @@ impl GovernanceState {
     }
 
     pub fn record_audit(&self, user: &str, action: &str, target: &str, outcome: &str) {
+        if outcome.contains("DENIED") {
+            self.auth_denied_total.fetch_add(1, Ordering::Relaxed);
+        }
         let mut log = self.audit_log.write();
         if log.len() >= 500 {
             log.pop_front();
@@ -1164,8 +1300,69 @@ impl GovernanceState {
         cur
     }
 
-    // ---- Wave 13: OpenTelemetry Trace Spans & Exactly-Once CDC Offsets ----
+    // ---- Wave 13 + Wave 41: OpenTelemetry Trace Spans (Local Ring + Optional OTLP/HTTP Push Export) ----
     pub fn record_span(&self, span: TraceSpan) {
+        let otlp_url = self.otlp_endpoint.read().clone();
+        if let Some(base) = otlp_url
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let span_clone = span.clone();
+            let endpoint = if base.ends_with("/v1/traces") {
+                base
+            } else {
+                format!("{}/v1/traces", base.trim_end_matches('/'))
+            };
+            // Build standard OTLP/HTTP JSON ResourceSpans payload for Jaeger/Tempo/Datadog APM
+            let attrs: Vec<serde_json::Value> = span_clone
+                .attributes
+                .iter()
+                .map(|(k, v)| {
+                    serde_json::json!({
+                        "key": k,
+                        "value": { "stringValue": v }
+                    })
+                })
+                .collect();
+            let start_ns = span_clone.start_ms.saturating_mul(1_000_000).to_string();
+            let end_ns = span_clone
+                .start_ms
+                .saturating_add(span_clone.duration_ms)
+                .saturating_mul(1_000_000)
+                .to_string();
+            let payload = serde_json::json!({
+                "resourceSpans": [{
+                    "resource": {
+                        "attributes": [{
+                            "key": "service.name",
+                            "value": { "stringValue": span_clone.service }
+                        }]
+                    },
+                    "scopeSpans": [{
+                        "scope": { "name": "rustlakedb.coordinator", "version": env!("CARGO_PKG_VERSION") },
+                        "spans": [{
+                            "traceId": span_clone.trace_id,
+                            "spanId": span_clone.span_id,
+                            "parentSpanId": span_clone.parent_span_id.unwrap_or_default(),
+                            "name": span_clone.name,
+                            "kind": 2,
+                            "startTimeUnixNano": start_ns,
+                            "endTimeUnixNano": end_ns,
+                            "attributes": attrs
+                        }]
+                    }]
+                }]
+            });
+            handle.spawn(async move {
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(2))
+                    .build()
+                {
+                    let _ = client.post(&endpoint).json(&payload).send().await;
+                }
+            });
+            self.otlp_spans_exported_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let mut q = self.trace_spans.write();
         if q.len() >= 500 {
             q.pop_front();

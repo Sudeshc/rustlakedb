@@ -562,6 +562,18 @@ pub trait Catalog: Send + Sync {
     fn catalog_stats(&self) -> (usize, usize) {
         (0, 0)
     }
+    /// Returns `(small_files, total_files, total_bytes)` across all current `main` snapshots with zero cloning (Wave 41).
+    fn catalog_file_health_stats(&self, _min_file_bytes: u64) -> (usize, usize, u64) {
+        (0, 0, 0)
+    }
+    /// Exports an atomic point-in-time snapshot of the full catalog for DR backups (`POST /v1/admin/backup-catalog`, Wave 41).
+    fn export_catalog_snapshot(&self) -> Option<FullCatalogSnapshot> {
+        None
+    }
+    /// Cleanly steps down Raft leadership during graceful node drain (`POST /v1/admin/drain`, Wave 41).
+    fn step_down_leader(&self) -> bool {
+        false
+    }
     async fn create_table(&self, metadata: IcebergTableMetadata) -> Result<()>;
     async fn drop_table(&self, table_name: &str) -> Result<()>;
     async fn get_table(&self, table_name: &str) -> Result<IcebergTableMetadata>;
@@ -853,6 +865,29 @@ impl Catalog for InMemoryRaftCatalog {
             .max()
             .unwrap_or(0);
         (guard.len(), max_snaps)
+    }
+
+    fn catalog_file_health_stats(&self, min_file_bytes: u64) -> (usize, usize, u64) {
+        let guard = self.tables.read();
+        let mut small = 0usize;
+        let mut total = 0usize;
+        let mut bytes = 0u64;
+        for t in guard.values() {
+            if let Ok(snap) = t.current_snapshot("main") {
+                for df in &snap.data_files {
+                    total += 1;
+                    bytes = bytes.saturating_add(df.byte_size);
+                    if df.byte_size < min_file_bytes {
+                        small += 1;
+                    }
+                }
+            }
+        }
+        (small, total, bytes)
+    }
+
+    fn export_catalog_snapshot(&self) -> Option<FullCatalogSnapshot> {
+        Some(self.export_snapshot())
     }
 
     async fn create_table(&self, mut metadata: IcebergTableMetadata) -> Result<()> {

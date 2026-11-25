@@ -1,0 +1,1084 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>RustLakeDB Lakehouse Console — Unified Control Plane</title>
+<style>
+:root {
+  --bg: #0b0f17;
+  --surface: #121826;
+  --surface2: #192234;
+  --border: #25324a;
+  --text: #e6edf7;
+  --muted: #8b9bb4;
+  --accent: #3b82f6;
+  --accent-soft: rgba(59,130,246,.16);
+  --green: #10b981;
+  --green-soft: rgba(16,185,129,.16);
+  --amber: #f59e0b;
+  --amber-soft: rgba(245,158,11,.16);
+  --red: #ef4444;
+  --red-soft: rgba(239,68,68,.16);
+  --purple: #a855f7;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  font-size: 13px;
+}
+aside.sidebar {
+  width: 238px;
+  min-width: 238px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 12px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.brand-logo {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #3b82f6, #06b6d4);
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  font-size: 15px;
+  color: #fff;
+}
+.brand-title { font-weight: 700; font-size: 15px; letter-spacing: .2px; }
+.brand-sub { font-size: 11px; color: var(--muted); }
+nav.nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  transition: all .12s ease;
+}
+.nav-btn:hover { background: var(--surface2); color: var(--text); }
+.nav-btn.active {
+  background: var(--accent-soft);
+  border-color: rgba(59,130,246,.35);
+  color: #93c5fd;
+  font-weight: 600;
+}
+.sidebar-footer {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sidebar-footer input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+}
+main.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+header.topbar {
+  height: 54px;
+  min-height: 54px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  gap: 12px;
+}
+.topbar-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+}
+.pill.green { background: var(--green-soft); border-color: rgba(16,185,129,.35); color: #34d399; }
+.pill.amber { background: var(--amber-soft); border-color: rgba(245,158,11,.35); color: #fbbf24; }
+.pill.red { background: var(--red-soft); border-color: rgba(239,68,68,.35); color: #f87171; }
+.pill.blue { background: var(--accent-soft); border-color: rgba(59,130,246,.35); color: #93c5fd; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
+.workspace {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: none;
+}
+.workspace.active { display: block; }
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+.kpi-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.kpi-val { font-size: 22px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.kpi-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.grid-3 { display: grid; grid-template-columns: 280px 1fr; gap: 16px; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  gap: 8px;
+}
+.card-title { font-size: 14px; font-weight: 600; margin: 0; }
+button.btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  padding: 7px 13px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+button.btn:hover { filter: brightness(1.1); }
+button.btn.sec { background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+button.btn.green { background: #059669; }
+button.btn.amber { background: #d97706; }
+button.btn.red { background: #dc2626; }
+button.btn.sm { padding: 4px 9px; font-size: 11px; }
+input.inp, select.inp, textarea.inp {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+  font-size: 12px;
+  outline: none;
+}
+textarea.sql-editor {
+  width: 100%;
+  min-height: 120px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+table.tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.tbl th, table.tbl td {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+table.tbl th {
+  background: var(--surface2);
+  color: var(--muted);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+}
+table.tbl tr:hover td { background: rgba(255,255,255,.02); }
+.table-wrap { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+pre.code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  margin: 0;
+  max-height: 320px;
+}
+.bar-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 12px; }
+.bar-label { width: 110px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.bar-track { flex: 1; height: 14px; background: var(--bg); border-radius: 4px; overflow: hidden; border: 1px solid var(--border); }
+.bar-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #06b6d4); transition: width .2s ease; }
+.bar-val { width: 65px; text-align: right; font-family: var(--mono); font-size: 11px; }
+.dag-flow { display: flex; gap: 12px; overflow-x: auto; padding: 8px 0; }
+.dag-node {
+  min-width: 210px;
+  background: var(--surface2);
+  border: 1px solid rgba(59,130,246,.45);
+  border-radius: 8px;
+  padding: 10px;
+}
+.dag-node-title { font-weight: 700; color: #93c5fd; font-size: 12px; margin-bottom: 6px; }
+.list-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+}
+.list-item:hover { background: var(--surface2); }
+.list-item.active { background: var(--accent-soft); border-color: rgba(59,130,246,.35); color: #93c5fd; }
+.tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.tab {
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+}
+.tab.active { background: var(--accent-soft); color: #93c5fd; border-color: rgba(59,130,246,.4); }
+.row-denied td { background: rgba(239,68,68,.10) !important; color: #fca5a5; }
+.banner-drain {
+  background: var(--amber-soft);
+  border-bottom: 1px solid rgba(245,158,11,.4);
+  color: #fde68a;
+  padding: 8px 20px;
+  font-weight: 600;
+  display: none;
+  justify-content: space-between;
+  align-items: center;
+}
+canvas.spark { width: 100%; height: 110px; display: block; }
+@media (max-width: 980px) {
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  aside.sidebar { width: 190px; min-width: 190px; }
+}
+</style>
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-logo">RL</div>
+    <div>
+      <div class="brand-title">RustLakeDB</div>
+      <div class="brand-sub" id="versionTag">v9.0.0 Control Console</div>
+    </div>
+  </div>
+  <nav class="nav">
+    <button class="nav-btn active" data-ws="overview" onclick="switchWs('overview')">&#9673; Cluster &amp; Raft Ops</button>
+    <button class="nav-btn" data-ws="sql" onclick="switchWs('sql')">&#9654; SQL &amp; Query Profile</button>
+    <button class="nav-btn" data-ws="catalog" onclick="switchWs('catalog')">&#9707; Catalog &amp; Iceberg</button>
+    <button class="nav-btn" data-ws="workload" onclick="switchWs('workload')">&#9889; Workload &amp; Traces</button>
+    <button class="nav-btn" data-ws="governance" onclick="switchWs('governance')">&#9878; Governance &amp; Audit</button>
+    <button class="nav-btn" data-ws="federation" onclick="switchWs('federation')">&#8644; Federation Hub</button>
+    <button class="nav-btn" data-ws="metrics" onclick="switchWs('metrics')">&#9776; Live Prometheus SLIs</button>
+  </nav>
+  <div class="sidebar-footer">
+    <div>Session Identity</div>
+    <input id="sessUser" value="postgres" placeholder="User (e.g. postgres)" title="Fallback SQL user"/>
+    <input id="sessBranch" value="main" placeholder="Iceberg Branch" title="Active Iceberg branch"/>
+    <input id="sessJwt" type="password" placeholder="Optional Bearer JWT..." title="OIDC/HS256 Bearer Token"/>
+    <div style="margin-top:4px;line-height:1.4">
+      PG v3 (:5432) &bull; Arrow Flight SQL (:8815) &bull; Iceberg REST (:8181)
+    </div>
+  </div>
+</aside>
+
+<main class="main">
+  <div class="banner-drain" id="drainBanner">
+    <span>&#9888; COORDINATOR IS DRAINING — /readyz returning 503 Service Unavailable; new SQL requests rejected.</span>
+    <button class="btn green sm" onclick="adminUndrain()">Resume Node (Undrain)</button>
+  </div>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="pill green" id="raftPill"><span class="dot"></span>Raft: Checking...</span>
+      <span class="pill blue" id="workersPill">Workers: -/-</span>
+      <span class="pill" id="storagePill">Storage: -</span>
+      <span class="pill" id="latencyPill">p50/p95/p99: -</span>
+    </div>
+    <div class="topbar-right">
+      <button class="btn sec sm" id="autoBtn" onclick="toggleAutoRefresh()">Auto: ON (3s)</button>
+      <button class="btn sec sm" onclick="refreshAll()">&#8635; Refresh</button>
+    </div>
+  </header>
+
+  <!-- 1. CLUSTER & RAFT OPS OVERVIEW -->
+  <section class="workspace active" id="ws-overview">
+    <div class="kpi-grid">
+      <div class="kpi"><div class="kpi-label">Total Queries</div><div class="kpi-val" id="kQueries">0</div><div class="kpi-sub" id="kErrors">0 errors</div></div>
+      <div class="kpi"><div class="kpi-label">Latency p50 / p95 / p99</div><div class="kpi-val" id="kLat">0 / 0 / 0 ms</div><div class="kpi-sub">Lock-free histogram</div></div>
+      <div class="kpi"><div class="kpi-label">Active / Max Snapshots</div><div class="kpi-val" id="kSnaps">0</div><div class="kpi-sub" id="kTables">0 tables</div></div>
+      <div class="kpi"><div class="kpi-label">Small / Total Data Files</div><div class="kpi-val" id="kFiles">0 / 0</div><div class="kpi-sub" id="kBytes">0 B on storage</div></div>
+      <div class="kpi"><div class="kpi-label">Compaction Runs</div><div class="kpi-val" id="kCompact">0</div><div class="kpi-sub" id="kCompactFiles">0 files rewritten</div></div>
+      <div class="kpi"><div class="kpi-label">Auth Denials (42501/403)</div><div class="kpi-val" id="kDenied">0</div><div class="kpi-sub" id="kBufRows">0 ingest buf rows</div></div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Live Cluster Throughput &amp; Latency Trend</h3><span class="pill blue" id="otlpPill">OTLP Exported: 0</span></div>
+        <canvas class="spark" id="sparkCanvas" width="560" height="110"></canvas>
+        <div style="display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-top:6px">
+          <span>Blue: Queries/poll &bull; Emerald: Cache Hits</span>
+          <span id="pruneSummary">Puffin pruned: 0 &bull; ZoneMap pruned: 0</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Day-2 Operations &amp; Disaster Recovery</h3></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+          <button class="btn green" onclick="adminBackupCatalog()">&#128190; Backup Catalog Snapshot (SHA-256)</button>
+          <button class="btn amber" onclick="adminDrain()">&#9888; Graceful Drain Node</button>
+          <button class="btn sec" onclick="adminUndrain()">&#9654; Undrain Node</button>
+        </div>
+        <pre class="code" id="opsOutput">Ready. Trigger a consistent DR catalog backup or graceful drain above.</pre>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Cluster Topology &amp; Distributed Worker Fleet</h3></div>
+        <div id="workerFleet">Loading workers...</div>
+      </div>
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Query Latency Histogram (Prometheus Buckets)</h3></div>
+        <div id="histBars">No samples yet.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. SQL WORKBENCH & VISUAL QUERY PROFILE -->
+  <section class="workspace" id="ws-sql">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">SQL Workbench</h3>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn sec sm" onclick="setSqlPreset('SHOW TABLES;')">SHOW TABLES</button>
+          <button class="btn sec sm" onclick="setSqlPreset('SELECT * FROM system.query_history LIMIT 25;')">Query History</button>
+          <button class="btn sec sm" onclick="setSqlPreset('SELECT * FROM system.audit_log LIMIT 25;')">Audit Log</button>
+          <button class="btn sec sm" onclick="setSqlPreset('SELECT * FROM system.access_history LIMIT 25;')">Access History</button>
+          <button class="btn sec sm" onclick="setSqlPreset('SHOW EXTERNAL CATALOGS;')">External Catalogs</button>
+        </div>
+      </div>
+      <textarea class="inp sql-editor" id="sqlInput" onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){runSql();}">SHOW TABLES;</textarea>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:8px;flex-wrap:wrap">
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn green" onclick="runSql()">&#9654; Run SQL (Ctrl+Enter)</button>
+          <button class="btn sec sm" onclick="exportCsv()">Export CSV</button>
+          <button class="btn sec sm" onclick="exportJson()">Export JSON</button>
+        </div>
+        <div id="sqlMeta" style="color:var(--muted);font-family:var(--mono);font-size:12px"></div>
+      </div>
+    </div>
+
+    <div class="card" id="dagCard" style="display:none">
+      <div class="card-header"><h3 class="card-title">Visual Query Profile (Distributed Execution DAG)</h3><span class="pill blue" id="dagStats"></span></div>
+      <div class="dag-flow" id="dagFlow"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Query Results</h3><span id="rowCountPill" class="pill">0 rows</span></div>
+      <div class="table-wrap" id="sqlResults"><div style="padding:16px;color:var(--muted)">Execute a query above to inspect results.</div></div>
+    </div>
+  </section>
+
+  <!-- 3. CATALOG & ICEBERG STORAGE EXPLORER -->
+  <section class="workspace" id="ws-catalog">
+    <div class="grid-3">
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Catalog Objects</h3></div>
+        <input class="inp" style="width:100%;margin-bottom:10px" id="catSearch" placeholder="Filter tables..." oninput="renderCatalogList()"/>
+        <div id="catalogList" style="max-height:540px;overflow:auto">Loading...</div>
+      </div>
+      <div>
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title" id="catSelectedTitle">Select a table to inspect Iceberg storage health &amp; snapshots</h3>
+            <span class="pill" id="catHealthBadge">-</span>
+          </div>
+          <div id="catActions" style="display:none;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+            <button class="btn sm" onclick="runTableSql('COMPACT TABLE ')">Compact Small Files</button>
+            <button class="btn sm green" onclick="runTableSql('OPTIMIZE TABLE ')">Optimize / Cluster</button>
+            <button class="btn sm amber" onclick="runTableSql('VACUUM TABLE ', ' RETAIN 10')">Vacuum (Retain 10)</button>
+            <button class="btn sm sec" onclick="runTableSql('ANALYZE TABLE ')">Analyze Stats</button>
+            <button class="btn sm sec" onclick="openTablePreview()">Preview 50 Rows</button>
+            <button class="btn sm sec" onclick="openTableFederation()">Federate Table &rarr;</button>
+          </div>
+          <div id="catHealthBody" style="color:var(--muted)">Choose a table from the catalog tree on the left.</div>
+        </div>
+        <div class="card" id="catSnapCard" style="display:none">
+          <div class="card-header"><h3 class="card-title">Iceberg Snapshot Timeline &amp; Time-Travel Rollback</h3></div>
+          <div class="table-wrap" id="catSnapshots"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. WORKLOAD, ACTIVE QUERIES & TRACES -->
+  <section class="workspace" id="ws-workload">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Active Running Queries (WLM Control)</h3><span class="pill blue" id="activeCountPill">0 active</span></div>
+      <div class="table-wrap" id="activeQueriesTable"></div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Query History</h3>
+        <div style="display:flex;gap:8px">
+          <input class="inp" id="qhFilter" placeholder="Filter SQL or user..." oninput="renderQueryHistory()"/>
+          <select class="inp" id="qhMode" onchange="renderQueryHistory()">
+            <option value="all">All Queries</option>
+            <option value="slow">Slow (&ge;100ms)</option>
+            <option value="err">Errors Only</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap" id="queryHistoryTable"></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Distributed Execution Traces (/v1/traces)</h3></div>
+      <div class="table-wrap" id="tracesTable"></div>
+    </div>
+  </section>
+
+  <!-- 5. GOVERNANCE, RBAC, LINEAGE & COMPLIANCE -->
+  <section class="workspace" id="ws-governance">
+    <div class="tabs">
+      <button class="tab active" data-gtab="rbac" onclick="switchGovTab('rbac')">Roles, Grants &amp; Policies</button>
+      <button class="tab" data-gtab="audit" onclick="switchGovTab('audit')">Audit Log (42501/403)</button>
+      <button class="tab" data-gtab="access" onclick="switchGovTab('access')">Access History (Column Lineage)</button>
+      <button class="tab" data-gtab="lineage" onclick="switchGovTab('lineage')">Table Data Lineage</button>
+    </div>
+    <div id="gtab-rbac">
+      <div class="grid-2">
+        <div class="card"><div class="card-header"><h3 class="card-title">Roles &amp; Transitive Hierarchy</h3></div><div id="govRoles"></div></div>
+        <div class="card"><div class="card-header"><h3 class="card-title">Table, Schema &amp; Column Grants</h3></div><div class="table-wrap" id="govGrants"></div></div>
+      </div>
+      <div class="grid-2">
+        <div class="card"><div class="card-header"><h3 class="card-title">Row-Level Security &amp; Column Masking</h3></div><div class="table-wrap" id="govPolicies"></div></div>
+        <div class="card"><div class="card-header"><h3 class="card-title">Tag-Based ABAC Masking &amp; Table Tags</h3></div><div class="table-wrap" id="govTags"></div></div>
+      </div>
+    </div>
+    <div id="gtab-audit" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">Durable Raft Audit Trail (system.audit_log)</h3>
+          <div style="display:flex;gap:8px">
+            <input class="inp" id="auditFilter" placeholder="Filter user/action/target..." oninput="renderAudit()"/>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px"><input type="checkbox" id="auditDenialsOnly" onchange="renderAudit()"/> Denials Only</label>
+          </div>
+        </div>
+        <div class="table-wrap" id="auditTable"></div>
+      </div>
+    </div>
+    <div id="gtab-access" style="display:none">
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Snowflake-Style Access History (system.access_history)</h3></div>
+        <div class="table-wrap" id="accessTable"></div>
+      </div>
+    </div>
+    <div id="gtab-lineage" style="display:none">
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Automatic Table-Level Data Lineage</h3></div>
+        <div class="table-wrap" id="lineageTable"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. CROSS-CATALOG FEDERATION HUB -->
+  <section class="workspace" id="ws-federation">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Inbound External Catalogs</h3></div>
+        <div class="table-wrap" id="extCatalogsTable" style="margin-bottom:12px"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <input class="inp" id="fedName" placeholder="Catalog name (e.g. polaris_prod)"/>
+          <select class="inp" id="fedType">
+            <option>ICEBERG_REST</option><option>SNOWFLAKE</option><option>DATABRICKS</option><option>GLUE</option><option>BIGQUERY</option>
+          </select>
+          <input class="inp" id="fedUrl" placeholder="Catalog REST URL (https://...)" style="grid-column:span 2"/>
+          <input class="inp" id="fedToken" type="password" placeholder="Optional OAuth/Bearer Token" style="grid-column:span 2"/>
+        </div>
+        <button class="btn green" style="margin-top:10px" onclick="registerExternalCatalog()">Register External Catalog</button>
+      </div>
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Outbound Multi-Engine Federation Generator</h3></div>
+        <div style="display:flex;gap:8px;margin-bottom:12px">
+          <select class="inp" id="fedExportTable" style="flex:1" onchange="loadFederationExport()"></select>
+          <button class="btn sm" onclick="loadFederationExport()">Generate Snippets</button>
+        </div>
+        <div class="tabs" id="fedEngineTabs">
+          <button class="tab active" data-eng="snowflake" onclick="selectFedEngine('snowflake')">Snowflake Polaris</button>
+          <button class="tab" data-eng="databricks_unity_catalog" onclick="selectFedEngine('databricks_unity_catalog')">Databricks Unity</button>
+          <button class="tab" data-eng="aws_glue" onclick="selectFedEngine('aws_glue')">AWS Glue</button>
+          <button class="tab" data-eng="google_bigquery" onclick="selectFedEngine('google_bigquery')">Google BigQuery</button>
+        </div>
+        <pre class="code" id="fedSnippet">Select a table to generate turnkey zero-copy Iceberg v3 federation configs.</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. LIVE PROMETHEUS SLIS & DIAGNOSTICS -->
+  <section class="workspace" id="ws-metrics">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Live Prometheus Metrics Exposition (/metrics)</h3>
+        <div style="display:flex;gap:8px">
+          <input class="inp" id="metricsFilter" placeholder="Filter metric name..." oninput="renderRawMetrics()"/>
+          <a class="btn sec sm" href="/metrics" target="_blank" style="text-decoration:none">Open Raw /metrics</a>
+          <a class="btn sec sm" href="/readyz" target="_blank" style="text-decoration:none">Open /readyz</a>
+        </div>
+      </div>
+      <pre class="code" id="rawMetrics" style="max-height:580px">Loading /metrics...</pre>
+    </div>
+  </section>
+</main>
+
+<script>
+let autoRefresh = true;
+let timerId = null;
+let state = {
+  status: null,
+  selectedTable: null,
+  lastSqlResult: null,
+  queryHistory: [],
+  auditLog: [],
+  accessHistory: [],
+  lineage: [],
+  govOverview: null,
+  tags: {},
+  traces: [],
+  extCatalogs: [],
+  fedExport: null,
+  fedEngine: 'snowflake',
+  rawMetrics: '',
+  sparkPoints: [],
+};
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtBytes(b) {
+  b = Number(b || 0);
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KiB';
+  if (b < 1073741824) return (b/1048576).toFixed(2) + ' MiB';
+  return (b/1073741824).toFixed(2) + ' GiB';
+}
+function fmtTs(ms) {
+  if (!ms) return '-';
+  try { return new Date(ms).toISOString().replace('T', ' ').replace('Z', ''); } catch { return String(ms); }
+}
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  const tok = document.getElementById('sessJwt').value.trim();
+  if (tok) h['Authorization'] = 'Bearer ' + tok;
+  return h;
+}
+function currentUser() { return document.getElementById('sessUser').value.trim() || 'postgres'; }
+function currentBranch() { return document.getElementById('sessBranch').value.trim() || 'main'; }
+
+function switchWs(name) {
+  document.querySelectorAll('.workspace').forEach(w => w.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.ws === name));
+  document.getElementById('ws-' + name).classList.add('active');
+  refreshActiveWorkspace(name);
+}
+function switchGovTab(tab) {
+  ['rbac','audit','access','lineage'].forEach(t => {
+    document.getElementById('gtab-' + t).style.display = (t === tab) ? 'block' : 'none';
+  });
+  document.querySelectorAll('[data-gtab]').forEach(b => b.classList.toggle('active', b.dataset.gtab === tab));
+}
+function toggleAutoRefresh() {
+  autoRefresh = !autoRefresh;
+  document.getElementById('autoBtn').textContent = autoRefresh ? 'Auto: ON (3s)' : 'Auto: PAUSED';
+}
+
+async function refreshClusterStatus() {
+  const r = await fetch('/v1/cluster/status', { headers: authHeaders() });
+  const st = await r.json();
+  state.status = st;
+  document.getElementById('versionTag').textContent = 'v' + (st.version || '9.0.0') + ' Control Console';
+  document.getElementById('drainBanner').style.display = st.draining ? 'flex' : 'none';
+
+  const raftPill = document.getElementById('raftPill');
+  if (st.raft) {
+    raftPill.className = 'pill ' + (st.raft.is_leader ? 'green' : 'blue');
+    raftPill.innerHTML = '<span class="dot"></span>Raft node-' + st.raft.node_id + ' ' + (st.raft.is_leader ? 'LEADER' : 'FOLLOWER') + ' (t' + st.raft.term + ', idx=' + st.raft.commit_index + ')';
+  } else {
+    raftPill.className = 'pill green';
+    raftPill.innerHTML = '<span class="dot"></span>Catalog: Single-Node Ready';
+  }
+
+  const workers = st.workers || [];
+  const healthy = workers.filter(w => w.healthy).length;
+  const wp = document.getElementById('workersPill');
+  wp.className = 'pill ' + (healthy === workers.length && workers.length > 0 ? 'green' : (healthy > 0 ? 'amber' : 'red'));
+  wp.textContent = 'Workers: ' + healthy + '/' + workers.length;
+  document.getElementById('storagePill').textContent = 'Storage: ' + (st.storage_uri || 'memory://');
+
+  const ops = st.ops || {};
+  const lat = ops.latency_ms || { p50: 0, p95: 0, p99: 0 };
+  document.getElementById('latencyPill').textContent = 'p50/p95/p99: ' + lat.p50 + '/' + lat.p95 + '/' + lat.p99 + ' ms';
+
+  document.getElementById('kQueries').textContent = (ops.queries_total || 0).toLocaleString();
+  document.getElementById('kErrors').textContent = (ops.query_errors_total || 0) + ' errors / ' + (ops.worker_rpc_timeouts_total || 0) + ' RPC retries';
+  document.getElementById('kLat').textContent = lat.p50 + ' / ' + lat.p95 + ' / ' + lat.p99 + ' ms';
+  document.getElementById('kSnaps').textContent = ops.max_snapshots || 0;
+  document.getElementById('kTables').textContent = (st.tables || []).length + ' tables, ' + (st.views || []).length + ' views';
+  document.getElementById('kFiles').textContent = ((st.storage && st.storage.small_files_total) || 0) + ' / ' + ((st.storage && st.storage.total_data_files) || 0);
+  document.getElementById('kBytes').textContent = fmtBytes(st.storage && st.storage.total_data_bytes) + ' active Parquet';
+  document.getElementById('kCompact').textContent = ops.compaction_runs_total || 0;
+  document.getElementById('kCompactFiles').textContent = (ops.compaction_files_rewritten_total || 0) + ' files rewritten';
+  document.getElementById('kDenied').textContent = ops.auth_denied_total || 0;
+  document.getElementById('kBufRows').textContent = (ops.ingest_buffer_rows || 0) + ' buffered ingest rows';
+  document.getElementById('otlpPill').textContent = 'OTLP Exported: ' + (ops.otlp_spans_exported_total || 0);
+  document.getElementById('pruneSummary').textContent = 'Puffin pruned: ' + ((st.storage && st.storage.files_pruned_by_puffin) || 0) + ' \u2022 ZoneMap pruned: ' + ((st.storage && st.storage.files_pruned_by_zonemap) || 0);
+
+  document.getElementById('workerFleet').innerHTML = workers.length === 0
+    ? '<div style="color:var(--muted)">No remote workers registered (local execution mode).</div>'
+    : '<div style="display:flex;gap:8px;flex-wrap:wrap">' + workers.map(w => '<span class="pill ' + (w.healthy ? 'green' : 'red') + '"><span class="dot"></span>' + esc(w.id) + ' (' + (w.healthy ? 'HEALTHY' : 'DOWN') + ')</span>').join('') + '</div>';
+
+  renderHistogram(ops.latency_histogram);
+  updateSparkline(ops.queries_total || 0, (st.storage && st.storage.cache_hits) || 0);
+  renderCatalogList();
+  renderActiveQueries(st.active_queries || []);
+
+  const sel = document.getElementById('fedExportTable');
+  const prev = sel.value;
+  const tbls = st.tables || [];
+  sel.innerHTML = tbls.length ? tbls.map(t => '<option value="' + esc(t) + '">' + esc(t) + '</option>').join('') : '<option value="">No tables yet</option>';
+  if (prev && tbls.includes(prev)) sel.value = prev;
+}
+
+function renderHistogram(h) {
+  if (!h || !h.buckets) return;
+  const bounds = h.bounds_ms || [];
+  const cum = h.buckets || [];
+  const total = cum[cum.length - 1] || 0;
+  if (total === 0) { document.getElementById('histBars').innerHTML = '<div style="color:var(--muted)">Execute queries to populate latency buckets.</div>'; return; }
+  let html = '';
+  let prev = 0;
+  for (let i = 0; i < cum.length; i++) {
+    const count = Math.max(0, cum[i] - prev);
+    prev = cum[i];
+    const lbl = i < bounds.length ? ('<= ' + bounds[i] + 'ms') : '> ' + bounds[bounds.length - 1] + 'ms';
+    const pct = Math.round((count / total) * 100);
+    html += '<div class="bar-row"><span class="bar-label">' + lbl + '</span><div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div><span class="bar-val">' + count + ' (' + pct + '%)</span></div>';
+  }
+  document.getElementById('histBars').innerHTML = html;
+}
+
+function updateSparkline(qTotal, cacheHits) {
+  state.sparkPoints.push({ q: qTotal, c: cacheHits });
+  if (state.sparkPoints.length > 40) state.sparkPoints.shift();
+  const canvas = document.getElementById('sparkCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = '#25324a';
+  ctx.lineWidth = 1;
+  for (let y = 20; y < H; y += 30) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  if (state.sparkPoints.length < 2) return;
+  const qDeltas = [], cDeltas = [];
+  for (let i = 1; i < state.sparkPoints.length; i++) {
+    qDeltas.push(Math.max(0, state.sparkPoints[i].q - state.sparkPoints[i - 1].q));
+    cDeltas.push(Math.max(0, state.sparkPoints[i].c - state.sparkPoints[i - 1].c));
+  }
+  const maxV = Math.max(1, ...qDeltas, ...cDeltas);
+  const drawSeries = (arr, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    arr.forEach((v, i) => {
+      const x = (i / Math.max(1, arr.length - 1)) * (W - 10) + 5;
+      const y = H - 10 - (v / maxV) * (H - 22);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  };
+  drawSeries(qDeltas, '#3b82f6');
+  drawSeries(cDeltas, '#10b981');
+}
+
+async function adminBackupCatalog() {
+  document.getElementById('opsOutput').textContent = 'Writing consistent Raft catalog snapshot & verifying SHA-256...';
+  const r = await fetch('/v1/admin/backup-catalog', {
+    method: 'POST', headers: authHeaders({'Content-Type':'application/json'}),
+    body: JSON.stringify({ user: currentUser() })
+  });
+  document.getElementById('opsOutput').textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function adminDrain() {
+  const r = await fetch('/v1/admin/drain', {
+    method: 'POST', headers: authHeaders({'Content-Type':'application/json'}),
+    body: JSON.stringify({ user: currentUser(), timeout_ms: 5000 })
+  });
+  document.getElementById('opsOutput').textContent = JSON.stringify(await r.json(), null, 2);
+  refreshClusterStatus();
+}
+async function adminUndrain() {
+  const r = await fetch('/v1/admin/undrain', {
+    method: 'POST', headers: authHeaders({'Content-Type':'application/json'}),
+    body: JSON.stringify({ user: currentUser() })
+  });
+  document.getElementById('opsOutput').textContent = JSON.stringify(await r.json(), null, 2);
+  refreshClusterStatus();
+}
+
+function setSqlPreset(q) { document.getElementById('sqlInput').value = q; }
+async function runSql(overrideSql) {
+  const sql = overrideSql || document.getElementById('sqlInput').value;
+  document.getElementById('sqlMeta').textContent = 'Running...';
+  const r = await fetch('/v1/sql', {
+    method: 'POST',
+    headers: authHeaders({'Content-Type':'application/json'}),
+    body: JSON.stringify({ sql, user: currentUser(), branch: currentBranch() })
+  });
+  const d = await r.json();
+  if (d.error) {
+    document.getElementById('sqlMeta').innerHTML = '<span style="color:#f87171">ERROR: ' + esc(d.error) + '</span>';
+    document.getElementById('dagCard').style.display = 'none';
+    return;
+  }
+  state.lastSqlResult = d;
+  document.getElementById('sqlMeta').textContent = d.command_tag + ' \u2022 ' + d.elapsed_ms + ' ms \u2022 stages=' + d.stages_executed + ' \u2022 tasks=' + d.tasks_executed;
+  document.getElementById('rowCountPill').textContent = (d.row_count || 0) + ' rows';
+
+  const stages = d.dag_stages || [];
+  if (stages.length > 0) {
+    document.getElementById('dagCard').style.display = 'block';
+    document.getElementById('dagStats').textContent = d.elapsed_ms + ' ms | ' + stages.length + ' stages | ' + d.tasks_executed + ' tasks';
+    document.getElementById('dagFlow').innerHTML = stages.map(s =>
+      '<div class="dag-node"><div class="dag-node-title">Stage ' + s.stage_id + ' (' + esc(s.shuffle_mode) + ', ' + s.partitions + 'p)</div>' +
+      '<div style="font-size:11px;color:var(--muted);margin-bottom:4px">deps: [' + (s.dependencies || []).join(', ') + ']</div>' +
+      (s.operators || []).map(op => '<div style="font-family:var(--mono);font-size:11px;padding:2px 0;border-top:1px solid var(--border)">' + esc(op).slice(0, 90) + '</div>').join('') +
+      '</div>'
+    ).join('');
+  } else {
+    document.getElementById('dagCard').style.display = 'none';
+  }
+
+  const cols = d.columns || [];
+  const rows = d.rows || [];
+  if (cols.length === 0) {
+    document.getElementById('sqlResults').innerHTML = '<div style="padding:14px;color:#34d399">' + esc(d.command_tag) + '</div>';
+  } else {
+    let h = '<table class="tbl"><thead><tr>' + cols.map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead><tbody>';
+    for (const row of rows) {
+      h += '<tr>' + row.map(v => '<td>' + (v === null ? '<span style="color:var(--muted)">NULL</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v)) + '</td>').join('') + '</tr>';
+    }
+    document.getElementById('sqlResults').innerHTML = h + '</tbody></table>';
+  }
+  refreshClusterStatus();
+}
+function exportCsv() {
+  const d = state.lastSqlResult; if (!d || !d.columns) return;
+  const lines = [d.columns.join(','), ...(d.rows || []).map(r => r.map(v => JSON.stringify(v ?? '')).join(','))];
+  downloadBlob(lines.join('\n'), 'rustlakedb-result.csv', 'text/csv');
+}
+function exportJson() {
+  const d = state.lastSqlResult; if (!d) return;
+  downloadBlob(JSON.stringify(d, null, 2), 'rustlakedb-result.json', 'application/json');
+}
+function downloadBlob(text, name, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name; a.click();
+}
+
+function renderCatalogList() {
+  const st = state.status; if (!st) return;
+  const q = (document.getElementById('catSearch').value || '').toLowerCase();
+  const tables = (st.tables || []).filter(t => t.toLowerCase().includes(q));
+  const views = (st.views || []).filter(v => (v.name || '').toLowerCase().includes(q));
+  let h = '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">TABLES (' + tables.length + ')</div>';
+  h += tables.map(t => '<div class="list-item ' + (state.selectedTable === t ? 'active' : '') + '" onclick="inspectTable(\'' + esc(t) + '\')"><span>&#9638; ' + esc(t) + '</span></div>').join('') || '<div style="color:var(--muted);padding:6px">No tables</div>';
+  if (views.length) {
+    h += '<div style="font-size:11px;color:var(--muted);margin:12px 0 6px">VIEWS (' + views.length + ')</div>';
+    h += views.map(v => '<div class="list-item" onclick="setSqlPreset(\'SELECT * FROM ' + esc(v.name) + ' LIMIT 50;\');switchWs(\'sql\');runSql()"><span>&#9671; ' + esc(v.name) + '</span><span class="pill" style="font-size:10px">' + (v.materialized ? 'MV' : 'VIEW') + '</span></div>').join('');
+  }
+  document.getElementById('catalogList').innerHTML = h;
+}
+
+async function inspectTable(tbl) {
+  state.selectedTable = tbl;
+  renderCatalogList();
+  document.getElementById('catSelectedTitle').textContent = 'Table: ' + tbl;
+  document.getElementById('catActions').style.display = 'flex';
+  const [hr, sr] = await Promise.all([
+    fetch('/v1/tables/' + encodeURIComponent(tbl) + '/health', { headers: authHeaders() }),
+    fetch('/v1/tables/' + encodeURIComponent(tbl) + '/snapshots', { headers: authHeaders() })
+  ]);
+  const h = await hr.json();
+  const s = await sr.json();
+  const badge = document.getElementById('catHealthBadge');
+  badge.className = 'pill ' + (h.recommendation === 'HEALTHY' ? 'green' : 'amber');
+  badge.textContent = h.recommendation || 'UNKNOWN';
+
+  const dist = h.file_size_distribution || {};
+  const fc = Math.max(1, h.file_count || 1);
+  const bars = [
+    ['< 1 MiB', dist.lt_1mb || 0],
+    ['1-32 MiB', dist['1mb_to_32mb'] || 0],
+    ['32-128 MiB', dist['32mb_to_128mb'] || 0],
+    ['128-256 MiB', dist['128mb_to_256mb'] || 0],
+    ['> 256 MiB', dist.gt_256mb || 0],
+  ].map(([lbl, cnt]) => '<div class="bar-row"><span class="bar-label">' + lbl + '</span><div class="bar-track"><div class="bar-fill" style="width:' + Math.round((cnt / fc) * 100) + '%"></div></div><span class="bar-val">' + cnt + ' files</span></div>').join('');
+
+  const tags = Object.entries(h.tags || {}).map(([k, v]) => '<span class="pill blue">' + esc(k) + '=' + esc(v) + '</span>').join(' ') || '<span style="color:var(--muted)">No tags</span>';
+  const schemaRows = (h.schema || []).map(f => '<tr><td>' + f.field_id + '</td><td><b>' + esc(f.name) + '</b></td><td><code>' + esc(f.data_type) + '</code></td><td>' + (f.nullable ? 'YES' : 'NO') + '</td></tr>').join('');
+
+  document.getElementById('catHealthBody').innerHTML =
+    '<div class="kpi-grid">' +
+      '<div class="kpi"><div class="kpi-label">Rows / Deleted</div><div class="kpi-val">' + (h.total_rows || 0).toLocaleString() + '</div><div class="kpi-sub">' + ((h.delete_ratio || 0) * 100).toFixed(1) + '% DV delete ratio</div></div>' +
+      '<div class="kpi"><div class="kpi-label">Parquet Files</div><div class="kpi-val">' + (h.file_count || 0) + '</div><div class="kpi-sub">small=' + (h.small_files || 0) + ', skewed=' + (h.oversized_files || 0) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-label">Total / Avg Size</div><div class="kpi-val">' + fmtBytes(h.total_bytes) + '</div><div class="kpi-sub">avg ' + fmtBytes(h.avg_file_bytes) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-label">Snapshots</div><div class="kpi-val">' + (h.snapshot_count || 0) + '</div><div class="kpi-sub">refs: ' + Object.keys(h.refs || {}).join(', ') + '</div></div>' +
+    '</div>' +
+    '<div style="margin-bottom:12px"><b>Governance Tags:</b> ' + tags + '</div>' +
+    '<div class="grid-2"><div><div style="font-weight:600;margin-bottom:6px">Parquet File-Size Distribution</div>' + bars + '</div>' +
+    '<div><div style="font-weight:600;margin-bottom:6px">Iceberg Schema</div><div class="table-wrap"><table class="tbl"><thead><tr><th>ID</th><th>Column</th><th>Type</th><th>Null</th></tr></thead><tbody>' + schemaRows + '</tbody></table></div></div></div>';
+
+  const snaps = (s.snapshots || []).slice().sort((a, b) => b.snapshot_id - a.snapshot_id);
+  document.getElementById('catSnapCard').style.display = 'block';
+  document.getElementById('catSnapshots').innerHTML = '<table class="tbl"><thead><tr><th>Snapshot ID</th><th>Timestamp</th><th>Files</th><th>Rows</th><th>Operation</th><th>Actions</th></tr></thead><tbody>' +
+    snaps.map(sn => '<tr><td><code>' + sn.snapshot_id + '</code></td><td>' + fmtTs(sn.timestamp_ms) + '</td><td>' + sn.file_count + '</td><td>' + sn.row_count + '</td><td>' + esc((sn.summary && sn.summary.operation) || 'append') + '</td><td>' +
+      '<button class="btn sec sm" onclick="timeTravelQuery(\'' + esc(tbl) + '\',' + sn.snapshot_id + ')">Time Travel</button> ' +
+      '<button class="btn amber sm" onclick="restoreTableSnap(\'' + esc(tbl) + '\',' + sn.snapshot_id + ')">Restore</button></td></tr>').join('') +
+    '</tbody></table>';
+}
+async function runTableSql(prefix, suffix) {
+  if (!state.selectedTable) return;
+  const sql = prefix + state.selectedTable + (suffix || '') + ';';
+  await runSql(sql);
+  inspectTable(state.selectedTable);
+}
+function openTablePreview() {
+  if (!state.selectedTable) return;
+  setSqlPreset('SELECT * FROM ' + state.selectedTable + ' LIMIT 50;');
+  switchWs('sql'); runSql();
+}
+function openTableFederation() {
+  if (!state.selectedTable) return;
+  document.getElementById('fedExportTable').value = state.selectedTable;
+  switchWs('federation'); loadFederationExport();
+}
+function timeTravelQuery(tbl, sid) {
+  setSqlPreset('SELECT * FROM ' + tbl + ' VERSION AS OF ' + sid + ' LIMIT 50;');
+  switchWs('sql'); runSql();
+}
+async function restoreTableSnap(tbl, sid) {
+  await runSql('RESTORE TABLE ' + tbl + ' TO VERSION ' + sid + ';');
+  inspectTable(tbl);
+}
+
+function renderActiveQueries(list) {
+  document.getElementById('activeCountPill').textContent = list.length + ' active';
+  document.getElementById('activeQueriesTable').innerHTML = list.length === 0
+    ? '<div style="padding:14px;color:var(--muted)">No queries currently executing.</div>'
+    : '<table class="tbl"><thead><tr><th>Query ID</th><th>User</th><th>Started</th><th>SQL</th><th>Control</th></tr></thead><tbody>' +
+      list.map(q => '<tr><td><code>' + esc(q.query_id) + '</code></td><td>' + esc(q.user) + '</td><td>' + fmtTs(q.started_ms) + '</td><td><code>' + esc(q.sql) + '</code></td><td><button class="btn red sm" onclick="cancelQuery(\'' + esc(q.query_id) + '\')">Cancel</button></td></tr>').join('') +
+      '</tbody></table>';
+}
+async function cancelQuery(qid) {
+  await fetch('/v1/queries/' + encodeURIComponent(qid) + '/cancel', { method: 'POST', headers: authHeaders() });
+  refreshClusterStatus();
+}
+
+async function refreshWorkload() {
+  const [qhr, tr] = await Promise.all([
+    fetch('/v1/governance/query-history', { headers: authHeaders() }),
+    fetch('/v1/traces', { headers: authHeaders() })
+  ]);
+  state.queryHistory = ((await qhr.json()).query_history || []).slice().reverse();
+  state.traces = ((await tr.json()).spans || []).slice().reverse();
+  renderQueryHistory();
+  renderTraces();
+}
+function renderQueryHistory() {
+  const f = (document.getElementById('qhFilter').value || '').toLowerCase();
+  const mode = document.getElementById('qhMode').value;
+  const rows = state.queryHistory.filter(q => {
+    if (mode === 'slow' && (q.elapsed_ms || 0) < 100) return false;
+    if (mode === 'err' && q.status === 'OK') return false;
+    if (f && !(q.sql || '').toLowerCase().includes(f) && !(q.user || '').toLowerCase().includes(f)) return false;
+    return true;
+  });
+  document.getElementById('queryHistoryTable').innerHTML = '<table class="tbl"><thead><tr><th>Time</th><th>User</th><th>Status</th><th>Latency</th><th>Rows</th><th>SQL</th></tr></thead><tbody>' +
+    rows.slice(0, 100).map(q => '<tr class="' + (q.status !== 'OK' ? 'row-denied' : '') + '"><td>' + fmtTs(q.timestamp_ms) + '</td><td>' + esc(q.user) + '</td><td>' + esc(q.status) + '</td><td>' + q.elapsed_ms + ' ms</td><td>' + q.rows_returned + '</td><td><code>' + esc(q.sql).slice(0, 140) + '</code></td></tr>').join('') +
+    '</tbody></table>';
+}
+function renderTraces() {
+  const maxDur = Math.max(1, ...state.traces.map(s => s.duration_ms || 1));
+  document.getElementById('tracesTable').innerHTML = state.traces.length === 0
+    ? '<div style="padding:14px;color:var(--muted)">No spans recorded yet.</div>'
+    : '<table class="tbl"><thead><tr><th>Trace ID</th><th>Span</th><th>Service</th><th>Duration</th><th>Timeline</th></tr></thead><tbody>' +
+      state.traces.slice(0, 80).map(s => '<tr><td><code>' + esc(s.trace_id).slice(0, 14) + '</code></td><td>' + esc(s.name) + '</td><td>' + esc(s.service) + '</td><td>' + s.duration_ms + ' ms</td><td style="width:200px"><div class="bar-track"><div class="bar-fill" style="width:' + Math.max(4, Math.round((s.duration_ms / maxDur) * 100)) + '%"></div></div></td></tr>').join('') +
+      '</tbody></table>';
+}
+
+async function refreshGovernance() {
+  const [ov, au, ac, li, tg] = await Promise.all([
+    fetch('/v1/governance/overview', { headers: authHeaders() }),
+    fetch('/v1/governance/audit', { headers: authHeaders() }),
+    fetch('/v1/governance/access-history', { headers: authHeaders() }),
+    fetch('/v1/governance/lineage', { headers: authHeaders() }),
+    fetch('/v1/governance/tags', { headers: authHeaders() })
+  ]);
+  state.govOverview = await ov.json();
+  state.auditLog = ((await au.json()).audit_log || []).slice().reverse();
+  state.accessHistory = ((await ac.json()).access_history || []).slice().reverse();
+  state.lineage = ((await li.json()).lineage || []).slice().reverse();
+  state.tags = (await tg.json()).tags || {};
+  renderGovernance();
+  renderAudit();
+}
+function renderGovernance() {
+  const g = state.govOverview || {};
+  const memberships = g.role_memberships || {};
+  document.getElementById('govRoles').innerHTML =
+    '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' + (g.roles || []).map(r => '<span class="pill blue">' + esc(r) + '</span>').join('') + '</div>' +
+    '<div style="font-size:12px;color:var(--muted)"><b>Role Inheritance:</b> ' +
+    (Object.keys(memberships).length ? Object.entries(memberships).map(([c, ps]) => '<code>' + esc(c) + ' &sube; [' + ps.map(esc).join(', ') + ']</code>').join(' &bull; ') : 'None configured') + '</div>';
+
+  const grants = (g.grants || []).map(x => '<tr><td>' + esc(x.role) + '</td><td><code>' + esc(x.target) + '</code></td><td>' + (x.privileges || []).join(', ') + '</td><td>TABLE/SCOPE</td></tr>');
+  const cgrants = (g.column_grants || []).map(x => '<tr><td>' + esc(x.role) + '</td><td><code>' + esc(x.table) + '</code></td><td>SELECT (' + (x.columns || []).join(', ') + ')</td><td>COLUMN</td></tr>');
+  document.getElementById('govGrants').innerHTML = '<table class="tbl"><thead><tr><th>Role</th><th>Target</th><th>Privileges</th><th>Kind</th></tr></thead><tbody>' + ([...grants, ...cgrants].join('') || '<tr><td colspan="4" style="color:var(--muted)">No explicit grants yet.</td></tr>') + '</tbody></table>';
+
+  const rls = (g.rls_policies || []).map(x => '<tr><td>RLS</td><td>' + esc(x.role) + '</td><td><code>' + esc(x.table) + '</code></td><td><code>' + esc(x.predicate) + '</code></td></tr>');
+  const msk = (g.masking_policies || []).map(x => '<tr><td>MASK</td><td>' + esc(x.role) + '</td><td><code>' + esc(x.table) + '.' + esc(x.target) + '</code></td><td>' + esc(x.mask_value) + '</td></tr>');
+  document.getElementById('govPolicies').innerHTML = '<table class="tbl"><thead><tr><th>Type</th><th>Role</th><th>Target</th><th>Rule</th></tr></thead><tbody>' + ([...rls, ...msk].join('') || '<tr><td colspan="4" style="color:var(--muted)">No RLS or column masking policies.</td></tr>') + '</tbody></table>';
+
+  const tagPols = (g.tag_masking_policies || []).map(p => '<tr><td>TAG ABAC</td><td>' + esc(p.role) + '</td><td><code>' + esc(p.tag_key) + '=' + esc(p.tag_value) + '</code></td><td>' + esc(p.target) + ' &rarr; ' + esc(p.mask_value) + '</td></tr>');
+  const tblTags = Object.entries(state.tags || {}).map(([t, kv]) => '<tr><td>TABLE TAG</td><td>*</td><td><code>' + esc(t) + '</code></td><td>' + Object.entries(kv).map(([k, v]) => esc(k) + '=' + esc(v)).join(', ') + '</td></tr>');
+  document.getElementById('govTags').innerHTML = '<table class="tbl"><thead><tr><th>Kind</th><th>Role</th><th>Target/Tag</th><th>Detail</th></tr></thead><tbody>' + ([...tagPols, ...tblTags].join('') || '<tr><td colspan="4" style="color:var(--muted)">No tag policies or table tags.</td></tr>') + '</tbody></table>';
+
+  document.getElementById('accessTable').innerHTML = '<table class="tbl"><thead><tr><th>Time</th><th>User (Role)</th><th>Protocol</th><th>Action</th><th>Table</th><th>Columns</th></tr></thead><tbody>' +
+    (state.accessHistory.slice(0, 100).map(a => '<tr><td>' + fmtTs(a.timestamp_ms) + '</td><td>' + esc(a.user) + ' (' + esc(a.role) + ')</td><td><span class="pill">' + esc(a.protocol) + '</span></td><td>' + esc(a.action) + '</td><td><code>' + esc(a.table) + '</code></td><td><code>' + (a.columns || []).map(esc).join(', ') + '</code></td></tr>').join('') || '<tr><td colspan="6" style="color:var(--muted)">No access history entries yet.</td></tr>') + '</tbody></table>';
+
+  document.getElementById('lineageTable').innerHTML = '<table class="tbl"><thead><tr><th>Time</th><th>Source Table</th><th>&rarr;</th><th>Target Table</th><th>Operation</th><th>User</th></tr></thead><tbody>' +
+    (state.lineage.slice(0, 100).map(e => '<tr><td>' + fmtTs(e.timestamp_ms) + '</td><td><code>' + esc(e.source_table) + '</code></td><td>&rarr;</td><td><code>' + esc(e.target_table) + '</code></td><td>' + esc(e.operation) + '</td><td>' + esc(e.user) + '</td></tr>').join('') || '<tr><td colspan="6" style="color:var(--muted)">No lineage edges recorded yet.</td></tr>') + '</tbody></table>';
+}
+function renderAudit() {
+  const f = (document.getElementById('auditFilter').value || '').toLowerCase();
+  const denyOnly = document.getElementById('auditDenialsOnly').checked;
+  const rows = state.auditLog.filter(a => {
+    const denied = String(a.outcome || '').includes('DENIED');
+    if (denyOnly && !denied) return false;
+    if (f && !(a.user + ' ' + a.action + ' ' + a.target + ' ' + a.outcome).toLowerCase().includes(f)) return false;
+    return true;
+  });
+  document.getElementById('auditTable').innerHTML = '<table class="tbl"><thead><tr><th>Time</th><th>User</th><th>Action</th><th>Target</th><th>Outcome</th></tr></thead><tbody>' +
+    (rows.slice(0, 150).map(a => '<tr class="' + (String(a.outcome || '').includes('DENIED') ? 'row-denied' : '') + '"><td>' + fmtTs(a.timestamp_ms) + '</td><td>' + esc(a.user) + '</td><td><b>' + esc(a.action) + '</b></td><td><code>' + esc(a.target) + '</code></td><td>' + esc(a.outcome) + '</td></tr>').join('') || '<tr><td colspan="5" style="color:var(--muted)">No audit entries match.</td></tr>') + '</tbody></table>';
+}
+
+async function refreshFederation() {
+  const r = await fetch('/v1/federation/catalogs', { headers: authHeaders() });
+  state.extCatalogs = (await r.json()).external_catalogs || [];
+  document.getElementById('extCatalogsTable').innerHTML = '<table class="tbl"><thead><tr><th>Catalog</th><th>Type</th><th>URI</th></tr></thead><tbody>' +
+    (state.extCatalogs.map(c => '<tr><td><b>' + esc(c.name) + '</b></td><td><span class="pill blue">' + esc(c.catalog_type) + '</span></td><td><code>' + esc(c.uri) + '</code></td></tr>').join('') || '<tr><td colspan="3" style="color:var(--muted)">No external catalogs registered yet.</td></tr>') + '</tbody></table>';
+  if (document.getElementById('fedExportTable').value) loadFederationExport();
+}
+async function registerExternalCatalog() {
+  const name = document.getElementById('fedName').value.trim();
+  const type = document.getElementById('fedType').value;
+  const url = document.getElementById('fedUrl').value.trim();
+  const tok = document.getElementById('fedToken').value.trim();
+  if (!name || !url) return;
+  const sql = "CREATE EXTERNAL CATALOG " + name + " TYPE " + type + " URL '" + url + "'" + (tok ? " TOKEN '" + tok + "'" : "") + ";";
+  await runSql(sql);
+  refreshFederation();
+}
+async function loadFederationExport() {
+  const tbl = document.getElementById('fedExportTable').value;
+  if (!tbl) return;
+  const r = await fetch('/v1/federation/export/' + encodeURIComponent(tbl), { headers: authHeaders() });
+  state.fedExport = await r.json();
+  renderFedSnippet();
+}
+function selectFedEngine(eng) {
+  state.fedEngine = eng;
+  document.querySelectorAll('#fedEngineTabs .tab').forEach(t => t.classList.toggle('active', t.dataset.eng === eng));
+  renderFedSnippet();
+}
+function renderFedSnippet() {
+  if (!state.fedExport || !state.fedExport.federation) return;
+  const section = state.fedExport.federation[state.fedEngine];
+  document.getElementById('fedSnippet').textContent = JSON.stringify({
+    table: state.fedExport.table,
+    metadata_location: state.fedExport.metadata_location,
+    iceberg_rest_uri: state.fedExport.iceberg_rest_uri,
+    config: section
+  }, null, 2);
+}
+
+async function refreshMetrics() {
+  const r = await fetch('/metrics');
+  state.rawMetrics = await r.text();
+  renderRawMetrics();
+}
+function renderRawMetrics() {
+  const f = (document.getElementById('metricsFilter').value || '').toLowerCase();
+  const lines = state.rawMetrics.split('\n').filter(l => !f || l.toLowerCase().includes(f));
+  document.getElementById('rawMetrics').textContent = lines.join('\n');
+}
+
+function refreshActiveWorkspace(ws) {
+  if (ws === 'workload') refreshWorkload();
+  else if (ws === 'governance') refreshGovernance();
+  else if (ws === 'federation') refreshFederation();
+  else if (ws === 'metrics') refreshMetrics();
+  else if (ws === 'catalog' && state.selectedTable) inspectTable(state.selectedTable);
+}
+async function refreshAll() {
+  await refreshClusterStatus();
+  const active = document.querySelector('.nav-btn.active');
+  if (active) refreshActiveWorkspace(active.dataset.ws);
+}
+
+refreshAll();
+timerId = setInterval(() => { if (autoRefresh) refreshAll(); }, 3000);
+</script>
+</body>
+</html>
