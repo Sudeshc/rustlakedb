@@ -91,6 +91,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
+name = "arrow-arith"
+version = "54.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fc766fdacaf804cb10c7c70580254fcdb5d55cdfda2bc57b02baf5223a3af9e"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "chrono",
+ "num",
+]
+
+[[package]]
 name = "arrow-array"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -155,14 +169,22 @@ version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a194f47959a4e111463cb6d02c8576fe084b3d7a3c092314baf3b9629b62595b"
 dependencies = [
+ "arrow-arith",
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
+ "arrow-data",
  "arrow-ipc",
+ "arrow-ord",
+ "arrow-row",
  "arrow-schema",
+ "arrow-select",
+ "arrow-string",
  "base64 0.22.1",
  "bytes",
  "futures",
+ "once_cell",
+ "paste",
  "prost",
  "prost-types",
  "tonic",
@@ -179,6 +201,32 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "flatbuffers",
+]
+
+[[package]]
+name = "arrow-ord"
+version = "54.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0a3334a743bd2a1479dbc635540617a3923b4b2f6870f37357339e6b5363c21"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
+]
+
+[[package]]
+name = "arrow-row"
+version = "54.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d1d7a7291d2c5107e92140f75257a99343956871f3d3ab33a7b41532f79cb68"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "half",
 ]
 
 [[package]]
@@ -199,6 +247,23 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "num",
+]
+
+[[package]]
+name = "arrow-string"
+version = "54.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a21546b337ab304a32cfc0770f671db7411787586b45b78b4593ae78e64e2b03"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
+ "memchr",
+ "num",
+ "regex",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -1758,6 +1823,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9807af0e638c12e753aa1b4e601791bf2a8f71274023c8bbeec12fc149950857"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1871,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-catalog"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -1892,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-cli"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -1914,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-common"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1925,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-coordinator"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "arrow-ipc",
  "async-trait",
@@ -1949,18 +2026,23 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
 name = "rustlakedb-gateway"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
+ "arrow-array",
  "arrow-flight",
  "arrow-schema",
  "base64 0.22.1",
  "bytes",
  "futures",
+ "parking_lot",
+ "prost",
  "ring",
+ "rustlakedb-catalog",
  "rustlakedb-common",
  "rustlakedb-coordinator",
  "rustlakedb-protocol",
@@ -1973,11 +2055,12 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "rustlakedb-planner"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "rustlakedb-catalog",
  "rustlakedb-common",
@@ -1988,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-protocol"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "rustlakedb-common",
  "serde",
@@ -1998,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-shuffle"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2016,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-storage"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2038,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-testkit"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "arrow-array",
  "arrow-flight",
@@ -2073,10 +2156,11 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-worker"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "axum 0.8.9",
  "bytes",

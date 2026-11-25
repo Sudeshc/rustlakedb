@@ -39,21 +39,46 @@ spec:
             - "--bind"
             - "0.0.0.0:{{ .Values.workers.rpcPort }}"
             - "--advertise-url"
-            - "http://$(POD_NAME).rustlakedb-workers:{{ .Values.workers.rpcPort }}"
-            - "--data-dir"
+            - "{{ if .Values.mtls.enabled }}https{{ else }}http{{ end }}://$(POD_NAME).rustlakedb-workers:{{ .Values.workers.rpcPort }}"
+            - "--coordinator-url"
+            - "http://rustlakedb-coordinator:{{ .Values.coordinator.controlPlanePort }}"
+            - "--storage-uri"
             - "{{ .Values.warehouse.uri }}"
+            - "--data-dir"
+            - "/var/lib/rustlakedb"
           env:
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- if .Values.mtls.enabled }}
+            - name: RUSTLAKEDB_MTLS_CA
+              value: "/etc/rustlakedb/mtls/ca.crt"
+            - name: RUSTLAKEDB_MTLS_CERT
+              value: "/etc/rustlakedb/mtls/server.crt"
+            - name: RUSTLAKEDB_MTLS_KEY
+              value: "/etc/rustlakedb/mtls/server.key"
+            {{- end }}
           ports:
             - containerPort: {{ .Values.workers.rpcPort }}
           readinessProbe:
             httpGet:
               path: /healthz
               port: {{ .Values.workers.rpcPort }}
+              scheme: {{ if .Values.mtls.enabled }}HTTPS{{ else }}HTTP{{ end }}
             periodSeconds: 5
+          {{- if .Values.mtls.enabled }}
+          volumeMounts:
+            - name: mtls-certs
+              mountPath: /etc/rustlakedb/mtls
+              readOnly: true
+          {{- end }}
+      {{- if .Values.mtls.enabled }}
+      volumes:
+        - name: mtls-certs
+          secret:
+            secretName: {{ .Values.mtls.secretName }}
+      {{- end }}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -102,15 +127,44 @@ spec:
             - "0.0.0.0:{{ .Values.coordinator.pgPort }}"
             - "--rest-addr"
             - "0.0.0.0:{{ .Values.coordinator.controlPlanePort }}"
-            - "--data-dir"
+            - "--flight-addr"
+            - "0.0.0.0:{{ .Values.coordinator.flightPort }}"
+            - "--storage-uri"
             - "{{ .Values.warehouse.uri }}"
-            - "--worker-urls"
-            - "http://rustlakedb-worker-0.rustlakedb-workers:{{ .Values.workers.rpcPort }},http://rustlakedb-worker-1.rustlakedb-workers:{{ .Values.workers.rpcPort }},http://rustlakedb-worker-2.rustlakedb-workers:{{ .Values.workers.rpcPort }}"
+            - "--data-dir"
+            - "/var/lib/rustlakedb"
+          env:
+            {{- if .Values.auth.oidcJwksUrl }}
+            - name: RUSTLAKEDB_OIDC_JWKS_URL
+              value: "{{ .Values.auth.oidcJwksUrl }}"
+            {{- end }}
+            {{- if .Values.mtls.enabled }}
+            - name: RUSTLAKEDB_MTLS_CA
+              value: "/etc/rustlakedb/mtls/ca.crt"
+            - name: RUSTLAKEDB_MTLS_CERT
+              value: "/etc/rustlakedb/mtls/client.crt"
+            - name: RUSTLAKEDB_MTLS_KEY
+              value: "/etc/rustlakedb/mtls/client.key"
+            {{- end }}
           ports:
             - name: pgwire
               containerPort: {{ .Values.coordinator.pgPort }}
             - name: control-plane
               containerPort: {{ .Values.coordinator.controlPlanePort }}
+            - name: flight-sql
+              containerPort: {{ .Values.coordinator.flightPort }}
+          {{- if .Values.mtls.enabled }}
+          volumeMounts:
+            - name: mtls-certs
+              mountPath: /etc/rustlakedb/mtls
+              readOnly: true
+          {{- end }}
+      {{- if .Values.mtls.enabled }}
+      volumes:
+        - name: mtls-certs
+          secret:
+            secretName: {{ .Values.mtls.secretName }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -126,3 +180,6 @@ spec:
     - name: control-plane
       port: {{ .Values.coordinator.controlPlanePort }}
       targetPort: {{ .Values.coordinator.controlPlanePort }}
+    - name: flight-sql
+      port: {{ .Values.coordinator.flightPort }}
+      targetPort: {{ .Values.coordinator.flightPort }}

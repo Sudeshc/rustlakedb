@@ -329,6 +329,18 @@ pub enum ColumnExpr {
         query: String,
         alias: String,
     },
+    /// General `CASE WHEN <filter> THEN <expr> ... ELSE <expr> END` (Wave 19 TPC-H).
+    CaseExpr {
+        branches: Vec<(FilterExpr, Box<ColumnExpr>)>,
+        else_expr: Box<ColumnExpr>,
+        alias: String,
+    },
+    /// `EXTRACT(YEAR|MONTH|DAY FROM <expr>)` (Wave 19 TPC-H).
+    Extract {
+        field: String,
+        expr: Box<ColumnExpr>,
+        alias: String,
+    },
 }
 
 impl ColumnExpr {
@@ -346,7 +358,9 @@ impl ColumnExpr {
             | ColumnExpr::MathExpr { alias, .. }
             | ColumnExpr::Cast { alias, .. }
             | ColumnExpr::Now { alias }
-            | ColumnExpr::Bm25Score { alias, .. } => alias.clone(),
+            | ColumnExpr::Bm25Score { alias, .. }
+            | ColumnExpr::CaseExpr { alias, .. }
+            | ColumnExpr::Extract { alias, .. } => alias.clone(),
         }
     }
 }
@@ -370,6 +384,16 @@ pub struct WindowSpec {
     pub alias: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CmpOp {
+    Eq,
+    NotEq,
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FilterExpr {
     Eq { column: String, value: ScalarValue },
@@ -378,6 +402,12 @@ pub enum FilterExpr {
     GtEq { column: String, value: ScalarValue },
     Lt { column: String, value: ScalarValue },
     LtEq { column: String, value: ScalarValue },
+    /// Column-to-column comparison (`l_commitdate < l_receiptdate`, Wave 19 TPC-H).
+    ColCmp {
+        left: String,
+        op: CmpOp,
+        right: String,
+    },
     IsNull { column: String },
     IsNotNull { column: String },
     InList { column: String, values: Vec<ScalarValue> },

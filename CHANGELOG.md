@@ -2,6 +2,28 @@
 
 All notable changes to **RustLakeDB** are documented in this file.
 
+## [5.0.0] - 2026-11-24 — Tier-1 Lakehouse Parity Release: Flight SQL, Bi-Directional REST Catalog, Kafka RecordBatch v2, Full 22-Query Analytics + CBO, Columnar Arrow Pipeline & OIDC/JWKS (Waves 17–21)
+
+### Wave 21 — Enterprise OIDC/JWKS `RS256` Auth, Active Query Cancellation, Upgraded Web Console & Helm v5
+- **OIDC / JWKS (`RS256`) Authentication:** Added RFC 7517 JWKS RSA public key loading (`GovernanceState::set_jwks_json`) and cryptographic `RSA_PKCS1_2048_8192_SHA256` JWT signature + `exp` validation via `ring` for Okta, Auth0, Entra ID, and AWS Cognito integration.
+- **Active Query Cancellation & Live Cluster Topology UI:** Added `CANCEL QUERY '<id>'`, `GET /v1/queries/active`, `POST /v1/queries/{id}/cancel`, and upgraded the embedded Web Admin Console (`GET /`) with live worker health badges and 1-click query cancellation.
+- **Kubernetes Helm Chart `v5.0.0`:** Added Arrow Flight SQL (`8815`), optional cluster-internal mTLS secret mounts, OIDC JWKS env wiring, worker self-registration, and `autoscaling/v2` HPA.
+
+### Wave 20 — End-to-End Native Apache Arrow `RecordBatch` Columnar Execution Pipeline
+- **Native Arrow Columnar Engine (`rustlakedb_worker::columnar`):** Evaluates `BinaryArith`, `CaseExpr`, `StringExpr`, `MathExpr`, `Extract`, `Filter` (`arrow_select::filter_record_batch`), `HashAggregate` + `ROLLUP`/`CUBE`/`GROUPING SETS`, and `Window` (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `SUM`, `AVG`, `LAG`, `LEAD`) directly over Arrow `RecordBatch` arrays without intermediate `RowBatch` row-maps.
+
+### Wave 19 — Full 22-Query Analytical Decision-Support Suite & CBO Optimizer
+- **SQL Completeness:** Added `DATE +/- INTERVAL 'N' DAY|MONTH|YEAR` compile-time folding, `EXTRACT(YEAR|MONTH|DAY FROM ...)`, `BETWEEN`/`NOT BETWEEN`, general `CASE WHEN ... THEN <expr> ELSE <expr> END`, derived expressions inside aggregates (`SUM(a * (1 - b))`, `SUM(CASE WHEN ... END)`), column-to-column filter comparisons (`l_commitdate < l_receiptdate`), inline aggregate rewriting in `HAVING`, and scalar subquery substitution (`< (SELECT AVG(...))`).
+- **CBO Enhancements:** Added **Predicate Pushdown Through Joins** (`push_filter_through_joins`) onto `IcebergScan` leaves and **Dependency-Aware Multi-Table CBO Join Reordering** for arbitrary 5+ table snowflake/star joins.
+
+### Wave 18 — Full Apache Arrow Flight SQL (`arrow-flight::sql`) & Multi-Arch Releases
+- **Full Arrow Flight SQL Protocol (`:8815`):** Implemented `CommandStatementQuery`, `CommandStatementUpdate`, `CommandStatementIngest` (`DoPut` bulk zero-copy Arrow ingestion), `CommandGetCatalogs`, `CommandGetDbSchemas`, `CommandGetTables`, `CommandGetTableTypes`, `CommandGetSqlInfo`, and `PreparedStatement` lifecycle (`CreatePreparedStatement`/`ClosePreparedStatement`), verified with the official `FlightSqlServiceClient`.
+- **Multi-Arch Release Pipeline:** Upgraded `.github/workflows/release.yml` to build native binaries for `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, and `windows-x86_64`, plus multi-arch `linux/amd64` + `linux/arm64` GHCR container manifests.
+
+### Wave 17 — Bi-Directional Iceberg v3 REST Catalog & Production Kafka/Redpanda RecordBatch v2 CDC
+- **Bi-Directional Iceberg v3 REST Catalog Read/Write Spec:** Added `POST /v1/oauth/tokens`, `POST/GET/DELETE /v1/namespaces`, `POST /v1/namespaces/{ns}/tables`, `HEAD /v1/namespaces/{ns}/tables/{table}`, and `POST /v1/namespaces/{ns}/tables/{table}` OCC table commits (`assert-ref-snapshot-id`, `add-schema`, `add-snapshot`, `remove-snapshots`) with `409 Conflict` enforcement.
+- **Kafka / Redpanda RecordBatch v2 (`magic=2`):** Upgraded `kafka_ingest.rs` to **Metadata v1**, **ListOffsets v1**, and **Fetch v4** decoding Kafka RecordBatch v2 (`CRC32C`, zigzag varints, Zstd & uncompressed) with automatic legacy Fetch v0 fallback.
+
 ## [4.0.0] - 2026-11-24 — Frontier Lakehouse Release: Arrow Flight gRPC, Native Temporal/Decimal, Hidden Partitioning, Kafka CDC, Cluster mTLS & AWS STS SigV4 (Waves 14–16)
 
 ### Wave 16 — Cluster-Internal mTLS, Real Cloud AWS STS `AssumeRole` SigV4 & Cross-Engine Interop

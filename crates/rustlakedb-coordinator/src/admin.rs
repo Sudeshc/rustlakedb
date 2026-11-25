@@ -57,6 +57,8 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
         .route("/v1/workers/heartbeat", post(register_worker_http))
         .route("/v1/sql", post(sql_json))
         .route("/v1/sql/arrow", post(sql_arrow))
+        .route("/v1/queries/active", get(active_queries_http))
+        .route("/v1/queries/{query_id}/cancel", post(cancel_query_http))
         .route("/v1/ingest/{table}", post(ingest_ndjson_http))
         .route("/v1/cdc/{table}", post(ingest_cdc_http))
         .route("/v1/traces", get(get_traces_http))
@@ -116,7 +118,9 @@ fn resolve_http_session(
     headers: &HeaderMap,
     fallback_user: &str,
 ) -> std::result::Result<SessionContext, String> {
-    if let Some(secret) = coord.governance.jwt_secret() {
+    let has_jwks = coord.governance.has_jwks();
+    let hs_secret = coord.governance.jwt_secret();
+    if has_jwks || hs_secret.is_some() {
         let auth = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -124,9 +128,43 @@ fn resolve_http_session(
         let token = auth
             .strip_prefix("Bearer ")
             .ok_or_else(|| "Authorization header must start with 'Bearer '".to_string())?;
-        return verify_jwt_hs256(&secret, token).map_err(|e| e.to_string());
+        if has_jwks {
+            if let Ok(sess) = coord.governance.verify_jwt_rs256(token) {
+                return Ok(sess);
+            }
+            if hs_secret.is_none() {
+                return coord
+                    .governance
+                    .verify_jwt_rs256(token)
+                    .map_err(|e| e.to_string());
+            }
+        }
+        if let Some(secret) = hs_secret {
+            return verify_jwt_hs256(&secret, token).map_err(|e| e.to_string());
+        }
     }
     Ok(SessionContext::for_user(fallback_user))
+}
+
+async fn active_queries_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    Json(json!({
+        "active_queries": coord.governance.active_queries_snapshot()
+    }))
+}
+
+async fn cancel_query_http(
+    Path(query_id): Path<String>,
+    State(coord): State<Arc<Coordinator>>,
+) -> (StatusCode, Json<Value>) {
+    let was_active = coord.governance.cancel_query(&query_id);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "query_id": query_id,
+            "cancelled": true,
+            "was_active": was_active
+        })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -406,18 +444,26 @@ pre{background:#0d1117;padding:10px;border-radius:6px;overflow:auto;font-size:12
 </style></head>
 <body>
 <h1>RustLakeDB Lakehouse Console</h1>
-<div class="sub">100% Rust Distributed SQL &amp; Apache Iceberg v3 Engine &bull; PG v3 Wire &bull; Arrow IPC &bull; Prometheus <code>/metrics</code></div>
+<div class="sub">100% Rust Distributed SQL &amp; Apache Iceberg v3 Engine &bull; PG v3 Wire (:5432) &bull; Arrow Flight SQL (:8815) &bull; Iceberg v3 REST &bull; OIDC/JWKS &bull; Prometheus <code>/metrics</code></div>
 <div class="grid">
-  <div class="card"><h3>Cluster &amp; Catalog Status</h3><pre id="status">Loading...</pre></div>
+  <div class="card"><h3>Cluster Topology &amp; Worker Health</h3><div id="workers"></div><pre id="status">Loading...</pre></div>
   <div class="card"><h3>Interactive SQL Workbench</h3>
     <textarea id="sql">SELECT region, COUNT(*) AS orders, SUM(amount) AS total_rev FROM public.big_orders GROUP BY region ORDER BY region;</textarea><br/>
     <button onclick="runSql()">Run Distributed SQL</button>
     <div id="meta" style="margin-top:8px;color:#8b949e"></div>
   </div>
 </div>
+<div class="card" style="margin-bottom:16px"><h3>Active Queries &amp; Workload Control</h3><div id="activeq">No active queries.</div></div>
 <div class="card"><h3>Query Result</h3><div id="out">Run a query above to inspect results.</div></div>
 <script>
-async function refresh(){const r=await fetch('/v1/cluster/status');document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);}
+async function cancelQuery(qid){await fetch('/v1/queries/'+encodeURIComponent(qid)+'/cancel',{method:'POST'});refresh();}
+async function refresh(){
+  const r=await fetch('/v1/cluster/status');const st=await r.json();
+  document.getElementById('status').textContent=JSON.stringify(st,null,2);
+  document.getElementById('workers').innerHTML=(st.workers||[]).map(w=>'<span style="display:inline-block;margin:2px 6px 8px 0;padding:4px 10px;border-radius:12px;background:'+(w.healthy?'#1f6feb':'#da3633')+';font-size:12px">'+w.id+' ('+(w.healthy?'HEALTHY':'DOWN')+')</span>').join('');
+  const aq=st.active_queries||[];
+  document.getElementById('activeq').innerHTML=aq.length===0?'No active queries.':'<table><thead><tr><th>Query ID</th><th>User</th><th>SQL</th><th>Action</th></tr></thead><tbody>'+aq.map(q=>'<tr><td>'+q.query_id+'</td><td>'+q.user+'</td><td><code>'+q.sql+'</code></td><td><button style="background:#da3633;margin:0;padding:4px 10px" onclick="cancelQuery(\''+q.query_id+'\')">Cancel</button></td></tr>').join('')+'</tbody></table>';
+}
 async function runSql(){
   const sql=document.getElementById('sql').value;
   const r=await fetch('/v1/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});

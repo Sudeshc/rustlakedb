@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/sudeshc/rustlakedb
-  tag: "4.0.0"
+  tag: "5.0.0"
   pullPolicy: IfNotPresent
 
 warehouse:
@@ -8,10 +8,19 @@ warehouse:
   awsEndpointUrl: ""
   awsRegion: "us-east-1"
 
+auth:
+  jwtSecret: ""
+  oidcJwksUrl: ""
+
+mtls:
+  enabled: false
+  secretName: "rustlakedb-cluster-mtls"
+
 coordinator:
   replicas: 1
   pgPort: 5432
   controlPlanePort: 8181
+  flightPort: 8815
   resources:
     requests:
       cpu: "1000m"

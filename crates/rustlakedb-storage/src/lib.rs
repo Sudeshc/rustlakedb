@@ -831,6 +831,50 @@ pub fn row_batch_to_record_batch(batch: &RowBatch) -> Result<RecordBatch> {
         .map_err(|e| RustLakeError::Execution(format!("arrow record batch build: {e}")))
 }
 
+/// Converts any Apache Arrow `RecordBatch` into a RustLakeDB `RowBatch`, preserving native
+/// `Int64`, `Float64`, `Bool`, `Date32`, `Timestamp(Microsecond)`, `Decimal128`, and `Utf8` values (Wave 18).
+pub fn record_batch_to_row_batch(rb: &RecordBatch) -> RowBatch {
+    let schema = rb.schema();
+    let cols: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let mut rows = Vec::with_capacity(rb.num_rows());
+    for row_idx in 0..rb.num_rows() {
+        let mut map = BTreeMap::new();
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let col = rb.column(col_idx);
+            let val = if col.is_null(row_idx) {
+                ScalarValue::Null
+            } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                ScalarValue::Int64(a.value(row_idx))
+            } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
+                ScalarValue::Int64(a.value(row_idx) as i64)
+            } else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+                ScalarValue::Float64(a.value(row_idx))
+            } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::Float32Array>() {
+                ScalarValue::Float64(a.value(row_idx) as f64)
+            } else if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+                ScalarValue::Bool(a.value(row_idx))
+            } else if let Some(a) = col.as_any().downcast_ref::<Date32Array>() {
+                ScalarValue::Date(a.value(row_idx))
+            } else if let Some(a) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                ScalarValue::Int64(a.value(row_idx))
+            } else if let Some(a) = col.as_any().downcast_ref::<Decimal128Array>() {
+                let scale = match field.data_type() {
+                    DataType::Decimal128(_, s) => (*s).max(0) as u8,
+                    _ => 2,
+                };
+                ScalarValue::Decimal(a.value(row_idx), scale)
+            } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+                ScalarValue::Utf8(a.value(row_idx).to_string())
+            } else {
+                ScalarValue::Null
+            };
+            map.insert(field.name().clone(), val);
+        }
+        rows.push(map);
+    }
+    RowBatch::new(cols, rows)
+}
+
 /// Serializes any `RowBatch` into a standard zero-copy **Apache Arrow IPC Stream** (`application/vnd.apache.arrow.stream`)
 /// for high-throughput Python (PyArrow, Polars, DuckDB) and BI clients!
 pub fn row_batch_to_arrow_ipc(batch: &RowBatch) -> Result<Vec<u8>> {

@@ -67,7 +67,7 @@ async fn wave15_apache_arrow_flight_grpc_end_to_end() {
 
     // 1. Handshake
     let hs = client.handshake(bytes::Bytes::new()).await.unwrap();
-    assert_eq!(hs.as_ref(), b"rustlakedb-flight-v4");
+    assert!(hs.starts_with(b"rustlakedb-flight"));
 
     // 2. ListFlights enumerates Iceberg tables
     let flights: Vec<_> = client

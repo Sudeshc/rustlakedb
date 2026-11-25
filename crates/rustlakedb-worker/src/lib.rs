@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Sudeshc
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod columnar;
 pub mod rpc;
 
 use arrow_array::{
@@ -871,6 +872,43 @@ pub fn eval_col_expr(row: &BTreeMap<String, ScalarValue>, expr: &ColumnExpr) -> 
             };
             ScalarValue::Float64(compute_bm25_row_score(&text, query))
         }
+        ColumnExpr::CaseExpr {
+            branches,
+            else_expr,
+            alias,
+        } => {
+            if let Some(already) = row.get(alias) {
+                return already.clone();
+            }
+            for (pred, res_expr) in branches {
+                if eval_filter(row, pred) {
+                    return eval_col_expr(row, res_expr);
+                }
+            }
+            eval_col_expr(row, else_expr)
+        }
+        ColumnExpr::Extract { field, expr, alias } => {
+            if let Some(already) = row.get(alias) {
+                return already.clone();
+            }
+            let val = eval_col_expr(row, expr);
+            let date_str = match val {
+                ScalarValue::Date(d) => rustlakedb_protocol::format_iso_date_days(d),
+                ScalarValue::Utf8(s) => s,
+                _ => return ScalarValue::Null,
+            };
+            let date_part = date_str.split(['T', ' ']).next().unwrap_or("");
+            let mut parts = date_part.split('-');
+            let y = parts.next().and_then(|s| s.parse::<i64>().ok());
+            let m = parts.next().and_then(|s| s.parse::<i64>().ok());
+            let d = parts.next().and_then(|s| s.parse::<i64>().ok());
+            match field.to_uppercase().as_str() {
+                "YEAR" => y.map(ScalarValue::Int64).unwrap_or(ScalarValue::Null),
+                "MONTH" => m.map(ScalarValue::Int64).unwrap_or(ScalarValue::Null),
+                "DAY" => d.map(ScalarValue::Int64).unwrap_or(ScalarValue::Null),
+                _ => ScalarValue::Null,
+            }
+        }
     }
 }
 
@@ -1107,6 +1145,31 @@ pub fn eval_filter(row: &BTreeMap<String, ScalarValue>, expr: &FilterExpr) -> bo
             compare_col(row, column, value),
             Some(CmpOrdering::Less | CmpOrdering::Equal)
         ),
+        FilterExpr::ColCmp { left, op, right } => {
+            let Some(lv) = row.get(left) else {
+                return false;
+            };
+            let Some(rv) = row.get(right) else {
+                return false;
+            };
+            if matches!(lv, ScalarValue::Null) || matches!(rv, ScalarValue::Null) {
+                return false;
+            }
+            match op {
+                rustlakedb_protocol::CmpOp::Eq => values_eq(lv, rv),
+                rustlakedb_protocol::CmpOp::NotEq => !values_eq(lv, rv),
+                rustlakedb_protocol::CmpOp::Gt => compare_scalar(lv, rv) == CmpOrdering::Greater,
+                rustlakedb_protocol::CmpOp::GtEq => matches!(
+                    compare_scalar(lv, rv),
+                    CmpOrdering::Greater | CmpOrdering::Equal
+                ),
+                rustlakedb_protocol::CmpOp::Lt => compare_scalar(lv, rv) == CmpOrdering::Less,
+                rustlakedb_protocol::CmpOp::LtEq => matches!(
+                    compare_scalar(lv, rv),
+                    CmpOrdering::Less | CmpOrdering::Equal
+                ),
+            }
+        }
         FilterExpr::IsNull { column } => {
             matches!(row.get(column), None | Some(ScalarValue::Null))
         }
@@ -2679,7 +2742,9 @@ impl WorkerNode {
             has_int_key = true;
             let g_str = match r.get(group_col) {
                 Some(ScalarValue::Utf8(s)) => s.as_str(),
-                _ => continue,
+                Some(ScalarValue::Null) | None => continue,
+                // Non-string group key (e.g. Int64 o_orderkey): bail out so general HashAggregate preserves exact type!
+                _ => return Ok(None),
             };
             let gid = if let Some(&id) = group_name_to_id.get(g_str) {
                 id

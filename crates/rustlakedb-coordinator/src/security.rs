@@ -5,6 +5,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
 use parking_lot::RwLock;
 use ring::hmac;
+use ring::rand::SystemRandom;
+use ring::signature::{
+    KeyPair, RsaKeyPair, RsaPublicKeyComponents, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
+};
 use rustlakedb_catalog::TableCommitProposal;
 use rustlakedb_common::{Result, RustLakeError};
 use rustlakedb_protocol::{FilterExpr, RowBatch, ScalarValue};
@@ -99,7 +103,15 @@ pub struct TraceSpan {
     pub attributes: std::collections::BTreeMap<String, String>,
 }
 
-/// Enterprise Governance, RBAC, RLS, Dynamic Masking, WLM & Observability Engine (Waves 3–4).
+/// RSA public key extracted from an RFC 7517 OIDC JWKS document (Wave 21).
+#[derive(Debug, Clone)]
+pub struct JwkRsaKey {
+    pub kid: Option<String>,
+    pub n: Vec<u8>,
+    pub e: Vec<u8>,
+}
+
+/// Enterprise Governance, RBAC, RLS, Dynamic Masking, WLM & Observability Engine (Waves 3–21).
 pub struct GovernanceState {
     roles: RwLock<HashSet<String>>,
     /// (role, table) -> granted privileges ("SELECT", "INSERT", "UPDATE", "DELETE", "ALL")
@@ -114,12 +126,16 @@ pub struct GovernanceState {
     audit_log: RwLock<VecDeque<AuditLogEntry>>,
     /// Active queries for WLM & `SHOW QUERIES`
     active_queries: RwLock<HashMap<String, ActiveQueryInfo>>,
+    /// Query IDs explicitly cancelled via `CANCEL QUERY` or `POST /v1/queries/{id}/cancel` (Wave 21)
+    cancelled_queries: RwLock<HashSet<String>>,
     /// Query-driven JSON path hotness tracker: table -> (col.path -> hit_count)
     hot_json_paths: RwLock<HashMap<String, HashMap<String, u64>>>,
     /// Open multi-statement ACID transactions keyed by session user (`BEGIN` -> `COMMIT`/`ROLLBACK`, Wave 6)
     open_txs: RwLock<HashMap<String, Vec<TableCommitProposal>>>,
     /// Optional HMAC-SHA256 JWT secret for Control Plane Bearer token AuthN (Wave 7)
     jwt_secret: RwLock<Option<String>>,
+    /// Optional OIDC/JWKS RSA public keys for RS256 Bearer token AuthN (Okta/Auth0/Entra/Cognito, Wave 21)
+    jwks_keys: RwLock<Vec<JwkRsaKey>>,
     /// Registered SQL Scalar UDFs: lowercase_name -> (param_name, body_expr) (Wave 10)
     udfs: RwLock<HashMap<String, (String, String)>>,
     /// Logical schemas created via `CREATE SCHEMA` (Wave 9 dbt compat)
@@ -148,6 +164,7 @@ impl Default for GovernanceState {
             query_history: RwLock::new(VecDeque::with_capacity(512)),
             audit_log: RwLock::new(VecDeque::with_capacity(512)),
             active_queries: RwLock::new(HashMap::new()),
+            cancelled_queries: RwLock::new(HashSet::new()),
             hot_json_paths: RwLock::new(HashMap::new()),
             open_txs: RwLock::new(HashMap::new()),
             jwt_secret: RwLock::new(
@@ -155,6 +172,7 @@ impl Default for GovernanceState {
                     .ok()
                     .filter(|s| !s.is_empty()),
             ),
+            jwks_keys: RwLock::new(Vec::new()),
             udfs: RwLock::new(HashMap::new()),
             schemas: RwLock::new(HashSet::from(["public".to_string(), "default".to_string()])),
             trace_spans: RwLock::new(VecDeque::with_capacity(512)),
@@ -319,6 +337,62 @@ impl GovernanceState {
 
     pub fn query_history_snapshot(&self) -> Vec<QueryHistoryEntry> {
         self.query_history.read().iter().cloned().collect()
+    }
+
+    /// Loads RFC 7517 OIDC JWKS RSA public keys (`{"keys":[{"kty":"RSA","kid":"...","n":"...","e":"..."}]}`) (Wave 21).
+    pub fn set_jwks_json(&self, jwks_json: &str) -> Result<usize> {
+        let doc: serde_json::Value = serde_json::from_str(jwks_json)
+            .map_err(|e| RustLakeError::Execution(format!("invalid JWKS JSON: {e}")))?;
+        let arr = doc
+            .get("keys")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| RustLakeError::Execution("JWKS missing 'keys' array".into()))?;
+        let mut parsed = Vec::new();
+        for k in arr {
+            if k.get("kty").and_then(|v| v.as_str()) != Some("RSA") {
+                continue;
+            }
+            let Some(n_b64) = k.get("n").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(e_b64) = k.get("e").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let n = B64URL
+                .decode(n_b64)
+                .map_err(|e| RustLakeError::Execution(format!("invalid JWK 'n': {e}")))?;
+            let e = B64URL
+                .decode(e_b64)
+                .map_err(|e| RustLakeError::Execution(format!("invalid JWK 'e': {e}")))?;
+            parsed.push(JwkRsaKey {
+                kid: k.get("kid").and_then(|v| v.as_str()).map(String::from),
+                n,
+                e,
+            });
+        }
+        let count = parsed.len();
+        *self.jwks_keys.write() = parsed;
+        Ok(count)
+    }
+
+    pub fn has_jwks(&self) -> bool {
+        !self.jwks_keys.read().is_empty()
+    }
+
+    /// Verifies an OIDC `RS256` JWT against the configured JWKS key set (Wave 21).
+    pub fn verify_jwt_rs256(&self, token: &str) -> Result<SessionContext> {
+        let keys = self.jwks_keys.read().clone();
+        verify_jwt_rs256_with_keys(&keys, token)
+    }
+
+    /// Marks an active query as cancelled and removes it from active WLM tracking (Wave 21).
+    pub fn cancel_query(&self, query_id: &str) -> bool {
+        self.cancelled_queries.write().insert(query_id.to_string());
+        self.active_queries.write().remove(query_id).is_some()
+    }
+
+    pub fn is_query_cancelled(&self, query_id: &str) -> bool {
+        self.cancelled_queries.read().contains(query_id)
     }
 
     pub fn record_audit(&self, user: &str, action: &str, target: &str, outcome: &str) {
@@ -618,6 +692,161 @@ pub fn verify_jwt_hs256(secret: &str, token: &str) -> Result<SessionContext> {
         .map(String::from)
         .unwrap_or_else(|| user.clone());
     Ok(SessionContext { user, role })
+}
+
+/// Signs an RFC 7519 **RS256** (RSA-SHA256) JWT using a PKCS#8 DER RSA private key (Wave 21).
+pub fn sign_jwt_rs256_pkcs8(
+    pkcs8_der: &[u8],
+    kid: &str,
+    user: &str,
+    role: &str,
+    exp_epoch_secs: u64,
+) -> Result<(String, serde_json::Value)> {
+    let key_pair = RsaKeyPair::from_pkcs8(pkcs8_der)
+        .map_err(|e| RustLakeError::Execution(format!("parse RSA PKCS8 key: {e}")))?;
+    let (n_bytes, e_bytes) = parse_der_rsa_public_key(key_pair.public_key().as_ref())?;
+    let n_b64 = B64URL.encode(n_bytes);
+    let e_b64 = B64URL.encode(e_bytes);
+    let jwks = serde_json::json!({
+        "keys": [{
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "kid": kid,
+            "n": n_b64,
+            "e": e_b64
+        }]
+    });
+
+    let header = B64URL.encode(
+        serde_json::json!({ "alg": "RS256", "typ": "JWT", "kid": kid })
+            .to_string()
+            .as_bytes(),
+    );
+    let claims = serde_json::json!({
+        "sub": user,
+        "role": role,
+        "iat": epoch_ms() / 1000,
+        "exp": exp_epoch_secs
+    });
+    let payload = B64URL.encode(claims.to_string().as_bytes());
+    let signing_input = format!("{header}.{payload}");
+    let rng = SystemRandom::new();
+    let mut sig = vec![0u8; key_pair.public().modulus_len()];
+    key_pair
+        .sign(&RSA_PKCS1_SHA256, &rng, signing_input.as_bytes(), &mut sig)
+        .map_err(|e| RustLakeError::Execution(format!("RS256 sign error: {e}")))?;
+    let token = format!("{signing_input}.{}", B64URL.encode(&sig));
+    Ok((token, jwks))
+}
+
+/// Cryptographically verifies an OIDC **RS256** JWT against RFC 7517 JWKS RSA keys using `ring` (Wave 21).
+pub fn verify_jwt_rs256_with_keys(keys: &[JwkRsaKey], token: &str) -> Result<SessionContext> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(RustLakeError::Execution("invalid JWT format".into()));
+    }
+    let header_bytes = B64URL
+        .decode(parts[0])
+        .map_err(|_| RustLakeError::Execution("invalid JWT header encoding".into()))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|_| RustLakeError::Execution("invalid JWT header JSON".into()))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("RS256") {
+        return Err(RustLakeError::Execution("JWT alg must be RS256".into()));
+    }
+    let kid = header.get("kid").and_then(|v| v.as_str());
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = B64URL
+        .decode(parts[2])
+        .map_err(|_| RustLakeError::Execution("invalid JWT signature encoding".into()))?;
+
+    let mut verified = false;
+    for k in keys {
+        if let (Some(want), Some(have)) = (kid, k.kid.as_deref())
+            && want != have
+        {
+            continue;
+        }
+        let pub_key = RsaPublicKeyComponents {
+            n: k.n.as_slice(),
+            e: k.e.as_slice(),
+        };
+        if pub_key
+            .verify(&RSA_PKCS1_2048_8192_SHA256, signing_input.as_bytes(), &sig_bytes)
+            .is_ok()
+        {
+            verified = true;
+            break;
+        }
+    }
+    if !verified {
+        return Err(RustLakeError::Execution(
+            "OIDC RS256 JWT signature verification failed".into(),
+        ));
+    }
+
+    let payload_bytes = B64URL
+        .decode(parts[1])
+        .map_err(|_| RustLakeError::Execution("invalid JWT payload encoding".into()))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| RustLakeError::Execution("invalid JWT JSON claims".into()))?;
+
+    let now_secs = epoch_ms() / 1000;
+    if let Some(exp) = claims.get("exp").and_then(|v| v.as_u64())
+        && now_secs > exp
+    {
+        return Err(RustLakeError::Execution("OIDC JWT token has expired".into()));
+    }
+
+    let user = claims["sub"]
+        .as_str()
+        .or_else(|| claims["preferred_username"].as_str())
+        .ok_or_else(|| RustLakeError::Execution("OIDC JWT missing 'sub' claim".into()))?
+        .to_string();
+    let role = claims["role"]
+        .as_str()
+        .or_else(|| {
+            claims["groups"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+        })
+        .map(String::from)
+        .unwrap_or_else(|| user.clone());
+    Ok(SessionContext { user, role })
+}
+
+/// Extracts `(modulus_n, exponent_e)` big-endian unsigned bytes from an ASN.1 DER `RSAPublicKey`.
+fn parse_der_rsa_public_key(der: &[u8]) -> Result<(&[u8], &[u8])> {
+    fn read_tlv(buf: &[u8], expected_tag: u8) -> Result<(&[u8], &[u8])> {
+        if buf.len() < 2 || buf[0] != expected_tag {
+            return Err(RustLakeError::Execution("invalid DER RSA public key".into()));
+        }
+        let (len, header_len) = if buf[1] & 0x80 == 0 {
+            (buf[1] as usize, 2usize)
+        } else {
+            let nbytes = (buf[1] & 0x7F) as usize;
+            if nbytes == 0 || nbytes > 4 || buf.len() < 2 + nbytes {
+                return Err(RustLakeError::Execution("invalid DER length".into()));
+            }
+            let mut l = 0usize;
+            for &b in &buf[2..2 + nbytes] {
+                l = (l << 8) | (b as usize);
+            }
+            (l, 2 + nbytes)
+        };
+        if buf.len() < header_len + len {
+            return Err(RustLakeError::Execution("truncated DER TLV".into()));
+        }
+        Ok((&buf[header_len..header_len + len], &buf[header_len + len..]))
+    }
+
+    let (seq_body, _) = read_tlv(der, 0x30)?;
+    let (n_raw, rest) = read_tlv(seq_body, 0x02)?;
+    let (e_raw, _) = read_tlv(rest, 0x02)?;
+    let n = n_raw.strip_prefix(&[0u8]).unwrap_or(n_raw);
+    let e = e_raw.strip_prefix(&[0u8]).unwrap_or(e_raw);
+    Ok((n, e))
 }
 
 fn mask_json_path(doc: &mut serde_json::Value, path: &str, mask: &str) {

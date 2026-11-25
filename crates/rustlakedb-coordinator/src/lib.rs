@@ -348,6 +348,27 @@ impl Coordinator {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let lower = trimmed.to_lowercase();
 
+        // Active query cancellation (`CANCEL QUERY '<query_id>'`, Wave 21)
+        if lower.starts_with("cancel query ") {
+            let target_id = trimmed["cancel query ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"');
+            let was_active = self.governance.cancel_query(target_id);
+            return Ok(QueryExecutionResult {
+                command_tag: format!("CANCEL {}", if was_active { 1 } else { 0 }),
+                dag: None,
+                batch: RowBatch::new(
+                    vec!["query_id".into(), "cancelled".into()],
+                    vec![BTreeMap::from([
+                        ("query_id".into(), ScalarValue::Utf8(target_id.to_string())),
+                        ("cancelled".into(), ScalarValue::Bool(true)),
+                    ])],
+                ),
+                stats: QueryExecutionStats::default(),
+            });
+        }
+
         // Virtual governance & observability system tables (Wave 3)
         if lower.contains("system.query_history") {
             let entries = self.governance.query_history_snapshot();
@@ -2053,6 +2074,52 @@ impl Coordinator {
             );
         }
 
+        // 3. Handle scalar subqueries in WHERE/HAVING comparisons (`< (SELECT ...)`, `> (SELECT ...)`, `= (SELECT ...)`, etc., Wave 19 TPC-H)
+        loop {
+            let upper = current.to_uppercase();
+            let found = ["<= (SELECT ", ">= (SELECT ", "<> (SELECT ", "!= (SELECT ", "= (SELECT ", "< (SELECT ", "> (SELECT "]
+                .iter()
+                .filter_map(|pat| upper.find(pat).map(|pos| (pos, *pat)))
+                .min_by_key(|(pos, _)| *pos);
+            let Some((op_pos, pat)) = found else {
+                break;
+            };
+            let op_str = pat.trim_end_matches("(SELECT ").trim();
+            let open_paren = op_pos + pat.len() - "(SELECT ".len();
+            let Some(close_paren) = find_matching_paren(&current, open_paren) else {
+                break;
+            };
+            let sub_sql = current[open_paren + 1..close_paren].trim().to_string();
+            let sub_res = Box::pin(self.execute_sql_inner(&sub_sql, branch, session)).await?;
+            let first_col = sub_res.batch.columns.first().cloned().unwrap_or_default();
+            let scalar_lit = sub_res
+                .batch
+                .rows
+                .first()
+                .and_then(|r| r.get(&first_col))
+                .map(|v| match v {
+                    ScalarValue::Int64(i) => i.to_string(),
+                    ScalarValue::Float64(f) => f.to_string(),
+                    ScalarValue::Decimal(d, s) => {
+                        rustlakedb_protocol::format_decimal_i128(*d, *s)
+                    }
+                    ScalarValue::Bool(b) => b.to_string(),
+                    ScalarValue::Utf8(s) => format!("'{}'", s.replace('\'', "''")),
+                    ScalarValue::Date(d) => {
+                        format!("'{}'", rustlakedb_protocol::format_iso_date_days(*d))
+                    }
+                    _ => "NULL".to_string(),
+                })
+                .unwrap_or_else(|| "NULL".to_string());
+            current = format!(
+                "{}{} {}{}",
+                &current[..op_pos],
+                op_str,
+                scalar_lit,
+                &current[close_paren + 1..]
+            );
+        }
+
         Ok(current)
     }
 
@@ -3142,6 +3209,14 @@ fn collect_filter_cols_vec(expr: &FilterExpr, out: &mut Vec<String>) {
         | FilterExpr::JsonHasKey { column, .. } => {
             if !out.contains(column) {
                 out.push(column.clone());
+            }
+        }
+        FilterExpr::ColCmp { left, right, .. } => {
+            if !out.contains(left) {
+                out.push(left.clone());
+            }
+            if !out.contains(right) {
+                out.push(right.clone());
             }
         }
         FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {

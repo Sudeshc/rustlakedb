@@ -74,7 +74,8 @@ async fn crash_restart_recovery_preserves_tables_branches_indexes_and_dvs() {
             .await
             .unwrap();
         assert_eq!(tbl_doc["metadata"]["format-version"], 3);
-        assert!(tbl_doc["metadata"]["refs"]["audit"].is_u64());
+        assert!(tbl_doc["metadata"]["refs"]["audit"]["snapshot-id"].is_u64());
+        assert_eq!(tbl_doc["metadata"]["refs"]["audit"]["type"], "branch");
         assert_eq!(tbl_doc["metadata"]["indexes"].as_array().unwrap().len(), 1);
     }
 }

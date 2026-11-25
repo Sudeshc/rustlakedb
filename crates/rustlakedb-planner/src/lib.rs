@@ -18,7 +18,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
@@ -948,39 +948,88 @@ impl DistributedPlanner {
                 (scan, bytes)
             };
 
-            // Wave 9 Multi-Table CBO Join Ordering: when 3+ tables are joined with INNER JOIN,
-            // inspect every table's estimated byte size and reorder the join chain so the largest
-            // probe table drives against the smallest dimension tables first (broadcast-friendly)!
+            // Wave 9 + Wave 19 Dependency-Aware Multi-Table CBO Join Ordering:
+            // When 3+ tables are joined with INNER JOIN, greedily pick the smallest eligible
+            // table whose join key is already available in the joined schema (preserving strict
+            // foreign-key dependencies on snowflake/chain joins while broadcasting small dims first)!
             let all_inner = from_item.joins.len() >= 2
                 && from_item
                     .joins
                     .iter()
                     .all(|j| matches!(j.join_operator, sqlparser::ast::JoinOperator::Inner(_)));
             let ordered_joins = if all_inner {
-                let mut weighted: Vec<(u64, sqlparser::ast::Join)> =
-                    Vec::with_capacity(from_item.joins.len());
-                for j in from_item.joins {
+                let mut available_cols: HashSet<String> = HashSet::new();
+                if let Ok(lm) = catalog.get_table(&left_table_name).await {
+                    for f in &lm.schema {
+                        available_cols.insert(f.name.clone());
+                    }
+                }
+                type JoinCandidate = (
+                    usize,
+                    u64,
+                    HashSet<String>,
+                    Option<(String, String)>,
+                    sqlparser::ast::Join,
+                );
+                let mut pool: Vec<JoinCandidate> = Vec::with_capacity(from_item.joins.len());
+                for (orig_idx, j) in from_item.joins.into_iter().enumerate() {
                     let rname = extract_table_name(&j.relation)?;
+                    let mut rcols = HashSet::new();
                     let rbytes = if cte_plans.contains_key(&rname) {
                         4096u64
                     } else if let Ok(rm) = catalog.get_table(&rname).await {
+                        for f in &rm.schema {
+                            rcols.insert(f.name.clone());
+                        }
                         rm.splits(branch)
                             .map(|sp| sp.iter().map(|s| s.estimated_bytes).sum())
                             .unwrap_or(0)
                     } else {
                         u64::MAX
                     };
-                    weighted.push((rbytes, j));
+                    let keys = match &j.join_operator {
+                        sqlparser::ast::JoinOperator::Inner(JoinConstraint::On(expr)) => {
+                            extract_join_keys(expr).ok()
+                        }
+                        _ => None,
+                    };
+                    pool.push((orig_idx, rbytes, rcols, keys, j));
                 }
-                let already_sorted = weighted.windows(2).all(|w| w[0].0 <= w[1].0);
-                if !already_sorted {
-                    weighted.sort_by_key(|(b, _)| *b);
+
+                let mut chosen: Vec<(usize, sqlparser::ast::Join)> = Vec::with_capacity(pool.len());
+                while !pool.is_empty() {
+                    let pick_pos = pool
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, _, rcols, keys, _))| {
+                            if available_cols.is_empty() {
+                                return true;
+                            }
+                            match keys {
+                                Some((lk, rk)) => {
+                                    (available_cols.contains(lk) && (rcols.is_empty() || rcols.contains(rk)))
+                                        || (available_cols.contains(rk)
+                                            && (rcols.is_empty() || rcols.contains(lk)))
+                                }
+                                None => true,
+                            }
+                        })
+                        .min_by_key(|(_, (_, b, _, _, _))| *b)
+                        .map(|(pos, _)| pos)
+                        .unwrap_or(0);
+                    let (orig_idx, _, rcols, _, j) = pool.remove(pick_pos);
+                    available_cols.extend(rcols);
+                    chosen.push((orig_idx, j));
+                }
+
+                let reordered = chosen.iter().enumerate().any(|(i, (orig, _))| i != *orig);
+                if reordered {
                     cbo_notes.push(format!(
                         "CBO: reordered {}-way INNER JOIN by table size (smallest dimensions first)",
-                        weighted.len() + 1
+                        chosen.len() + 1
                     ));
                 }
-                weighted.into_iter().map(|(_, j)| j).collect()
+                chosen.into_iter().map(|(_, j)| j).collect()
             } else {
                 from_item.joins
             };
@@ -1090,9 +1139,19 @@ impl DistributedPlanner {
             if let Some(pred) = pushed_filter
                 && !matches!(node, PhysicalNode::IcebergScan { .. })
             {
-                node = PhysicalNode::Filter {
-                    input: Box::new(node),
-                    predicate: pred,
+                let (pushed_node, remaining, pushed_cnt) =
+                    push_filter_through_joins(node, pred, catalog, branch).await;
+                if pushed_cnt > 0 {
+                    cbo_notes.push(format!(
+                        "CBO: pushed {pushed_cnt} predicate conjunct(s) through JOIN onto IcebergScan leaves (histogram selectivity est.)"
+                    ));
+                }
+                node = match remaining {
+                    Some(rem) => PhysicalNode::Filter {
+                        input: Box::new(pushed_node),
+                        predicate: rem,
+                    },
+                    None => pushed_node,
                 };
             }
 
@@ -1105,6 +1164,7 @@ impl DistributedPlanner {
                 };
 
             let mut projected_exprs: Vec<ColumnExpr> = Vec::new();
+            let mut pre_agg_exprs: Vec<ColumnExpr> = Vec::new();
             let mut aggs: Vec<AggExpr> = Vec::new();
             let mut windows: Vec<WindowSpec> = Vec::new();
             let mut group_aliases: BTreeMap<String, String> = BTreeMap::new();
@@ -1116,7 +1176,9 @@ impl DistributedPlanner {
                         if let Some(win) = try_parse_window(&expr, None)? {
                             projected_exprs.push(ColumnExpr::Column(win.alias.clone()));
                             windows.push(win);
-                        } else if let Some(agg) = try_parse_agg(&expr, None)? {
+                        } else if let Some(agg) =
+                            try_parse_agg_with_expr(&expr, None, &mut pre_agg_exprs)?
+                        {
                             aggs.push(agg);
                         } else {
                             projected_exprs.push(parse_col_expr(&expr, None)?);
@@ -1126,7 +1188,11 @@ impl DistributedPlanner {
                         if let Some(win) = try_parse_window(&expr, Some(alias.value.clone()))? {
                             projected_exprs.push(ColumnExpr::Column(win.alias.clone()));
                             windows.push(win);
-                        } else if let Some(agg) = try_parse_agg(&expr, Some(alias.value.clone()))? {
+                        } else if let Some(agg) = try_parse_agg_with_expr(
+                            &expr,
+                            Some(alias.value.clone()),
+                            &mut pre_agg_exprs,
+                        )? {
                             aggs.push(agg);
                         } else {
                             let ce = parse_col_expr(&expr, Some(alias.value.clone()))?;
@@ -1160,9 +1226,53 @@ impl DistributedPlanner {
                 })
                 .collect();
 
-            let having_pred = select.having.map(|e| parse_filter_expr(&e)).transpose()?;
+            let having_pred = select
+                .having
+                .map(|e| {
+                    let rewritten = rewrite_having_agg_expr(&e, &mut aggs, &mut pre_agg_exprs)?;
+                    parse_filter_expr(&rewritten)
+                })
+                .transpose()?;
 
             if !aggs.is_empty() || !aligned_group_by.is_empty() {
+                // If any aggregate had a complex expression argument (e.g. SUM(l_extendedprice * (1 - l_discount))
+                // or SUM(CASE WHEN ... END)), inject a pre-aggregation Project computing those derived columns!
+                if !pre_agg_exprs.is_empty() {
+                    let mut needed: Vec<ColumnExpr> = Vec::new();
+                    let mut seen: HashSet<String> = HashSet::new();
+                    let mut raw_cols: HashSet<String> = HashSet::new();
+                    for g in &aligned_group_by {
+                        collect_col_expr_cols(g, &mut raw_cols);
+                    }
+                    for a in &aggs {
+                        match &a.func {
+                            AggFunc::Count => {}
+                            AggFunc::CountDistinct(c)
+                            | AggFunc::Sum(c)
+                            | AggFunc::Avg(c)
+                            | AggFunc::Min(c)
+                            | AggFunc::Max(c) => {
+                                if !pre_agg_exprs.iter().any(|p| p.output_name() == *c) {
+                                    raw_cols.insert(c.clone());
+                                }
+                            }
+                        }
+                    }
+                    for c in raw_cols {
+                        if seen.insert(c.clone()) {
+                            needed.push(ColumnExpr::Column(c));
+                        }
+                    }
+                    for p in pre_agg_exprs {
+                        if seen.insert(p.output_name()) {
+                            needed.push(p);
+                        }
+                    }
+                    node = PhysicalNode::Project {
+                        input: Box::new(node),
+                        exprs: needed,
+                    };
+                }
                 let partial = PhysicalNode::HashAggregate {
                     input: Box::new(node),
                     group_by: aligned_group_by.clone(),
@@ -1935,25 +2045,50 @@ fn parse_col_expr(expr: &Expr, alias: Option<String>) -> Result<ColumnExpr> {
             })
         }
         Expr::Case {
+            operand,
             conditions,
             results,
             else_result,
-            ..
         } => {
             let mut branches = Vec::with_capacity(conditions.len());
             for (cond, res) in conditions.iter().zip(results.iter()) {
-                branches.push((parse_filter_expr(cond)?, parse_scalar(res)?));
+                let pred = if let Some(op_expr) = operand {
+                    let eq_expr = Expr::BinaryOp {
+                        left: op_expr.clone(),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(cond.clone()),
+                    };
+                    parse_filter_expr(&eq_expr)?
+                } else {
+                    parse_filter_expr(cond)?
+                };
+                branches.push((pred, Box::new(parse_col_expr(res, None)?)));
             }
-            let else_val = match else_result {
-                Some(e) => parse_scalar(e)?,
-                None => ScalarValue::Null,
+            let else_expr = match else_result {
+                Some(e) => Box::new(parse_col_expr(e, None)?),
+                None => Box::new(ColumnExpr::Literal {
+                    value: ScalarValue::Null,
+                    alias: "null".into(),
+                }),
             };
-            Ok(ColumnExpr::CaseWhen {
+            Ok(ColumnExpr::CaseExpr {
                 branches,
-                else_val,
+                else_expr,
                 alias: alias.unwrap_or_else(|| "case_expr".into()),
             })
         }
+        Expr::Extract { field, expr, .. } => {
+            let inner = parse_col_expr(expr, None)?;
+            Ok(ColumnExpr::Extract {
+                field: field.to_string().to_uppercase(),
+                expr: Box::new(inner),
+                alias: alias.unwrap_or_else(|| format!("extract_{}", field.to_string().to_lowercase())),
+            })
+        }
+        Expr::TypedString { value, .. } => Ok(ColumnExpr::Literal {
+            value: ScalarValue::Utf8(value.clone()),
+            alias: alias.unwrap_or_else(|| "literal".into()),
+        }),
         Expr::BinaryOp { left, op, right }
             if matches!(
                 op,
@@ -2259,6 +2394,8 @@ fn extract_join_keys(expr: &Expr) -> Result<(String, String)> {
 
 fn parse_scalar(expr: &Expr) -> Result<ScalarValue> {
     match expr {
+        Expr::Nested(inner) => parse_scalar(inner),
+        Expr::TypedString { value, .. } => Ok(ScalarValue::Utf8(value.clone())),
         Expr::Value(v) => match v {
             Value::Number(n, _) => {
                 if let Ok(i) = n.parse::<i64>() {
@@ -2284,8 +2421,100 @@ fn parse_scalar(expr: &Expr) -> Result<ScalarValue> {
             ScalarValue::Float64(f) => Ok(ScalarValue::Float64(-f)),
             other => Err(RustLakeError::Plan(format!("cannot negate {other:?}"))),
         },
+        // Compile-time DATE +/- INTERVAL 'N' DAY|MONTH|YEAR folding and constant arithmetic (Wave 19 TPC-H)!
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+            ) =>
+        {
+            if let Expr::Interval(iv) = right.as_ref() {
+                let base_str = match parse_scalar(left)? {
+                    ScalarValue::Utf8(s) => s,
+                    other => {
+                        return Err(RustLakeError::Plan(format!(
+                            "INTERVAL arithmetic expects date string, got {other:?}"
+                        )))
+                    }
+                };
+                let sign: i64 = if matches!(op, BinaryOperator::Minus) { -1 } else { 1 };
+                let amount_raw = match parse_scalar(&iv.value)? {
+                    ScalarValue::Utf8(s) => s.trim().parse::<i64>().unwrap_or(0),
+                    ScalarValue::Int64(i) => i,
+                    _ => 0,
+                };
+                let unit = iv
+                    .leading_field
+                    .as_ref()
+                    .map(|f| f.to_string().to_uppercase())
+                    .unwrap_or_else(|| "DAY".into());
+                let folded = fold_date_interval(&base_str, sign * amount_raw, &unit)?;
+                return Ok(ScalarValue::Utf8(folded));
+            }
+            let lv = parse_scalar(left)?;
+            let rv = parse_scalar(right)?;
+            if let (Some(a), Some(b)) = (lv.as_f64(), rv.as_f64()) {
+                let res = match op {
+                    BinaryOperator::Plus => a + b,
+                    BinaryOperator::Minus => a - b,
+                    BinaryOperator::Multiply => a * b,
+                    BinaryOperator::Divide => {
+                        if b == 0.0 {
+                            0.0
+                        } else {
+                            a / b
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                return Ok(ScalarValue::Float64(res));
+            }
+            Err(RustLakeError::Plan(format!(
+                "unsupported constant binary op: {lv:?} {op:?} {rv:?}"
+            )))
+        }
         other => Err(RustLakeError::Plan(format!("expected literal, got {other:?}"))),
     }
+}
+
+fn fold_date_interval(base_iso: &str, delta: i64, unit: &str) -> Result<String> {
+    let days = rustlakedb_protocol::parse_iso_date_days(base_iso).ok_or_else(|| {
+        RustLakeError::Plan(format!("invalid ISO date literal '{base_iso}'"))
+    })?;
+    let new_days = match unit {
+        "DAY" | "DAYS" => days + delta as i32,
+        "WEEK" | "WEEKS" => days + (delta * 7) as i32,
+        "MONTH" | "MONTHS" => {
+            let parts: Vec<i64> = base_iso
+                .split('-')
+                .filter_map(|p| p.parse::<i64>().ok())
+                .collect();
+            if parts.len() == 3 {
+                let total_m = (parts[0] * 12 + (parts[1] - 1)) + delta;
+                let ny = total_m.div_euclid(12);
+                let nm = total_m.rem_euclid(12) + 1;
+                let nd = parts[2].min(28);
+                return Ok(format!("{ny:04}-{nm:02}-{nd:02}"));
+            }
+            days + (delta * 30) as i32
+        }
+        "YEAR" | "YEARS" => {
+            let parts: Vec<i64> = base_iso
+                .split('-')
+                .filter_map(|p| p.parse::<i64>().ok())
+                .collect();
+            if parts.len() == 3 {
+                let ny = parts[0] + delta;
+                return Ok(format!("{ny:04}-{:02}-{:02}", parts[1], parts[2]));
+            }
+            days + (delta * 365) as i32
+        }
+        _ => days + delta as i32,
+    };
+    Ok(rustlakedb_protocol::format_iso_date_days(new_days))
 }
 
 fn parse_filter_expr(expr: &Expr) -> Result<FilterExpr> {
@@ -2316,7 +2545,35 @@ fn parse_filter_expr(expr: &Expr) -> Result<FilterExpr> {
                 node
             })
         }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let column = extract_ident(expr)?;
+            let lo = parse_scalar(low)?;
+            let hi = parse_scalar(high)?;
+            let node = FilterExpr::And(
+                Box::new(FilterExpr::GtEq {
+                    column: column.clone(),
+                    value: lo,
+                }),
+                Box::new(FilterExpr::LtEq { column, value: hi }),
+            );
+            Ok(if *negated {
+                FilterExpr::Not(Box::new(node))
+            } else {
+                node
+            })
+        }
         Expr::Like {
+            negated,
+            expr,
+            pattern,
+            ..
+        }
+        | Expr::ILike {
             negated,
             expr,
             pattern,
@@ -2377,10 +2634,16 @@ fn parse_filter_expr(expr: &Expr) -> Result<FilterExpr> {
                 if let (Ok(lv), Ok(rv)) = (parse_scalar(left), parse_scalar(right)) {
                     return Ok(FilterExpr::LiteralBool(lv == rv));
                 }
-                Ok(FilterExpr::Eq {
-                    column: extract_ident(left)?,
-                    value: parse_scalar(right)?,
-                })
+                let lcol = extract_ident(left)?;
+                if let Ok(val) = parse_scalar(right) {
+                    Ok(FilterExpr::Eq { column: lcol, value: val })
+                } else {
+                    Ok(FilterExpr::ColCmp {
+                        left: lcol,
+                        op: rustlakedb_protocol::CmpOp::Eq,
+                        right: extract_ident(right)?,
+                    })
+                }
             }
             BinaryOperator::AtArrow => {
                 // Postgres JSONB `@>` containment (`payload @> '{"env": "prod"}'`).
@@ -2402,26 +2665,66 @@ fn parse_filter_expr(expr: &Expr) -> Result<FilterExpr> {
                 };
                 Ok(FilterExpr::JsonHasKey { column, key })
             }
-            BinaryOperator::NotEq => Ok(FilterExpr::NotEq {
-                column: extract_ident(left)?,
-                value: parse_scalar(right)?,
-            }),
-            BinaryOperator::Gt => Ok(FilterExpr::Gt {
-                column: extract_ident(left)?,
-                value: parse_scalar(right)?,
-            }),
-            BinaryOperator::GtEq => Ok(FilterExpr::GtEq {
-                column: extract_ident(left)?,
-                value: parse_scalar(right)?,
-            }),
-            BinaryOperator::Lt => Ok(FilterExpr::Lt {
-                column: extract_ident(left)?,
-                value: parse_scalar(right)?,
-            }),
-            BinaryOperator::LtEq => Ok(FilterExpr::LtEq {
-                column: extract_ident(left)?,
-                value: parse_scalar(right)?,
-            }),
+            BinaryOperator::NotEq => {
+                let lcol = extract_ident(left)?;
+                if let Ok(value) = parse_scalar(right) {
+                    Ok(FilterExpr::NotEq { column: lcol, value })
+                } else {
+                    Ok(FilterExpr::ColCmp {
+                        left: lcol,
+                        op: rustlakedb_protocol::CmpOp::NotEq,
+                        right: extract_ident(right)?,
+                    })
+                }
+            }
+            BinaryOperator::Gt => {
+                let lcol = extract_ident(left)?;
+                if let Ok(value) = parse_scalar(right) {
+                    Ok(FilterExpr::Gt { column: lcol, value })
+                } else {
+                    Ok(FilterExpr::ColCmp {
+                        left: lcol,
+                        op: rustlakedb_protocol::CmpOp::Gt,
+                        right: extract_ident(right)?,
+                    })
+                }
+            }
+            BinaryOperator::GtEq => {
+                let lcol = extract_ident(left)?;
+                if let Ok(value) = parse_scalar(right) {
+                    Ok(FilterExpr::GtEq { column: lcol, value })
+                } else {
+                    Ok(FilterExpr::ColCmp {
+                        left: lcol,
+                        op: rustlakedb_protocol::CmpOp::GtEq,
+                        right: extract_ident(right)?,
+                    })
+                }
+            }
+            BinaryOperator::Lt => {
+                let lcol = extract_ident(left)?;
+                if let Ok(value) = parse_scalar(right) {
+                    Ok(FilterExpr::Lt { column: lcol, value })
+                } else {
+                    Ok(FilterExpr::ColCmp {
+                        left: lcol,
+                        op: rustlakedb_protocol::CmpOp::Lt,
+                        right: extract_ident(right)?,
+                    })
+                }
+            }
+            BinaryOperator::LtEq => {
+                let lcol = extract_ident(left)?;
+                if let Ok(value) = parse_scalar(right) {
+                    Ok(FilterExpr::LtEq { column: lcol, value })
+                } else {
+                    Ok(FilterExpr::ColCmp {
+                        left: lcol,
+                        op: rustlakedb_protocol::CmpOp::LtEq,
+                        right: extract_ident(right)?,
+                    })
+                }
+            }
             other => Err(RustLakeError::Plan(format!(
                 "unsupported filter operator: {other:?}"
             ))),
@@ -2432,7 +2735,51 @@ fn parse_filter_expr(expr: &Expr) -> Result<FilterExpr> {
     }
 }
 
-fn try_parse_agg(expr: &Expr, alias: Option<String>) -> Result<Option<AggExpr>> {
+/// Rewrites inline aggregate calls inside `HAVING` (e.g. `HAVING SUM(l_quantity) > 30.0` or
+/// `HAVING COUNT(*) >= 2`) by ensuring the aggregate exists in `aggs` and replacing the call
+/// with its output alias so `parse_filter_expr` can evaluate it cleanly (Wave 19 TPC-H Q18).
+fn rewrite_having_agg_expr(
+    expr: &Expr,
+    aggs: &mut Vec<AggExpr>,
+    pre_agg_exprs: &mut Vec<ColumnExpr>,
+) -> Result<Expr> {
+    if let Some(parsed_agg) = try_parse_agg_with_expr(expr, None, pre_agg_exprs)? {
+        let alias = if let Some(existing) = aggs.iter().find(|a| a.func == parsed_agg.func) {
+            existing.alias.clone()
+        } else {
+            let a = format!("__having_agg_{}", aggs.len());
+            aggs.push(AggExpr {
+                func: parsed_agg.func,
+                alias: a.clone(),
+            });
+            a
+        };
+        return Ok(Expr::Identifier(sqlparser::ast::Ident::new(alias)));
+    }
+    match expr {
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(rewrite_having_agg_expr(left, aggs, pre_agg_exprs)?),
+            op: op.clone(),
+            right: Box::new(rewrite_having_agg_expr(right, aggs, pre_agg_exprs)?),
+        }),
+        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(rewrite_having_agg_expr(
+            inner,
+            aggs,
+            pre_agg_exprs,
+        )?))),
+        Expr::UnaryOp { op, expr: inner } => Ok(Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(rewrite_having_agg_expr(inner, aggs, pre_agg_exprs)?),
+        }),
+        other => Ok(other.clone()),
+    }
+}
+
+fn try_parse_agg_with_expr(
+    expr: &Expr,
+    alias: Option<String>,
+    pre_agg_exprs: &mut Vec<ColumnExpr>,
+) -> Result<Option<AggExpr>> {
     let Expr::Function(func) = expr else {
         return Ok(None);
     };
@@ -2447,10 +2794,28 @@ fn try_parse_agg(expr: &Expr, alias: Option<String>) -> Result<Option<AggExpr>> 
         ),
         _ => return Ok(None),
     };
+    let resolve_arg_col = |arg: Option<&FunctionArg>,
+                           pre: &mut Vec<ColumnExpr>|
+     -> Result<String> {
+        if let Ok(col) = extract_fn_arg_ident(arg) {
+            return Ok(col);
+        }
+        match arg {
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
+                let syn = format!("__agg_arg_{}", pre.len());
+                let ce = parse_col_expr(e, Some(syn.clone()))?;
+                pre.push(ce);
+                Ok(syn)
+            }
+            other => Err(RustLakeError::Plan(format!(
+                "expected column or expression in aggregate, got {other:?}"
+            ))),
+        }
+    };
     match name.as_str() {
         "COUNT" => {
             if is_distinct {
-                let col = extract_fn_arg_ident(args.first())?;
+                let col = resolve_arg_col(args.first(), pre_agg_exprs)?;
                 Ok(Some(AggExpr {
                     func: AggFunc::CountDistinct(col.clone()),
                     alias: alias.unwrap_or_else(|| format!("count_distinct_{col}")),
@@ -2463,28 +2828,28 @@ fn try_parse_agg(expr: &Expr, alias: Option<String>) -> Result<Option<AggExpr>> 
             }
         }
         "SUM" => {
-            let col = extract_fn_arg_ident(args.first())?;
+            let col = resolve_arg_col(args.first(), pre_agg_exprs)?;
             Ok(Some(AggExpr {
                 func: AggFunc::Sum(col.clone()),
                 alias: alias.unwrap_or_else(|| format!("sum_{col}")),
             }))
         }
         "AVG" => {
-            let col = extract_fn_arg_ident(args.first())?;
+            let col = resolve_arg_col(args.first(), pre_agg_exprs)?;
             Ok(Some(AggExpr {
                 func: AggFunc::Avg(col.clone()),
                 alias: alias.unwrap_or_else(|| format!("avg_{col}")),
             }))
         }
         "MIN" => {
-            let col = extract_fn_arg_ident(args.first())?;
+            let col = resolve_arg_col(args.first(), pre_agg_exprs)?;
             Ok(Some(AggExpr {
                 func: AggFunc::Min(col.clone()),
                 alias: alias.unwrap_or_else(|| format!("min_{col}")),
             }))
         }
         "MAX" => {
-            let col = extract_fn_arg_ident(args.first())?;
+            let col = resolve_arg_col(args.first(), pre_agg_exprs)?;
             Ok(Some(AggExpr {
                 func: AggFunc::Max(col.clone()),
                 alias: alias.unwrap_or_else(|| format!("max_{col}")),
@@ -2492,6 +2857,140 @@ fn try_parse_agg(expr: &Expr, alias: Option<String>) -> Result<Option<AggExpr>> 
         }
         _ => Ok(None),
     }
+}
+
+/// Predicate Pushdown Through Joins (Wave 19 CBO):
+/// Splits conjunctive `AND` predicates above a `HashJoin` and pushes single-table predicates
+/// directly onto the owning `IcebergScan` leaf before the join executes!
+async fn push_filter_through_joins(
+    node: PhysicalNode,
+    pred: FilterExpr,
+    catalog: &dyn Catalog,
+    _branch: &str,
+) -> (PhysicalNode, Option<FilterExpr>, usize) {
+    let mut table_cols: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut table_names: Vec<String> = Vec::new();
+    collect_scan_table_names(&node, &mut table_names);
+    for t in &table_names {
+        if let Ok(meta) = catalog.get_table(t).await {
+            let set: HashSet<String> = meta.schema.iter().map(|f| f.name.clone()).collect();
+            table_cols.insert(t.clone(), set);
+        }
+    }
+
+    let mut conjuncts = Vec::new();
+    flatten_and_conjuncts(pred, &mut conjuncts);
+
+    let mut per_table_preds: HashMap<String, Vec<FilterExpr>> = HashMap::new();
+    let mut remaining: Vec<FilterExpr> = Vec::new();
+    let mut pushed_cnt = 0usize;
+
+    for c in conjuncts {
+        let mut cols = HashSet::new();
+        collect_filter_cols(&c, &mut cols);
+        let owners: Vec<&String> = table_cols
+            .iter()
+            .filter(|(_, schema_cols)| !cols.is_empty() && cols.iter().all(|col| schema_cols.contains(col)))
+            .map(|(t, _)| t)
+            .collect();
+        if owners.len() == 1 {
+            per_table_preds
+                .entry(owners[0].clone())
+                .or_default()
+                .push(c);
+            pushed_cnt += 1;
+        } else {
+            remaining.push(c);
+        }
+    }
+
+    let rewritten = if pushed_cnt > 0 {
+        attach_pushed_preds_to_scans(node, &per_table_preds)
+    } else {
+        node
+    };
+    let rem_expr = combine_and_conjuncts(remaining);
+    (rewritten, rem_expr, pushed_cnt)
+}
+
+fn collect_scan_table_names(node: &PhysicalNode, out: &mut Vec<String>) {
+    match node {
+        PhysicalNode::IcebergScan { table_name, .. } => {
+            if !out.contains(table_name) {
+                out.push(table_name.clone());
+            }
+        }
+        PhysicalNode::HashJoin { left, right, join_type, .. } => {
+            // Only safely push through INNER joins
+            if *join_type == JoinType::Inner {
+                collect_scan_table_names(left, out);
+                collect_scan_table_names(right, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn attach_pushed_preds_to_scans(
+    node: PhysicalNode,
+    per_table: &HashMap<String, Vec<FilterExpr>>,
+) -> PhysicalNode {
+    match node {
+        PhysicalNode::IcebergScan {
+            table_name,
+            projection,
+            pushed_filter,
+            splits,
+        } => {
+            let mut all = Vec::new();
+            if let Some(existing) = pushed_filter {
+                all.push(existing);
+            }
+            if let Some(extra) = per_table.get(&table_name) {
+                all.extend(extra.iter().cloned());
+            }
+            PhysicalNode::IcebergScan {
+                table_name,
+                projection,
+                pushed_filter: combine_and_conjuncts(all),
+                splits,
+            }
+        }
+        PhysicalNode::HashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            join_type,
+            is_broadcast,
+        } if join_type == JoinType::Inner => PhysicalNode::HashJoin {
+            left: Box::new(attach_pushed_preds_to_scans(*left, per_table)),
+            right: Box::new(attach_pushed_preds_to_scans(*right, per_table)),
+            left_key,
+            right_key,
+            join_type,
+            is_broadcast,
+        },
+        other => other,
+    }
+}
+
+fn flatten_and_conjuncts(expr: FilterExpr, out: &mut Vec<FilterExpr>) {
+    match expr {
+        FilterExpr::And(a, b) => {
+            flatten_and_conjuncts(*a, out);
+            flatten_and_conjuncts(*b, out);
+        }
+        other => out.push(other),
+    }
+}
+
+fn combine_and_conjuncts(list: Vec<FilterExpr>) -> Option<FilterExpr> {
+    let mut iter = list.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, next| {
+        FilterExpr::And(Box::new(acc), Box::new(next))
+    }))
 }
 
 fn extract_fn_arg_ident(arg: Option<&FunctionArg>) -> Result<String> {
@@ -2754,6 +3253,20 @@ fn collect_col_expr_cols(expr: &ColumnExpr, out: &mut HashSet<String>) {
                 collect_filter_cols(pred, out);
             }
         }
+        ColumnExpr::CaseExpr {
+            branches,
+            else_expr,
+            ..
+        } => {
+            for (pred, res) in branches {
+                collect_filter_cols(pred, out);
+                collect_col_expr_cols(res, out);
+            }
+            collect_col_expr_cols(else_expr, out);
+        }
+        ColumnExpr::Extract { expr, .. } => {
+            collect_col_expr_cols(expr, out);
+        }
         ColumnExpr::Coalesce { columns, .. } => {
             for c in columns {
                 out.insert(c.clone());
@@ -2791,6 +3304,10 @@ fn collect_filter_cols(expr: &FilterExpr, out: &mut HashSet<String>) {
         | FilterExpr::JsonContains { column, .. }
         | FilterExpr::JsonHasKey { column, .. } => {
             out.insert(column.clone());
+        }
+        FilterExpr::ColCmp { left, right, .. } => {
+            out.insert(left.clone());
+            out.insert(right.clone());
         }
         FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
             collect_filter_cols(a, out);

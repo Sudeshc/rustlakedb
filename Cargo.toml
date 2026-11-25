@@ -15,15 +15,16 @@ members = [
 ]
 
 [workspace.package]
-version = "4.0.0"
+version = "5.0.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 arrow-array = "54"
-arrow-flight = "54"
+arrow-flight = { version = "54", features = ["flight-sql-experimental"] }
 arrow-ipc = "54"
 arrow-schema = "54"
+arrow-select = "54"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
@@ -35,6 +36,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 object_store = "0.11"
 parking_lot = "0.12"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
+prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
 roaring = "0.10"
