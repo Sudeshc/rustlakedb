@@ -34,6 +34,7 @@ fn make_part_file(path: &str, region: &str) -> DataFileEntry {
         column_min: HashMap::new(),
         column_max: HashMap::new(),
         partition_values: pv,
+        dv_path: None,
     }
 }
 
@@ -177,4 +178,77 @@ async fn wave31_iceberg_v3_equality_deletes_zero_read_cdc_upsert_and_delete() {
     assert_eq!(res.batch.rows[0].get("balance"), Some(&ScalarValue::Float64(999.0)));
     assert_eq!(res.batch.rows[1].get("id"), Some(&ScalarValue::Int64(3)));
     assert_eq!(res.batch.rows[1].get("balance"), Some(&ScalarValue::Float64(300.0)));
+}
+
+#[tokio::test]
+async fn prc_immutable_dv_preserves_restore_after_update_delete_and_explain_view() {
+    let dir = tempdir().unwrap();
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryRaftCatalog::open(dir.path()).unwrap());
+    let store = Arc::new(IcebergObjectStore::local_fs(dir.path()).unwrap());
+    let shuffle: Arc<dyn ShuffleTransport> =
+        Arc::new(HybridShuffleManager::new(dir.path().join("shuffle")).unwrap());
+    let worker = Arc::new(WorkerNode::new("w-prc", catalog.clone(), shuffle.clone(), store.clone()));
+    let coord = Coordinator::new(
+        catalog,
+        store,
+        shuffle,
+        vec![worker],
+        PlannerConfig::default(),
+    );
+
+    coord
+        .execute_sql("CREATE TABLE dr_ledger (id BIGINT NOT NULL, balance DOUBLE)", "main")
+        .await
+        .unwrap();
+    coord
+        .execute_sql("INSERT INTO dr_ledger VALUES (1, 1000.0), (2, 2000.0), (3, 3000.0)", "main")
+        .await
+        .unwrap();
+    let snaps = coord
+        .execute_sql("SHOW SNAPSHOTS ON dr_ledger", "main")
+        .await
+        .unwrap();
+    let good_snap = match snaps.batch.rows.last().unwrap().get("snapshot_id").unwrap() {
+        ScalarValue::Int64(v) => *v as u64,
+        other => panic!("unexpected snapshot_id: {other:?}"),
+    };
+
+    // Corrupt via UPDATE & DELETE (creates new immutable snapshot-scoped DVs!)
+    coord
+        .execute_sql("UPDATE dr_ledger SET balance = 0.0 WHERE id >= 1", "main")
+        .await
+        .unwrap();
+    coord
+        .execute_sql("DELETE FROM dr_ledger WHERE id = 3", "main")
+        .await
+        .unwrap();
+    let after_bad = coord
+        .execute_sql("SELECT COUNT(*) AS cnt, SUM(balance) AS total FROM dr_ledger", "main")
+        .await
+        .unwrap();
+    assert_eq!(after_bad.batch.rows[0].get("cnt"), Some(&ScalarValue::Int64(2)));
+    assert_eq!(after_bad.batch.rows[0].get("total"), Some(&ScalarValue::Float64(0.0)));
+
+    // Restore back to good_snap -> must recover ALL 3 rows and exact $6,000 balance!
+    coord
+        .execute_sql(&format!("RESTORE TABLE dr_ledger TO VERSION {good_snap}"), "main")
+        .await
+        .unwrap();
+    let restored = coord
+        .execute_sql("SELECT COUNT(*) AS cnt, SUM(balance) AS total FROM dr_ledger", "main")
+        .await
+        .unwrap();
+    assert_eq!(restored.batch.rows[0].get("cnt"), Some(&ScalarValue::Int64(3)));
+    assert_eq!(restored.batch.rows[0].get("total"), Some(&ScalarValue::Float64(6000.0)));
+
+    // Verify EXPLAIN (FORMAT JSON) over a virtual VIEW works cleanly!
+    coord
+        .execute_sql("CREATE VIEW v_dr AS SELECT id, balance FROM dr_ledger", "main")
+        .await
+        .unwrap();
+    let exp = coord
+        .execute_sql("EXPLAIN (FORMAT JSON) SELECT id, balance FROM v_dr ORDER BY id", "main")
+        .await
+        .unwrap();
+    assert_eq!(exp.batch.num_rows(), 1);
 }

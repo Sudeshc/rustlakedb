@@ -487,6 +487,9 @@ pub struct IcebergSplit {
     pub file_path: String,
     pub row_group_id: u32,
     pub estimated_bytes: u64,
+    /// Immutable snapshot-scoped Iceberg v3 Deletion Vector path (if any rows deleted in this snapshot).
+    #[serde(default)]
+    pub dv_path: Option<String>,
 }
 
 impl IcebergSplit {

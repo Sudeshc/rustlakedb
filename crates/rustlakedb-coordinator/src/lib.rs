@@ -1165,7 +1165,12 @@ impl Coordinator {
                     for df in &snap.data_files {
                         if let Ok(fb) = self
                             .store
-                            .read_data_file(&df.file_path, &updated.schema, None)
+                            .read_data_file_with_dv(
+                                &df.file_path,
+                                df.dv_path.as_deref(),
+                                &updated.schema,
+                                None,
+                            )
                             .await
                         {
                             let mut hnsw = rustlakedb_storage::hnsw::HnswIndex::new(8, 32);
@@ -1242,18 +1247,28 @@ impl Coordinator {
                 predicate,
             } => {
                 // Iceberg v3 Merge-on-Read UPDATE:
-                // 1) Mark old rows deleted in file-local Roaring Bitmap Deletion Vector
+                // 1) Mark old rows deleted in a NEW immutable snapshot-scoped Roaring Bitmap DV
                 // 2) Write updated row versions to a new Parquet + Puffin file
-                // 3) Commit new snapshot atomically via OCC
+                // 3) Commit new snapshot atomically via OCC (old snapshots stay 100% immutable!)
                 let meta = self.catalog.get_table(&table_name).await?;
                 let snap = meta.current_snapshot(branch)?;
                 let mut updated_rows = Vec::new();
+                let mut removed_files = Vec::new();
+                let mut added_files = Vec::new();
 
                 for df in &snap.data_files {
-                    let mut dv = self.store.read_deletion_vector(&df.file_path).await?;
+                    let mut dv = self
+                        .store
+                        .read_deletion_vector_at(df.dv_path.as_deref())
+                        .await?;
                     let file_batch = self
                         .store
-                        .read_data_file(&df.file_path, &meta.schema, None)
+                        .read_data_file_with_dv(
+                            &df.file_path,
+                            df.dv_path.as_deref(),
+                            &meta.schema,
+                            None,
+                        )
                         .await?;
                     let mut phys_idx: u32 = 0;
                     let mut changed = false;
@@ -1276,7 +1291,14 @@ impl Coordinator {
                         phys_idx += 1;
                     }
                     if changed {
-                        self.store.write_deletion_vector(&df.file_path, &dv).await?;
+                        let new_dv_path = format!("{}.dv.{}.roaring", df.file_path, Uuid::new_v4());
+                        self.store
+                            .write_deletion_vector_at(&new_dv_path, &dv)
+                            .await?;
+                        removed_files.push(df.file_path.clone());
+                        let mut updated_df = df.clone();
+                        updated_df.dv_path = Some(new_dv_path);
+                        added_files.push(updated_df);
                     }
                 }
 
@@ -1289,13 +1311,14 @@ impl Coordinator {
                         .store
                         .write_data_file(&file_path, &meta.schema, &new_batch)
                         .await?;
+                    added_files.push(entry);
                     self.catalog
                         .commit_table(TableCommitProposal {
                             table_name: table_name.clone(),
                             branch: branch.to_string(),
                             expected_snapshot_id: snap.snapshot_id,
-                            added_files: vec![entry],
-                            removed_files: vec![],
+                            added_files,
+                            removed_files,
                             is_append_only: false,
                         })
                         .await?;
@@ -1317,12 +1340,22 @@ impl Coordinator {
                 let meta = self.catalog.get_table(&table_name).await?;
                 let snap = meta.current_snapshot(branch)?;
                 let mut total_deleted = 0usize;
+                let mut removed_files = Vec::new();
+                let mut added_files = Vec::new();
 
                 for df in &snap.data_files {
-                    let mut dv = self.store.read_deletion_vector(&df.file_path).await?;
+                    let mut dv = self
+                        .store
+                        .read_deletion_vector_at(df.dv_path.as_deref())
+                        .await?;
                     let file_batch = self
                         .store
-                        .read_data_file(&df.file_path, &meta.schema, None)
+                        .read_data_file_with_dv(
+                            &df.file_path,
+                            df.dv_path.as_deref(),
+                            &meta.schema,
+                            None,
+                        )
                         .await?;
                     let mut phys_idx: u32 = 0;
                     let mut changed = false;
@@ -1338,8 +1371,30 @@ impl Coordinator {
                         phys_idx += 1;
                     }
                     if changed {
-                        self.store.write_deletion_vector(&df.file_path, &dv).await?;
+                        let new_dv_path = format!("{}.dv.{}.roaring", df.file_path, Uuid::new_v4());
+                        self.store
+                            .write_deletion_vector_at(&new_dv_path, &dv)
+                            .await?;
+                        removed_files.push(df.file_path.clone());
+                        let mut updated_df = df.clone();
+                        updated_df.dv_path = Some(new_dv_path);
+                        added_files.push(updated_df);
                     }
+                }
+
+                if !removed_files.is_empty() {
+                    self.catalog
+                        .commit_table(TableCommitProposal {
+                            table_name: table_name.clone(),
+                            branch: branch.to_string(),
+                            expected_snapshot_id: snap.snapshot_id,
+                            added_files,
+                            removed_files,
+                            is_append_only: false,
+                        })
+                        .await?;
+                    let updated = self.catalog.get_table(&table_name).await?;
+                    self.store.write_iceberg_metadata(&updated, branch).await?;
                 }
 
                 Ok(QueryExecutionResult {
@@ -1371,7 +1426,12 @@ impl Coordinator {
                 for df in &snap.data_files {
                     let b = self
                         .store
-                        .read_data_file(&df.file_path, &meta.schema, None)
+                        .read_data_file_with_dv(
+                            &df.file_path,
+                            df.dv_path.as_deref(),
+                            &meta.schema,
+                            None,
+                        )
                         .await?;
                     live_rows.extend(b.rows);
                 }
@@ -1429,9 +1489,14 @@ impl Coordinator {
 
                 let mut deleted_files = 0usize;
                 for p in pre_referenced {
-                    if p.ends_with(".parquet") && !referenced.contains(&p) {
-                        let _ = self.store.delete_data_file(&p).await;
-                        deleted_files += 1;
+                    if !referenced.contains(&p) {
+                        if p.ends_with(".parquet") {
+                            let _ = self.store.delete_data_file(&p).await;
+                            deleted_files += 1;
+                        } else if p.ends_with(".roaring") {
+                            let _ = self.store.delete_object(&p).await;
+                            deleted_files += 1;
+                        }
                     }
                 }
 
@@ -1866,7 +1931,12 @@ impl Coordinator {
                     for df in &src_snap.data_files {
                         let b = self
                             .store
-                            .read_data_file(&df.file_path, &src_meta.schema, None)
+                            .read_data_file_with_dv(
+                                &df.file_path,
+                                df.dv_path.as_deref(),
+                                &src_meta.schema,
+                                None,
+                            )
                             .await?;
                         for row in b.rows {
                             if let Some(k) = row.get(&source_key).and_then(|v| v.to_pg_text()) {
@@ -1880,13 +1950,23 @@ impl Coordinator {
                 let tgt_snap = tgt_meta.current_snapshot(branch)?;
                 let mut matched_keys = std::collections::HashSet::new();
                 let mut new_rows: Vec<BTreeMap<String, ScalarValue>> = Vec::new();
+                let mut removed_files = Vec::new();
+                let mut added_files = Vec::new();
                 let mut affected = 0usize;
 
                 for df in &tgt_snap.data_files {
-                    let mut dv = self.store.read_deletion_vector(&df.file_path).await?;
+                    let mut dv = self
+                        .store
+                        .read_deletion_vector_at(df.dv_path.as_deref())
+                        .await?;
                     let file_batch = self
                         .store
-                        .read_data_file(&df.file_path, &tgt_meta.schema, None)
+                        .read_data_file_with_dv(
+                            &df.file_path,
+                            df.dv_path.as_deref(),
+                            &tgt_meta.schema,
+                            None,
+                        )
                         .await?;
                     let mut phys_idx: u32 = 0;
                     let mut changed = false;
@@ -1938,7 +2018,14 @@ impl Coordinator {
                         phys_idx += 1;
                     }
                     if changed {
-                        self.store.write_deletion_vector(&df.file_path, &dv).await?;
+                        let new_dv_path = format!("{}.dv.{}.roaring", df.file_path, Uuid::new_v4());
+                        self.store
+                            .write_deletion_vector_at(&new_dv_path, &dv)
+                            .await?;
+                        removed_files.push(df.file_path.clone());
+                        let mut updated_df = df.clone();
+                        updated_df.dv_path = Some(new_dv_path);
+                        added_files.push(updated_df);
                     }
                 }
 
@@ -1976,13 +2063,17 @@ impl Coordinator {
                         .store
                         .write_data_file(&path, &tgt_meta.schema, &batch)
                         .await?;
+                    added_files.push(entry);
+                }
+
+                if !added_files.is_empty() || !removed_files.is_empty() {
                     self.catalog
                         .commit_table(TableCommitProposal {
                             table_name: target_table.clone(),
                             branch: branch.to_string(),
                             expected_snapshot_id: tgt_snap.snapshot_id,
-                            added_files: vec![entry],
-                            removed_files: vec![],
+                            added_files,
+                            removed_files,
                             is_append_only: false,
                         })
                         .await?;
@@ -2018,7 +2109,12 @@ impl Coordinator {
                 for df in &snap.data_files {
                     let b = self
                         .store
-                        .read_data_file(&df.file_path, &meta.schema, None)
+                        .read_data_file_with_dv(
+                            &df.file_path,
+                            df.dv_path.as_deref(),
+                            &meta.schema,
+                            None,
+                        )
                         .await?;
                     live_rows.extend(b.rows);
                 }
@@ -2189,7 +2285,12 @@ impl Coordinator {
                             for df in &delta_files {
                                 let fb = self
                                     .store
-                                    .read_data_file(&df.file_path, &src_meta.schema, None)
+                                    .read_data_file_with_dv(
+                                        &df.file_path,
+                                        df.dv_path.as_deref(),
+                                        &src_meta.schema,
+                                        None,
+                                    )
                                     .await?;
                                 combined_delta.extend(fb.rows);
                             }
@@ -2433,7 +2534,8 @@ impl Coordinator {
     }
 
     async fn expand_virtual_views(&self, sql: &str) -> String {
-        let upper = sql.trim().to_uppercase();
+        let trimmed = sql.trim();
+        let upper = trimmed.to_uppercase();
         if !upper.starts_with("SELECT ") && !upper.starts_with("EXPLAIN ") {
             return sql.to_string();
         }
@@ -2442,7 +2544,7 @@ impl Coordinator {
         };
         let virtual_views: Vec<ViewDefinition> = views
             .into_iter()
-            .filter(|v| !v.materialized && sql.contains(&v.name))
+            .filter(|v| !v.materialized && trimmed.contains(&v.name))
             .collect();
         if virtual_views.is_empty() {
             return sql.to_string();
@@ -2451,21 +2553,7 @@ impl Coordinator {
             .into_iter()
             .map(|v| format!("{} AS ({})", v.name, v.query_sql))
             .collect();
-        if upper.starts_with("EXPLAIN ANALYZE ") {
-            format!(
-                "EXPLAIN ANALYZE WITH {} {}",
-                ctes.join(", "),
-                &sql["EXPLAIN ANALYZE ".len()..]
-            )
-        } else if upper.starts_with("EXPLAIN ") {
-            format!(
-                "EXPLAIN WITH {} {}",
-                ctes.join(", "),
-                &sql["EXPLAIN ".len()..]
-            )
-        } else {
-            format!("WITH {} {sql}", ctes.join(", "))
-        }
+        rewrite_virtual_views_sql(trimmed, &ctes)
     }
 
     /// Wave 6 + Wave 9 Subquery Pre-Evaluator: rewrites `IN (SELECT ...)`, `NOT IN (SELECT ...)`,
@@ -2990,13 +3078,23 @@ impl Coordinator {
             }
         }
 
-        // Apply Iceberg v3 Deletion Vectors for updated/deleted keys in existing Parquet files
+        // Apply immutable Iceberg v3 Deletion Vectors for updated/deleted keys in existing Parquet files
+        let mut removed_files = Vec::new();
+        let mut added_files = Vec::new();
         if !keys_to_delete.is_empty() {
             for df in &snap.data_files {
-                let mut dv = self.store.read_deletion_vector(&df.file_path).await?;
+                let mut dv = self
+                    .store
+                    .read_deletion_vector_at(df.dv_path.as_deref())
+                    .await?;
                 let file_batch = self
                     .store
-                    .read_data_file(&df.file_path, &meta.schema, None)
+                    .read_data_file_with_dv(
+                        &df.file_path,
+                        df.dv_path.as_deref(),
+                        &meta.schema,
+                        None,
+                    )
                     .await?;
                 let mut phys_idx: u32 = 0;
                 let mut changed = false;
@@ -3016,7 +3114,14 @@ impl Coordinator {
                     phys_idx += 1;
                 }
                 if changed {
-                    self.store.write_deletion_vector(&df.file_path, &dv).await?;
+                    let new_dv_path = format!("{}.dv.{}.roaring", df.file_path, Uuid::new_v4());
+                    self.store
+                        .write_deletion_vector_at(&new_dv_path, &dv)
+                        .await?;
+                    removed_files.push(df.file_path.clone());
+                    let mut updated_df = df.clone();
+                    updated_df.dv_path = Some(new_dv_path);
+                    added_files.push(updated_df);
                 }
             }
         }
@@ -3033,13 +3138,17 @@ impl Coordinator {
                 .store
                 .write_data_file(&path, &meta.schema, &batch)
                 .await?;
+            added_files.push(entry);
+        }
+
+        if !added_files.is_empty() || !removed_files.is_empty() {
             self.catalog
                 .commit_table(TableCommitProposal {
                     table_name: table_name.to_string(),
                     branch: branch.to_string(),
                     expected_snapshot_id: snap.snapshot_id,
-                    added_files: vec![entry],
-                    removed_files: vec![],
+                    added_files,
+                    removed_files,
                     is_append_only: keys_to_delete.is_empty(),
                 })
                 .await?;
@@ -4583,8 +4692,9 @@ impl Coordinator {
         for df in &snap.data_files {
             let fb = self
                 .store
-                .read_data_file_with_aliases(
+                .read_data_file_with_aliases_and_dv(
                     &df.file_path,
+                    df.dv_path.as_deref(),
                     &meta.schema,
                     &meta.column_aliases,
                     None,
@@ -4972,4 +5082,57 @@ fn enforce_table_schema(meta: &IcebergTableMetadata, batch: &mut RowBatch) -> Re
         }
     }
     Ok(())
+}
+
+fn rewrite_virtual_views_sql(trimmed: &str, ctes: &[String]) -> String {
+    let cte_list = ctes.join(", ");
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("EXPLAIN ") {
+        let after_explain = trimmed["EXPLAIN".len()..].trim_start();
+        let (prefix, body) = if after_explain.starts_with('(') {
+            if let Some(close_rel) = after_explain.find(')') {
+                let opts = &after_explain[..=close_rel];
+                let rest = after_explain[close_rel + 1..].trim_start();
+                (format!("EXPLAIN {opts}"), rest)
+            } else {
+                ("EXPLAIN".to_string(), after_explain)
+            }
+        } else if after_explain.to_uppercase().starts_with("ANALYZE ") {
+            (
+                "EXPLAIN ANALYZE".to_string(),
+                after_explain["ANALYZE ".len()..].trim_start(),
+            )
+        } else {
+            ("EXPLAIN".to_string(), after_explain)
+        };
+        format!("{prefix} WITH {cte_list} {body}")
+    } else {
+        format!("WITH {cte_list} {trimmed}")
+    }
+}
+
+#[cfg(test)]
+mod view_rewrite_tests {
+    use super::rewrite_virtual_views_sql;
+
+    #[test]
+    fn rewrites_explain_format_json_and_analyze_over_views() {
+        let ctes = vec!["v_exec AS (SELECT region, COUNT(*) AS cnt FROM kpi GROUP BY region)".to_string()];
+        assert_eq!(
+            rewrite_virtual_views_sql("EXPLAIN (FORMAT JSON) SELECT region, cnt FROM v_exec", &ctes),
+            "EXPLAIN (FORMAT JSON) WITH v_exec AS (SELECT region, COUNT(*) AS cnt FROM kpi GROUP BY region) SELECT region, cnt FROM v_exec"
+        );
+        assert_eq!(
+            rewrite_virtual_views_sql("EXPLAIN ANALYZE SELECT * FROM v_exec", &ctes),
+            "EXPLAIN ANALYZE WITH v_exec AS (SELECT region, COUNT(*) AS cnt FROM kpi GROUP BY region) SELECT * FROM v_exec"
+        );
+        assert_eq!(
+            rewrite_virtual_views_sql("EXPLAIN SELECT * FROM v_exec", &ctes),
+            "EXPLAIN WITH v_exec AS (SELECT region, COUNT(*) AS cnt FROM kpi GROUP BY region) SELECT * FROM v_exec"
+        );
+        assert_eq!(
+            rewrite_virtual_views_sql("SELECT * FROM v_exec", &ctes),
+            "WITH v_exec AS (SELECT region, COUNT(*) AS cnt FROM kpi GROUP BY region) SELECT * FROM v_exec"
+        );
+    }
 }

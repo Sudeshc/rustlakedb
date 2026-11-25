@@ -88,12 +88,13 @@ async fn compaction_dv_materialization_time_travel_and_vacuum_gc() {
     // Delete order #3 (creates a DV sidecar).
     cluster.sql("DELETE FROM orders WHERE order_id = 3").await.unwrap();
 
-    // Time Travel: snapshot 2 only had the very first INSERT batch (orders 1, 2, 3; order 3 deleted by DV).
+    // Time Travel: snapshot 2 is 100% immutable (still sees all 3 rows from INSERT batch 1,
+    // unaffected by the later snapshot-scoped DELETE!).
     let tt = cluster
         .sql("SELECT COUNT(*) AS cnt FROM orders AT VERSION 2")
         .await
         .unwrap();
-    assert_eq!(tt.batch.rows[0].get("cnt"), Some(&ScalarValue::Int64(2)));
+    assert_eq!(tt.batch.rows[0].get("cnt"), Some(&ScalarValue::Int64(3)));
 
     // Compact 3 small Parquet files + Deletion Vector -> 1 clean compacted Parquet file!
     let cmp = cluster.sql("COMPACT TABLE orders").await.unwrap();
@@ -107,11 +108,11 @@ async fn compaction_dv_materialization_time_travel_and_vacuum_gc() {
     assert_eq!(after_compact.batch.rows[0].get("cnt"), Some(&ScalarValue::Int64(5)));
     assert_eq!(after_compact.batch.rows[0].get("total"), Some(&ScalarValue::Float64(800.0)));
 
-    // VACUUM expires old snapshots and physically deletes the 3 unreferenced old Parquet + Puffin + DV files!
+    // VACUUM expires old snapshots and physically deletes the 3 unreferenced old Parquet files + 1 expired immutable DV!
     let vac = cluster.sql("VACUUM TABLE orders RETAIN 1").await.unwrap();
     assert!(
-        vac.command_tag.contains("deleted_files=3"),
-        "expected VACUUM to delete 3 compacted-away Parquet files, got: {}",
+        vac.command_tag.contains("deleted_files=4"),
+        "expected VACUUM to delete 3 compacted-away Parquet files + 1 expired DV, got: {}",
         vac.command_tag
     );
 

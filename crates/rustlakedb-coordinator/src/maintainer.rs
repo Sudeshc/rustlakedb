@@ -55,18 +55,7 @@ impl AutonomousMaintainer {
             let meta = self.coordinator.catalog.get_table(&table_name).await?;
             let snap = meta.current_snapshot("main")?;
 
-            let mut has_dvs = false;
-            for df in &snap.data_files {
-                let dv = self
-                    .coordinator
-                    .store
-                    .read_deletion_vector(&df.file_path)
-                    .await?;
-                if !dv.is_empty() {
-                    has_dvs = true;
-                    break;
-                }
-            }
+            let has_dvs = snap.data_files.iter().any(|df| df.dv_path.is_some());
 
             // Only auto-compact small fragmented files (<16 MiB) on tables within in-memory compaction budget,
             // never pulling billion-row optimal Parquet tables into maintainer RAM!

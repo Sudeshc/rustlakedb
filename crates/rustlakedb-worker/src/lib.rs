@@ -291,6 +291,7 @@ impl WorkerNode {
                             && let Some(vec_rows) = self
                                 .try_eval_vectorized_filtered_scan(
                                     &split.file_path,
+                                    split.dv_path.as_deref(),
                                     &meta.schema,
                                     projection,
                                     pred,
@@ -308,8 +309,9 @@ impl WorkerNode {
                         };
                         let file_batch = self
                             .store
-                            .read_data_file_with_aliases(
+                            .read_data_file_with_aliases_and_dv(
                                 &split.file_path,
+                                split.dv_path.as_deref(),
                                 &meta.schema,
                                 &meta.column_aliases,
                                 proj_opt,
@@ -677,7 +679,11 @@ impl WorkerNode {
                         if effective_splits.len() == 1
                             && let Ok((batches, dv)) = self
                                 .store
-                                .read_arrow_batches(&effective_splits[0].file_path, None)
+                                .read_arrow_batches_with_dv(
+                                    &effective_splits[0].file_path,
+                                    effective_splits[0].dv_path.as_deref(),
+                                    None,
+                                )
                                 .await
                             && dv.is_empty()
                             && batches.len() == 1
@@ -2507,6 +2513,7 @@ impl WorkerNode {
     async fn try_eval_vectorized_filtered_scan(
         &self,
         file_path: &str,
+        dv_path: Option<&str>,
         schema: &[rustlakedb_catalog::FieldSchema],
         projection: &[String],
         pred: &FilterExpr,
@@ -2539,7 +2546,7 @@ impl WorkerNode {
 
         let (batches, dv) = self
             .store
-            .read_arrow_batches(file_path, Some(&proj_cols))
+            .read_arrow_batches_with_dv(file_path, dv_path, Some(&proj_cols))
             .await?;
         let has_dv = !dv.is_empty();
         let mut global_row_id = 0u32;
@@ -2617,7 +2624,11 @@ impl WorkerNode {
         for split in &task.assigned_splits {
             let (batches, dv) = self
                 .store
-                .read_arrow_batches(&split.file_path, Some(&needed))
+                .read_arrow_batches_with_dv(
+                    &split.file_path,
+                    split.dv_path.as_deref(),
+                    Some(&needed),
+                )
                 .await?;
             let has_dv = !dv.is_empty();
             let mut global_row_id = 0u32;
@@ -2705,6 +2716,7 @@ impl WorkerNode {
 
         struct SplitAggPlan {
             file_path: String,
+            dv_path: Option<String>,
             phys_group_cols: Vec<String>,
             phys_agg_cols: Vec<Option<String>>,
             phys_filter: Option<FilterExpr>,
@@ -2794,6 +2806,7 @@ impl WorkerNode {
             proj.sort();
             split_plans.push(SplitAggPlan {
                 file_path: split.file_path.clone(),
+                dv_path: split.dv_path.clone(),
                 phys_group_cols,
                 phys_agg_cols,
                 phys_filter,
@@ -2956,6 +2969,7 @@ impl WorkerNode {
 
         for SplitAggPlan {
             file_path,
+            dv_path,
             phys_group_cols,
             phys_agg_cols,
             phys_filter,
@@ -2964,7 +2978,7 @@ impl WorkerNode {
         {
             let (batches, dv) = self
                 .store
-                .read_arrow_batches(&file_path, Some(&proj))
+                .read_arrow_batches_with_dv(&file_path, dv_path.as_deref(), Some(&proj))
                 .await?;
             let has_dv = !dv.is_empty();
             let mut global_row_id = 0u32;
@@ -3444,7 +3458,7 @@ impl WorkerNode {
             }
             let (batches, dv) = self
                 .store
-                .read_arrow_batches(&split.file_path, Some(&proj))
+                .read_arrow_batches_with_dv(&split.file_path, split.dv_path.as_deref(), Some(&proj))
                 .await?;
             let has_dv = !dv.is_empty();
             let mut global_row_id = 0u32;
@@ -3687,7 +3701,11 @@ impl WorkerNode {
         for split in &task.assigned_splits {
             let (batches, dv) = self
                 .store
-                .read_arrow_batches(&split.file_path, Some(&proj_cols))
+                .read_arrow_batches_with_dv(
+                    &split.file_path,
+                    split.dv_path.as_deref(),
+                    Some(&proj_cols),
+                )
                 .await?;
             let has_dv = !dv.is_empty();
             let mut global_row_id = 0u32;

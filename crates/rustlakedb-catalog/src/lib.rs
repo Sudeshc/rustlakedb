@@ -136,6 +136,9 @@ pub struct DataFileEntry {
     /// Iceberg hidden partition values (`spec_expr -> partition_value`, Wave 14).
     #[serde(default)]
     pub partition_values: HashMap<String, String>,
+    /// Immutable Iceberg v3 Deletion Vector blob path scoped to this snapshot (preserves Time Travel & RESTORE).
+    #[serde(default)]
+    pub dv_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +347,7 @@ impl IcebergTableMetadata {
                 file_path: f.file_path.clone(),
                 row_group_id: f.row_group_id,
                 estimated_bytes: f.byte_size,
+                dv_path: f.dv_path.clone(),
             })
             .collect()
     }
@@ -365,6 +369,9 @@ impl IcebergTableMetadata {
         for snap in self.snapshots.values() {
             for df in &snap.data_files {
                 set.insert(df.file_path.clone());
+                if let Some(ref dv) = df.dv_path {
+                    set.insert(dv.clone());
+                }
             }
         }
         set
@@ -506,6 +513,16 @@ pub struct InMemoryRaftCatalog {
     state_file: Option<PathBuf>,
     views_file: Option<PathBuf>,
     governance_file: Option<PathBuf>,
+    /// Tracks `(mtime, byte_len)` of last written/synced catalog JSON files so disk reloads
+    /// execute strictly under the write lock (eliminating TOCTOU lost updates under concurrent writers!).
+    last_state_stamp: RwLock<Option<(std::time::SystemTime, u64)>>,
+    last_views_stamp: RwLock<Option<(std::time::SystemTime, u64)>>,
+    last_governance_stamp: RwLock<Option<(std::time::SystemTime, u64)>>,
+}
+
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 impl Default for InMemoryRaftCatalog {
@@ -523,6 +540,9 @@ impl InMemoryRaftCatalog {
             state_file: None,
             views_file: None,
             governance_file: None,
+            last_state_stamp: RwLock::new(None),
+            last_views_stamp: RwLock::new(None),
+            last_governance_stamp: RwLock::new(None),
         }
     }
 
@@ -540,18 +560,21 @@ impl InMemoryRaftCatalog {
         } else {
             HashMap::new()
         };
+        let state_stamp = file_stamp(&state_file);
         let views = if views_file.exists() {
             let bytes = std::fs::read(&views_file)?;
             serde_json::from_slice(&bytes).unwrap_or_default()
         } else {
             HashMap::new()
         };
+        let views_stamp = file_stamp(&views_file);
         let governance = if governance_file.exists() {
             let bytes = std::fs::read(&governance_file)?;
             serde_json::from_slice(&bytes).unwrap_or_default()
         } else {
             PersistedGovernanceState::default()
         };
+        let governance_stamp = file_stamp(&governance_file);
 
         Ok(Self {
             tables: RwLock::new(tables),
@@ -560,6 +583,9 @@ impl InMemoryRaftCatalog {
             state_file: Some(state_file),
             views_file: Some(views_file),
             governance_file: Some(governance_file),
+            last_state_stamp: RwLock::new(state_stamp),
+            last_views_stamp: RwLock::new(views_stamp),
+            last_governance_stamp: RwLock::new(governance_stamp),
         })
     }
 
@@ -569,6 +595,7 @@ impl InMemoryRaftCatalog {
             let bytes = serde_json::to_vec_pretty(tables)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
+            *self.last_state_stamp.write() = file_stamp(path);
         }
         Ok(())
     }
@@ -579,6 +606,7 @@ impl InMemoryRaftCatalog {
             let bytes = serde_json::to_vec_pretty(views)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
+            *self.last_views_stamp.write() = file_stamp(path);
         }
         Ok(())
     }
@@ -589,26 +617,45 @@ impl InMemoryRaftCatalog {
             let bytes = serde_json::to_vec_pretty(gov)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
+            *self.last_governance_stamp.write() = file_stamp(path);
         }
         Ok(())
     }
 
-    /// Refreshes in-memory catalog view from disk so independent Worker OS processes
-    /// immediately observe tables and snapshots committed by the Coordinator process.
+    /// Refreshes in-memory catalog view from disk strictly under the write lock, skipping I/O
+    /// when `(mtime, len)` matches our own last commit (zero TOCTOU lost updates under concurrency!).
     fn sync_from_disk(&self) {
-        if let Some(ref path) = self.state_file
-            && path.exists()
-            && let Ok(bytes) = std::fs::read(path)
-            && let Ok(loaded) = serde_json::from_slice::<HashMap<String, IcebergTableMetadata>>(&bytes)
-        {
-            *self.tables.write() = loaded;
+        if let Some(ref path) = self.state_file {
+            let cur_stamp = file_stamp(path);
+            if cur_stamp.is_some() && cur_stamp != *self.last_state_stamp.read() {
+                let mut guard = self.tables.write();
+                let recheck = file_stamp(path);
+                if recheck.is_some()
+                    && recheck != *self.last_state_stamp.read()
+                    && let Ok(bytes) = std::fs::read(path)
+                    && let Ok(loaded) =
+                        serde_json::from_slice::<HashMap<String, IcebergTableMetadata>>(&bytes)
+                {
+                    *guard = loaded;
+                    *self.last_state_stamp.write() = recheck;
+                }
+            }
         }
-        if let Some(ref path) = self.views_file
-            && path.exists()
-            && let Ok(bytes) = std::fs::read(path)
-            && let Ok(loaded) = serde_json::from_slice::<HashMap<String, ViewDefinition>>(&bytes)
-        {
-            *self.views.write() = loaded;
+        if let Some(ref path) = self.views_file {
+            let cur_stamp = file_stamp(path);
+            if cur_stamp.is_some() && cur_stamp != *self.last_views_stamp.read() {
+                let mut guard = self.views.write();
+                let recheck = file_stamp(path);
+                if recheck.is_some()
+                    && recheck != *self.last_views_stamp.read()
+                    && let Ok(bytes) = std::fs::read(path)
+                    && let Ok(loaded) =
+                        serde_json::from_slice::<HashMap<String, ViewDefinition>>(&bytes)
+                {
+                    *guard = loaded;
+                    *self.last_views_stamp.write() = recheck;
+                }
+            }
         }
     }
 }
@@ -1245,12 +1292,20 @@ impl Catalog for InMemoryRaftCatalog {
     }
 
     async fn get_governance(&self) -> Result<PersistedGovernanceState> {
-        if let Some(ref path) = self.governance_file
-            && path.exists()
-            && let Ok(bytes) = std::fs::read(path)
-            && let Ok(disk_gov) = serde_json::from_slice::<PersistedGovernanceState>(&bytes)
-        {
-            *self.governance.write() = disk_gov;
+        if let Some(ref path) = self.governance_file {
+            let cur_stamp = file_stamp(path);
+            if cur_stamp.is_some() && cur_stamp != *self.last_governance_stamp.read() {
+                let mut guard = self.governance.write();
+                let recheck = file_stamp(path);
+                if recheck.is_some()
+                    && recheck != *self.last_governance_stamp.read()
+                    && let Ok(bytes) = std::fs::read(path)
+                    && let Ok(disk_gov) = serde_json::from_slice::<PersistedGovernanceState>(&bytes)
+                {
+                    *guard = disk_gov;
+                    *self.last_governance_stamp.write() = recheck;
+                }
+            }
         }
         Ok(self.governance.read().clone())
     }
@@ -1387,5 +1442,54 @@ mod tests {
         cat.merge_branch("events", "staging", "main").await.unwrap();
         let t2 = cat.get_table("events").await.unwrap();
         assert_eq!(t2.current_snapshot("main").unwrap().snapshot_id, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_persistent_commits_conserve_every_file_zero_lost_updates() {
+        let dir = std::env::temp_dir().join(format!("rustlakedb_cat_occ_{}", uuid::Uuid::new_v4()));
+        let cat = std::sync::Arc::new(InMemoryRaftCatalog::open(&dir).unwrap());
+        cat.create_table(IcebergTableMetadata::new("ledger_occ", vec![]))
+            .await
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for w in 0..12usize {
+            let c = std::sync::Arc::clone(&cat);
+            handles.push(tokio::spawn(async move {
+                for i in 0..10usize {
+                    let meta = c.get_table("ledger_occ").await.unwrap();
+                    let snap = meta.current_snapshot("main").unwrap().snapshot_id;
+                    c.commit_table(TableCommitProposal {
+                        table_name: "ledger_occ".into(),
+                        branch: "main".into(),
+                        expected_snapshot_id: snap,
+                        added_files: vec![DataFileEntry {
+                            file_path: format!("ledger_occ/w{w}_i{i}.parquet"),
+                            row_group_id: 0,
+                            row_count: 1,
+                            byte_size: 128,
+                            deletion_vector: RoaringBitmap::new(),
+                            puffin_index: FilePuffinIndex::default(),
+                            ndv_estimates: HashMap::new(),
+                            column_min: HashMap::new(),
+                            column_max: HashMap::new(),
+                            partition_values: HashMap::new(),
+                            dv_path: None,
+                        }],
+                        removed_files: vec![],
+                        is_append_only: true,
+                    })
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let final_meta = cat.get_table("ledger_occ").await.unwrap();
+        let files = &final_meta.current_snapshot("main").unwrap().data_files;
+        assert_eq!(files.len(), 120, "all 120 concurrent commits must be conserved");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -381,6 +381,7 @@ impl IcebergObjectStore {
             column_min,
             column_max,
             partition_values: HashMap::new(),
+            dv_path: None,
         })
     }
 
@@ -462,14 +463,40 @@ impl IcebergObjectStore {
         file_path: &str,
         dv: &RoaringBitmap,
     ) -> Result<()> {
+        let key = dv_sidecar_path(file_path);
+        self.write_deletion_vector_at(&key, dv).await
+    }
+
+    /// Writes an immutable snapshot-scoped Iceberg v3 Deletion Vector blob at `dv_path`.
+    pub async fn write_deletion_vector_at(
+        &self,
+        dv_path: &str,
+        dv: &RoaringBitmap,
+    ) -> Result<()> {
         let mut bytes = Vec::new();
         dv.serialize_into(&mut bytes)?;
-        let dv_path = ObjPath::from(dv_sidecar_path(file_path));
+        let payload = Bytes::from(bytes);
+        let obj_path = ObjPath::from(dv_path);
         self.store
-            .put(&dv_path, PutPayload::from(Bytes::from(bytes)))
+            .put(&obj_path, PutPayload::from(payload.clone()))
             .await
             .map_err(|e| RustLakeError::Execution(format!("object_store put dv: {e}")))?;
+        self.cache.lock().put(dv_path.to_string(), payload);
         Ok(())
+    }
+
+    /// Reads an immutable snapshot-scoped Iceberg v3 Deletion Vector (`None` => zero deletes, zero I/O).
+    pub async fn read_deletion_vector_at(&self, dv_path: Option<&str>) -> Result<RoaringBitmap> {
+        let Some(p) = dv_path else {
+            return Ok(RoaringBitmap::new());
+        };
+        match self.get_cached_immutable(p).await? {
+            Some(bytes) => {
+                let bm = RoaringBitmap::deserialize_from(&bytes[..])?;
+                Ok(bm)
+            }
+            None => Ok(RoaringBitmap::new()),
+        }
     }
 
     pub async fn read_deletion_vector(&self, file_path: &str) -> Result<RoaringBitmap> {
@@ -535,7 +562,17 @@ impl IcebergObjectStore {
         file_path: &str,
         projected_columns: Option<&[String]>,
     ) -> Result<(Vec<RecordBatch>, RoaringBitmap)> {
-        let dv = self.read_deletion_vector(file_path).await?;
+        self.read_arrow_batches_with_dv(file_path, None, projected_columns)
+            .await
+    }
+
+    pub async fn read_arrow_batches_with_dv(
+        &self,
+        file_path: &str,
+        dv_path: Option<&str>,
+        projected_columns: Option<&[String]>,
+    ) -> Result<(Vec<RecordBatch>, RoaringBitmap)> {
+        let dv = self.read_deletion_vector_at(dv_path).await?;
         let bytes = self
             .get_cached_immutable(file_path)
             .await?
@@ -591,8 +628,26 @@ impl IcebergObjectStore {
         schema: &[FieldSchema],
         candidate_rows: Option<&RoaringBitmap>,
     ) -> Result<RowBatch> {
-        self.read_data_file_projected(file_path, schema, None, candidate_rows)
+        self.read_data_file_with_dv(file_path, None, schema, candidate_rows)
             .await
+    }
+
+    pub async fn read_data_file_with_dv(
+        &self,
+        file_path: &str,
+        dv_path: Option<&str>,
+        schema: &[FieldSchema],
+        candidate_rows: Option<&RoaringBitmap>,
+    ) -> Result<RowBatch> {
+        self.read_data_file_with_aliases_and_dv(
+            file_path,
+            dv_path,
+            schema,
+            &HashMap::new(),
+            None,
+            candidate_rows,
+        )
+        .await
     }
 
     pub async fn read_data_file_projected(
@@ -602,8 +657,9 @@ impl IcebergObjectStore {
         projected_columns: Option<&[String]>,
         candidate_rows: Option<&RoaringBitmap>,
     ) -> Result<RowBatch> {
-        self.read_data_file_with_aliases(
+        self.read_data_file_with_aliases_and_dv(
             file_path,
+            None,
             schema,
             &HashMap::new(),
             projected_columns,
@@ -624,6 +680,26 @@ impl IcebergObjectStore {
         projected_columns: Option<&[String]>,
         candidate_rows: Option<&RoaringBitmap>,
     ) -> Result<RowBatch> {
+        self.read_data_file_with_aliases_and_dv(
+            file_path,
+            None,
+            schema,
+            column_aliases,
+            projected_columns,
+            candidate_rows,
+        )
+        .await
+    }
+
+    pub async fn read_data_file_with_aliases_and_dv(
+        &self,
+        file_path: &str,
+        dv_path: Option<&str>,
+        schema: &[FieldSchema],
+        column_aliases: &HashMap<String, Vec<String>>,
+        projected_columns: Option<&[String]>,
+        candidate_rows: Option<&RoaringBitmap>,
+    ) -> Result<RowBatch> {
         // Expand projected columns to include historical physical names of renamed columns!
         let expanded_proj: Option<Vec<String>> = projected_columns.map(|cols| {
             let mut v = cols.to_vec();
@@ -639,7 +715,7 @@ impl IcebergObjectStore {
             v
         });
         let (batches, dv) = self
-            .read_arrow_batches(file_path, expanded_proj.as_deref())
+            .read_arrow_batches_with_dv(file_path, dv_path, expanded_proj.as_deref())
             .await?;
 
         let schema_names: HashSet<&str> = schema.iter().map(|f| f.name.as_str()).collect();
@@ -742,6 +818,12 @@ impl IcebergObjectStore {
             self.cache.lock().invalidate(&p);
             let _ = self.store.delete(&ObjPath::from(p.as_str())).await;
         }
+        Ok(())
+    }
+
+    pub async fn delete_object(&self, path: &str) -> Result<()> {
+        self.cache.lock().invalidate(path);
+        let _ = self.store.delete(&ObjPath::from(path)).await;
         Ok(())
     }
 
