@@ -6,6 +6,7 @@ pub mod autoloader;
 pub mod kafka_ingest;
 pub mod maintainer;
 pub mod pg_catalog;
+pub mod pgoutput;
 pub mod security;
 
 use crate::security::{GovernanceState, MaskingRule, SessionContext};
@@ -375,6 +376,39 @@ impl Coordinator {
                 ),
                 stats: QueryExecutionStats::default(),
             });
+        }
+
+        // Wave 37: `SHOW VIEWS` catalog inspection
+        if lower == "show views" {
+            let views = self.catalog.list_views().await?;
+            let rows: Vec<BTreeMap<String, ScalarValue>> = views
+                .into_iter()
+                .map(|v| {
+                    BTreeMap::from([
+                        ("view_name".into(), ScalarValue::Utf8(v.name)),
+                        ("materialized".into(), ScalarValue::Bool(v.materialized)),
+                        ("query_sql".into(), ScalarValue::Utf8(v.query_sql)),
+                    ])
+                })
+                .collect();
+            let n = rows.len();
+            return Ok(QueryExecutionResult {
+                command_tag: format!("SELECT {n}"),
+                dag: None,
+                batch: RowBatch::new(
+                    vec!["view_name".into(), "materialized".into(), "query_sql".into()],
+                    rows,
+                ),
+                stats: QueryExecutionStats::default(),
+            });
+        }
+
+        // Wave 37: `WITH RECURSIVE <cte> [(cols)] AS (<anchor> UNION [ALL] <recursive>) <outer>`
+        if lower.starts_with("with recursive ")
+            && let Some(rec_res) =
+                Box::pin(self.try_execute_recursive_cte(trimmed, branch, session)).await?
+        {
+            return Ok(rec_res);
         }
 
         // Wave 32: `UNNEST(ARRAY[...])` & `JSONB_ARRAY_ELEMENTS(...)` table-valued array unnesting!
@@ -1794,28 +1828,44 @@ impl Coordinator {
             PlannedCommand::MergeInto {
                 target_table,
                 source_table,
+                source_subquery,
                 target_key,
                 source_key,
                 when_matched_delete,
+                when_matched_delete_cond,
                 when_matched_updates,
+                when_matched_update_cond,
                 when_not_matched_insert,
+                when_not_matched_insert_cond,
             } => {
-                self.governance
-                    .check_access(session, &source_table, "SELECT")?;
+                if !source_table.is_empty() {
+                    self.governance
+                        .check_access(session, &source_table, "SELECT")?;
+                }
                 self.governance
                     .check_access(session, &target_table, "UPDATE")?;
 
-                let src_meta = self.catalog.get_table(&source_table).await?;
-                let src_snap = src_meta.current_snapshot(branch)?;
                 let mut src_index: HashMap<String, BTreeMap<String, ScalarValue>> = HashMap::new();
-                for df in &src_snap.data_files {
-                    let b = self
-                        .store
-                        .read_data_file(&df.file_path, &src_meta.schema, None)
-                        .await?;
-                    for row in b.rows {
+                if let Some(sub_sql) = source_subquery {
+                    let sub_res =
+                        Box::pin(self.execute_sql_with_session(&sub_sql, branch, session)).await?;
+                    for row in sub_res.batch.rows {
                         if let Some(k) = row.get(&source_key).and_then(|v| v.to_pg_text()) {
                             src_index.insert(k, row);
+                        }
+                    }
+                } else {
+                    let src_meta = self.catalog.get_table(&source_table).await?;
+                    let src_snap = src_meta.current_snapshot(branch)?;
+                    for df in &src_snap.data_files {
+                        let b = self
+                            .store
+                            .read_data_file(&df.file_path, &src_meta.schema, None)
+                            .await?;
+                        for row in b.rows {
+                            if let Some(k) = row.get(&source_key).and_then(|v| v.to_pg_text()) {
+                                src_index.insert(k, row);
+                            }
                         }
                     }
                 }
@@ -1842,10 +1892,27 @@ impl Coordinator {
                             && let Some(src_row) = src_index.get(&k)
                         {
                             matched_keys.insert(k);
-                            dv.insert(phys_idx);
-                            changed = true;
-                            affected += 1;
-                            if !when_matched_delete {
+                            let do_delete = when_matched_delete
+                                && eval_merge_cond(
+                                    when_matched_delete_cond.as_deref(),
+                                    src_row,
+                                    &row,
+                                );
+                            let do_update = !do_delete
+                                && (!when_matched_updates.is_empty() || !when_matched_delete)
+                                && eval_merge_cond(
+                                    when_matched_update_cond.as_deref(),
+                                    src_row,
+                                    &row,
+                                );
+                            if do_delete {
+                                dv.insert(phys_idx);
+                                changed = true;
+                                affected += 1;
+                            } else if do_update {
+                                dv.insert(phys_idx);
+                                changed = true;
+                                affected += 1;
                                 if when_matched_updates.is_empty() {
                                     for f in &tgt_meta.schema {
                                         if let Some(sv) = src_row.get(&f.name) {
@@ -1871,7 +1938,13 @@ impl Coordinator {
 
                 if when_not_matched_insert {
                     for (k, src_row) in src_index {
-                        if !matched_keys.contains(&k) {
+                        if !matched_keys.contains(&k)
+                            && eval_merge_cond(
+                                when_not_matched_insert_cond.as_deref(),
+                                &src_row,
+                                &BTreeMap::new(),
+                            )
+                        {
                             let mut ins_row = BTreeMap::new();
                             for f in &tgt_meta.schema {
                                 ins_row.insert(
@@ -3953,6 +4026,73 @@ fn try_decorrelate_exists(outer_prefix: &str, sub_sql: &str) -> Option<(String, 
     Some((outer_col, rebuilt))
 }
 
+fn eval_merge_cond(
+    cond: Option<&(String, String, String)>,
+    src_row: &BTreeMap<String, ScalarValue>,
+    tgt_row: &BTreeMap<String, ScalarValue>,
+) -> bool {
+    let Some((col, op, lit)) = cond else {
+        return true;
+    };
+    let val = src_row.get(col).or_else(|| tgt_row.get(col));
+    let Some(sv) = val else {
+        return false;
+    };
+    if let (Some(a), Ok(b)) = (sv.as_f64(), lit.parse::<f64>()) {
+        return match op.as_str() {
+            "=" => (a - b).abs() < 1e-9,
+            "!=" | "<>" => (a - b).abs() >= 1e-9,
+            ">" => a > b,
+            ">=" => a >= b,
+            "<" => a < b,
+            "<=" => a <= b,
+            _ => false,
+        };
+    }
+    let s = sv.to_pg_text().unwrap_or_default();
+    match op.as_str() {
+        "=" => s == *lit,
+        "!=" | "<>" => s != *lit,
+        ">" => s.as_str() > lit.as_str(),
+        ">=" => s.as_str() >= lit.as_str(),
+        "<" => s.as_str() < lit.as_str(),
+        "<=" => s.as_str() <= lit.as_str(),
+        _ => false,
+    }
+}
+
+fn replace_table_word(sql: &str, from_word: &str, to_word: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            in_single = !in_single;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        if !in_single && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let tok = &sql[start..i];
+            let prev_is_dot = start > 0 && bytes[start - 1] == b'.';
+            if !prev_is_dot && tok.eq_ignore_ascii_case(from_word) {
+                out.push_str(to_word);
+            } else {
+                out.push_str(tok);
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn extract_primary_from_table(sql: &str) -> Option<String> {
     let upper = sql.to_uppercase();
     let pos = upper.find(" FROM ")?;
@@ -4131,6 +4271,249 @@ impl Coordinator {
             batch: RowBatch::new(out_cols, out_rows),
             stats: base_res.stats,
         }))
+    }
+
+    /// Wave 37: Fixed-point `WITH RECURSIVE <cte> [(cols)] AS (<anchor> UNION [ALL] <recursive>) <outer>`
+    /// evaluator supporting org hierarchies, bill-of-materials, graph reachability, and series generation.
+    async fn try_execute_recursive_cte(
+        &self,
+        sql: &str,
+        branch: &str,
+        session: &SessionContext,
+    ) -> Result<Option<QueryExecutionResult>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let after_kw = trimmed["WITH RECURSIVE ".len()..].trim();
+        let upper = after_kw.to_uppercase();
+        let Some(as_pos) = upper.find(" AS ") else {
+            return Ok(None);
+        };
+        let header = after_kw[..as_pos].trim();
+        let (cte_name, explicit_cols): (String, Vec<String>) = if let Some(lp) = header.find('(') {
+            let rp = header.rfind(')').unwrap_or(header.len());
+            let name = header[..lp].trim().trim_matches('"').to_string();
+            let cols = header[lp + 1..rp]
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            (name, cols)
+        } else {
+            (header.trim_matches('"').to_string(), Vec::new())
+        };
+
+        let after_as = after_kw[as_pos + 4..].trim();
+        if !after_as.starts_with('(') {
+            return Ok(None);
+        }
+        let mut depth = 0i32;
+        let mut close_idx = None;
+        for (i, ch) in after_as.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end_paren) = close_idx else {
+            return Ok(None);
+        };
+        let cte_body = after_as[1..end_paren].trim();
+        let outer_sql = after_as[end_paren + 1..].trim();
+        if outer_sql.is_empty() {
+            return Ok(None);
+        }
+
+        // Split `cte_body` at top-level `UNION ALL` or `UNION`.
+        let body_upper = cte_body.to_uppercase();
+        let mut d = 0i32;
+        let mut split_info: Option<(usize, usize, bool)> = None;
+        let bbytes = body_upper.as_bytes();
+        for i in 0..bbytes.len() {
+            match bbytes[i] {
+                b'(' => d += 1,
+                b')' => d -= 1,
+                _ if d == 0 && body_upper[i..].starts_with(" UNION ALL ") => {
+                    split_info = Some((i, " UNION ALL ".len(), false));
+                    break;
+                }
+                _ if d == 0 && body_upper[i..].starts_with(" UNION ") => {
+                    split_info = Some((i, " UNION ".len(), true));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some((u_pos, u_len, is_distinct)) = split_info else {
+            return Ok(None);
+        };
+        let anchor_sql = cte_body[..u_pos].trim();
+        let recursive_sql = cte_body[u_pos + u_len..].trim();
+
+        // 1. Evaluate anchor term.
+        let anchor_res =
+            Box::pin(self.execute_sql_with_session(anchor_sql, branch, session)).await?;
+        let col_names: Vec<String> = if !explicit_cols.is_empty() {
+            explicit_cols
+        } else {
+            anchor_res.batch.columns.clone()
+        };
+        if col_names.is_empty() {
+            return Ok(Some(anchor_res));
+        }
+
+        let normalize_rows = |batch: &RowBatch| -> Vec<BTreeMap<String, ScalarValue>> {
+            batch
+                .rows
+                .iter()
+                .map(|r| {
+                    let mut out = BTreeMap::new();
+                    for (idx, dst_col) in col_names.iter().enumerate() {
+                        let val = r
+                            .get(dst_col)
+                            .or_else(|| batch.columns.get(idx).and_then(|src| r.get(src)))
+                            .cloned()
+                            .unwrap_or(ScalarValue::Null);
+                        out.insert(dst_col.clone(), val);
+                    }
+                    out
+                })
+                .collect()
+        };
+
+        let mut all_rows = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut working_rows = Vec::new();
+        for r in normalize_rows(&anchor_res.batch) {
+            if is_distinct {
+                let key = serde_json::to_string(&r).unwrap_or_default();
+                if !seen.insert(key) {
+                    continue;
+                }
+            }
+            all_rows.push(r.clone());
+            working_rows.push(r);
+        }
+
+        let schema: Vec<FieldSchema> = col_names
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let dt = match all_rows.first().and_then(|r| r.get(c)) {
+                    Some(ScalarValue::Int64(_)) => ColumnType::Int64,
+                    Some(ScalarValue::Float64(_)) => ColumnType::Float64,
+                    Some(ScalarValue::Bool(_)) => ColumnType::Bool,
+                    Some(ScalarValue::Json(_)) => ColumnType::Variant,
+                    _ => ColumnType::Utf8,
+                };
+                FieldSchema {
+                    field_id: (i + 1) as i32,
+                    name: c.clone(),
+                    data_type: dt,
+                    nullable: true,
+                }
+            })
+            .collect();
+
+        // 2. Fixed-point iteration (with 256-iteration cycle guard).
+        let run_id = Uuid::new_v4().simple().to_string();
+        let work_tbl = format!("_rec_w_{}", &run_id[..8]);
+        let out_tbl = format!("_rec_o_{}", &run_id[..8]);
+        let rec_rewritten = replace_table_word(recursive_sql, &cte_name, &work_tbl);
+
+        for _iter in 0..256 {
+            if working_rows.is_empty() {
+                break;
+            }
+            self.materialize_temp_table(&work_tbl, &schema, &col_names, &working_rows, branch)
+                .await?;
+            let step_res =
+                Box::pin(self.execute_sql_with_session(&rec_rewritten, branch, session)).await;
+            let _ = self.catalog.drop_table(&work_tbl).await;
+            let step_batch = step_res?.batch;
+
+            let mut next_working = Vec::new();
+            for r in normalize_rows(&step_batch) {
+                if is_distinct {
+                    let key = serde_json::to_string(&r).unwrap_or_default();
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                }
+                all_rows.push(r.clone());
+                next_working.push(r);
+            }
+            working_rows = next_working;
+        }
+
+        // 3. Materialize converged CTE output and execute outer query against it!
+        self.materialize_temp_table(&out_tbl, &schema, &col_names, &all_rows, branch)
+            .await?;
+        let outer_rewritten = replace_table_word(outer_sql, &cte_name, &out_tbl);
+        let final_res =
+            Box::pin(self.execute_sql_with_session(&outer_rewritten, branch, session)).await;
+        let _ = self.catalog.drop_table(&out_tbl).await;
+        Ok(Some(final_res?))
+    }
+
+    async fn materialize_temp_table(
+        &self,
+        table_name: &str,
+        schema: &[FieldSchema],
+        col_names: &[String],
+        rows: &[BTreeMap<String, ScalarValue>],
+        branch: &str,
+    ) -> Result<()> {
+        let _ = self.catalog.drop_table(table_name).await;
+        self.catalog
+            .create_table(IcebergTableMetadata::new(
+                table_name.to_string(),
+                schema.to_vec(),
+            ))
+            .await?;
+        if !rows.is_empty() {
+            let meta = self.catalog.get_table(table_name).await?;
+            let snap = meta.current_snapshot(branch)?;
+            let coerced_rows: Vec<BTreeMap<String, ScalarValue>> = rows
+                .iter()
+                .map(|r| {
+                    let mut nr = BTreeMap::new();
+                    for f in schema {
+                        let v = r.get(&f.name).cloned().unwrap_or(ScalarValue::Null);
+                        let coerced = match (&f.data_type, v) {
+                            (ColumnType::Int64, ScalarValue::Float64(fv)) => {
+                                ScalarValue::Int64(fv.round() as i64)
+                            }
+                            (ColumnType::Float64, ScalarValue::Int64(iv)) => {
+                                ScalarValue::Float64(iv as f64)
+                            }
+                            (_, other) => other,
+                        };
+                        nr.insert(f.name.clone(), coerced);
+                    }
+                    nr
+                })
+                .collect();
+            let batch = RowBatch::new(col_names.to_vec(), coerced_rows);
+            let path = format!("{table_name}/data/rec-{}.parquet", Uuid::new_v4());
+            let entry = self.store.write_data_file(&path, schema, &batch).await?;
+            self.catalog
+                .commit_table(TableCommitProposal {
+                    table_name: table_name.to_string(),
+                    branch: branch.to_string(),
+                    expected_snapshot_id: snap.snapshot_id,
+                    added_files: vec![entry],
+                    removed_files: vec![],
+                    is_append_only: true,
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Zero-read streaming CDC upsert/delete using Apache Iceberg v3 Equality Delete Parquet files (Wave 31).

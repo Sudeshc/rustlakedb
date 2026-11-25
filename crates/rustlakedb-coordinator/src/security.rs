@@ -148,6 +148,12 @@ pub struct GovernanceState {
     jwt_secret: RwLock<Option<String>>,
     /// Optional OIDC/JWKS RSA public keys for RS256 Bearer token AuthN (Okta/Auth0/Entra/Cognito, Wave 21)
     jwks_keys: RwLock<Vec<JwkRsaKey>>,
+    /// OIDC Discovery metadata for automatic JWKS key rotation & iss/aud enforcement (Wave 36)
+    oidc_issuer: RwLock<Option<String>>,
+    oidc_audience: RwLock<Option<String>>,
+    oidc_jwks_uri: RwLock<Option<String>>,
+    oidc_last_refresh_ms: AtomicU64,
+    oidc_refresh_ttl_ms: AtomicU64,
     /// Registered SQL Scalar UDFs: lowercase_name -> (param_name, body_expr) (Wave 10)
     udfs: RwLock<HashMap<String, (String, String)>>,
     /// Logical schemas created via `CREATE SCHEMA` (Wave 9 dbt compat)
@@ -186,6 +192,11 @@ impl Default for GovernanceState {
                     .filter(|s| !s.is_empty()),
             ),
             jwks_keys: RwLock::new(Vec::new()),
+            oidc_issuer: RwLock::new(None),
+            oidc_audience: RwLock::new(None),
+            oidc_jwks_uri: RwLock::new(None),
+            oidc_last_refresh_ms: AtomicU64::new(0),
+            oidc_refresh_ttl_ms: AtomicU64::new(300_000),
             udfs: RwLock::new(HashMap::new()),
             schemas: RwLock::new(HashSet::from(["public".to_string(), "default".to_string()])),
             trace_spans: RwLock::new(VecDeque::with_capacity(512)),
@@ -487,7 +498,95 @@ impl GovernanceState {
             .text()
             .await
             .map_err(|e| RustLakeError::Execution(format!("read OIDC JWKS body: {e}")))?;
-        self.set_jwks_json(&body)
+        let count = self.set_jwks_json(&body)?;
+        self.oidc_last_refresh_ms
+            .store(epoch_ms(), Ordering::Relaxed);
+        Ok(count)
+    }
+
+    /// Discovers `jwks_uri` and `issuer` from `{issuer_url}/.well-known/openid-configuration`,
+    /// installs the initial RSA keys, and enables automatic JWKS key rotation (Wave 36).
+    pub async fn configure_oidc_discovery(
+        &self,
+        issuer_url: &str,
+        expected_audience: Option<String>,
+    ) -> Result<usize> {
+        let well_known = format!(
+            "{}/.well-known/openid-configuration",
+            issuer_url.trim_end_matches('/')
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| RustLakeError::Execution(format!("OIDC discovery HTTP client: {e}")))?;
+        let resp = client
+            .get(&well_known)
+            .send()
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("fetch '{well_known}': {e}")))?;
+        if !resp.status().is_success() {
+            return Err(RustLakeError::Execution(format!(
+                "OIDC discovery HTTP {}: {well_known}",
+                resp.status()
+            )));
+        }
+        let doc: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("parse OIDC discovery JSON: {e}")))?;
+        let jwks_uri = doc
+            .get("jwks_uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RustLakeError::Execution("OIDC discovery missing 'jwks_uri'".into()))?
+            .to_string();
+        let issuer = doc
+            .get("issuer")
+            .and_then(|v| v.as_str())
+            .unwrap_or(issuer_url)
+            .to_string();
+        let count = self.refresh_jwks_from_url(&jwks_uri).await?;
+        *self.oidc_issuer.write() = Some(issuer);
+        *self.oidc_audience.write() = expected_audience;
+        *self.oidc_jwks_uri.write() = Some(jwks_uri);
+        Ok(count)
+    }
+
+    /// Verifies an OIDC RS256 JWT against cached JWKS keys, validating `iss`/`aud` claims and
+    /// automatically refreshing JWKS from `oidc_jwks_uri` on `kid` rotation or TTL expiry (Wave 36).
+    pub async fn verify_jwt_rs256_auto_rotate(&self, token: &str) -> Result<SessionContext> {
+        let jwks_uri = self.oidc_jwks_uri.read().clone();
+        let ttl = self.oidc_refresh_ttl_ms.load(Ordering::Relaxed);
+        let last = self.oidc_last_refresh_ms.load(Ordering::Relaxed);
+        if let Some(ref uri) = jwks_uri
+            && epoch_ms().saturating_sub(last) > ttl
+        {
+            let _ = self.refresh_jwks_from_url(uri).await;
+        }
+        let expected_iss = self.oidc_issuer.read().clone();
+        let expected_aud = self.oidc_audience.read().clone();
+        let first_attempt = {
+            let keys = self.jwks_keys.read().clone();
+            verify_jwt_rs256_with_keys_and_claims(
+                &keys,
+                token,
+                expected_iss.as_deref(),
+                expected_aud.as_deref(),
+            )
+        };
+        if first_attempt.is_ok() {
+            return first_attempt;
+        }
+        if let Some(uri) = jwks_uri {
+            let _ = self.refresh_jwks_from_url(&uri).await;
+            let keys = self.jwks_keys.read().clone();
+            return verify_jwt_rs256_with_keys_and_claims(
+                &keys,
+                token,
+                expected_iss.as_deref(),
+                expected_aud.as_deref(),
+            );
+        }
+        first_attempt
     }
 
     /// Spawns a background OIDC JWKS auto-refresh poller for zero-downtime key rotation (Wave 22).
@@ -834,6 +933,19 @@ pub fn sign_jwt_rs256_pkcs8(
     role: &str,
     exp_epoch_secs: u64,
 ) -> Result<(String, serde_json::Value)> {
+    sign_jwt_rs256_pkcs8_with_claims(pkcs8_der, kid, user, role, exp_epoch_secs, None, None)
+}
+
+/// Signs an RFC 7519 **RS256** JWT with optional OIDC `iss` & `aud` claims (Wave 36).
+pub fn sign_jwt_rs256_pkcs8_with_claims(
+    pkcs8_der: &[u8],
+    kid: &str,
+    user: &str,
+    role: &str,
+    exp_epoch_secs: u64,
+    iss: Option<&str>,
+    aud: Option<&str>,
+) -> Result<(String, serde_json::Value)> {
     let key_pair = RsaKeyPair::from_pkcs8(pkcs8_der)
         .map_err(|e| RustLakeError::Execution(format!("parse RSA PKCS8 key: {e}")))?;
     let (n_bytes, e_bytes) = parse_der_rsa_public_key(key_pair.public_key().as_ref())?;
@@ -855,12 +967,18 @@ pub fn sign_jwt_rs256_pkcs8(
             .to_string()
             .as_bytes(),
     );
-    let claims = serde_json::json!({
+    let mut claims = serde_json::json!({
         "sub": user,
         "role": role,
         "iat": epoch_ms() / 1000,
         "exp": exp_epoch_secs
     });
+    if let Some(i) = iss {
+        claims["iss"] = serde_json::Value::String(i.to_string());
+    }
+    if let Some(a) = aud {
+        claims["aud"] = serde_json::Value::String(a.to_string());
+    }
     let payload = B64URL.encode(claims.to_string().as_bytes());
     let signing_input = format!("{header}.{payload}");
     let rng = SystemRandom::new();
@@ -874,6 +992,16 @@ pub fn sign_jwt_rs256_pkcs8(
 
 /// Cryptographically verifies an OIDC **RS256** JWT against RFC 7517 JWKS RSA keys using `ring` (Wave 21).
 pub fn verify_jwt_rs256_with_keys(keys: &[JwkRsaKey], token: &str) -> Result<SessionContext> {
+    verify_jwt_rs256_with_keys_and_claims(keys, token, None, None)
+}
+
+/// Verifies an OIDC **RS256** JWT with optional `iss` and `aud` claim checks (Wave 36).
+pub fn verify_jwt_rs256_with_keys_and_claims(
+    keys: &[JwkRsaKey],
+    token: &str,
+    expected_iss: Option<&str>,
+    expected_aud: Option<&str>,
+) -> Result<SessionContext> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(RustLakeError::Execution("invalid JWT format".into()));
@@ -928,6 +1056,33 @@ pub fn verify_jwt_rs256_with_keys(keys: &[JwkRsaKey], token: &str) -> Result<Ses
         && now_secs > exp
     {
         return Err(RustLakeError::Execution("OIDC JWT token has expired".into()));
+    }
+    if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_u64())
+        && now_secs < nbf
+    {
+        return Err(RustLakeError::Execution("OIDC JWT token not yet valid (nbf)".into()));
+    }
+    if let Some(want_iss) = expected_iss {
+        let got_iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+        if got_iss != want_iss {
+            return Err(RustLakeError::Execution(format!(
+                "OIDC JWT issuer mismatch: expected '{want_iss}', got '{got_iss}'"
+            )));
+        }
+    }
+    if let Some(want_aud) = expected_aud {
+        let aud_ok = match claims.get("aud") {
+            Some(serde_json::Value::String(s)) => s == want_aud,
+            Some(serde_json::Value::Array(arr)) => {
+                arr.iter().any(|v| v.as_str() == Some(want_aud))
+            }
+            _ => false,
+        };
+        if !aud_ok {
+            return Err(RustLakeError::Execution(format!(
+                "OIDC JWT audience mismatch: expected '{want_aud}'"
+            )));
+        }
     }
 
     let user = claims["sub"]

@@ -1,0 +1,98 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rustlakeclusters.lakehouse.rustlakedb.io
+spec:
+  group: lakehouse.rustlakedb.io
+  names:
+    kind: RustLakeCluster
+    listKind: RustLakeClusterList
+    plural: rustlakeclusters
+    singular: rustlakecluster
+    shortNames:
+      - rlc
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Coordinators
+          type: integer
+          jsonPath: .status.readyCoordinators
+        - name: Workers
+          type: integer
+          jsonPath: .status.readyWorkers
+        - name: DesiredWorkers
+          type: integer
+          jsonPath: .status.desiredWorkers
+        - name: Image
+          type: string
+          jsonPath: .spec.image
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - image
+                - workers
+              properties:
+                image:
+                  type: string
+                coordinators:
+                  type: integer
+                  minimum: 1
+                  default: 3
+                enableRaftHa:
+                  type: boolean
+                  default: true
+                warehouseUri:
+                  type: string
+                  default: s3://warehouse
+                coordinatorServiceUrl:
+                  type: string
+                workers:
+                  type: object
+                  required:
+                    - minReplicas
+                    - maxReplicas
+                  properties:
+                    minReplicas:
+                      type: integer
+                      minimum: 1
+                    maxReplicas:
+                      type: integer
+                      minimum: 1
+                    targetQueriesPerWorker:
+                      type: integer
+                      default: 4
+                    scaleDownCooldownSecs:
+                      type: integer
+                      default: 120
+                    nvmeSpillGi:
+                      type: integer
+                      default: 100
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                readyCoordinators:
+                  type: integer
+                readyWorkers:
+                  type: integer
+                desiredWorkers:
+                  type: integer
+                currentLeader:
+                  type: string
+                lastScaleEpochSecs:
+                  type: integer
+                message:
+                  type: string

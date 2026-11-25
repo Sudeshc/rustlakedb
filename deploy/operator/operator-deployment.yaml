@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rustlakedb-operator
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rustlakedb-operator
+rules:
+  - apiGroups: ["lakehouse.rustlakedb.io"]
+    resources: ["rustlakeclusters", "rustlakeclusters/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rustlakedb-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rustlakedb-operator
+subjects:
+  - kind: ServiceAccount
+    name: rustlakedb-operator
+    namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustlakedb-operator
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rustlakedb-operator
+  template:
+    metadata:
+      labels:
+        app: rustlakedb-operator
+    spec:
+      serviceAccountName: rustlakedb-operator
+      containers:
+        - name: operator
+          image: ghcr.io/sudeshc/rustlakedb:9.0.0
+          args: ["--mode", "operator"]
+---
+apiVersion: lakehouse.rustlakedb.io/v1alpha1
+kind: RustLakeCluster
+metadata:
+  name: prod-lakehouse
+  namespace: default
+spec:
+  image: ghcr.io/sudeshc/rustlakedb:9.0.0
+  coordinators: 3
+  enableRaftHa: true
+  warehouseUri: s3://warehouse
+  workers:
+    minReplicas: 3
+    maxReplicas: 24
+    targetQueriesPerWorker: 4
+    scaleDownCooldownSecs: 120
+    nvmeSpillGi: 200

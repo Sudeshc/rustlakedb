@@ -29,4 +29,5 @@ tokio-rustls.workspace = true
 tower.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+xxhash-rust.workspace = true
 zstd.workspace = true

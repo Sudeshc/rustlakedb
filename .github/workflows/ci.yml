@@ -11,7 +11,7 @@ env:
 
 jobs:
   lint-and-test:
-    name: Clippy, Security & Full Regression Suite (Waves 1-33, TPC-H 22/22 & Chaos)
+    name: Clippy, Security & Full Regression Suite (Waves 1-38, TPC-H 22/22 & Chaos)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -45,5 +45,5 @@ jobs:
     needs: lint-and-test
     steps:
       - uses: actions/checkout@v7
-      - name: Build RustLakeDB v8.0.0 Docker Image
-        run: docker build -t rustlakedb:8.0.0 .
+      - name: Build RustLakeDB v9.0.0 Docker Image
+        run: docker build -t rustlakedb:9.0.0 .

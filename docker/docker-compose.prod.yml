@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Sudeshc
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Turnkey RustLakeDB v7.0.0 Production Lakehouse Stack (100% Rust Storage + Compute!):
+# Turnkey RustLakeDB v9.0.0 Production Lakehouse Stack (100% Rust Storage + Compute!):
 #   - RustFS S3-Compatible Object Store (`s3://warehouse`, API :19000, Console :19001)
 #   - 2 Distributed RustLakeDB Workers + Coordinator (PGWire :25432, Iceberg REST & UI :28181, Arrow Flight SQL :28815)
 #   - Prometheus scraping /metrics with preloaded alert rules (:19090)
@@ -51,7 +51,7 @@ services:
         PY
 
   worker-1:
-    image: rustlakedb:8.0.0
+    image: rustlakedb:9.0.0
     container_name: rustlakedb-prod-worker-1
     depends_on:
       s3-init:
@@ -87,7 +87,7 @@ services:
       retries: 15
 
   worker-2:
-    image: rustlakedb:8.0.0
+    image: rustlakedb:9.0.0
     container_name: rustlakedb-prod-worker-2
     depends_on:
       s3-init:
@@ -123,7 +123,7 @@ services:
       retries: 15
 
   coordinator:
-    image: rustlakedb:8.0.0
+    image: rustlakedb:9.0.0
     container_name: rustlakedb-prod-coordinator
     depends_on:
       worker-1:

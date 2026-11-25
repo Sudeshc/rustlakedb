@@ -227,7 +227,11 @@ async fn handle_pg_stream<S: AsyncRead + AsyncWrite + Unpin>(
     // 2. Send AuthenticationOk, full pgjdbc/DBeaver ParameterStatus set, BackendKeyData, ReadyForQuery.
     let mut handshake = BytesMut::new();
     write_auth_ok(&mut handshake);
-    write_param_status(&mut handshake, "server_version", "16.0 (RustLakeDB 2.0.0)");
+    write_param_status(
+        &mut handshake,
+        "server_version",
+        &format!("16.0 (RustLakeDB {})", env!("CARGO_PKG_VERSION")),
+    );
     write_param_status(&mut handshake, "server_version_num", "160000");
     write_param_status(&mut handshake, "server_encoding", "UTF8");
     write_param_status(&mut handshake, "client_encoding", "UTF8");

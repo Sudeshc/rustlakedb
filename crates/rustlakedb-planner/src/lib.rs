@@ -149,12 +149,20 @@ pub enum PlannedCommand {
     MergeInto {
         target_table: String,
         source_table: String,
+        /// Optional subquery `USING (SELECT ...) AS s` (Wave 37).
+        source_subquery: Option<String>,
         target_key: String,
         source_key: String,
         when_matched_delete: bool,
+        /// Optional predicate `(col, op, literal)` for `WHEN MATCHED AND <pred> THEN DELETE` (Wave 37).
+        when_matched_delete_cond: Option<Box<(String, String, String)>>,
         /// Vec of (target_col, source_col) assignments when matched.
         when_matched_updates: Vec<(String, String)>,
+        /// Optional predicate `(col, op, literal)` for `WHEN MATCHED AND <pred> THEN UPDATE` (Wave 37).
+        when_matched_update_cond: Option<Box<(String, String, String)>>,
         when_not_matched_insert: bool,
+        /// Optional predicate `(col, op, literal)` for `WHEN NOT MATCHED AND <pred> THEN INSERT` (Wave 37).
+        when_not_matched_insert_cond: Option<Box<(String, String, String)>>,
     },
     Update {
         table_name: String,
@@ -529,8 +537,13 @@ impl DistributedPlanner {
         // Support `SELECT ... FROM <table> AT VERSION <snap_id> ...` Iceberg Time Travel syntax!
         let (normalized_sql, time_travel_version) = extract_time_travel_clause(&sql_no_part)?;
 
+        let parse_sql_str = if upper.starts_with("CREATE TABLE ") && normalized_sql.contains('<') {
+            normalize_angle_bracket_ddl_types(&normalized_sql)
+        } else {
+            normalized_sql
+        };
         let dialect = PostgreSqlDialect {};
-        let stmts = Parser::parse_sql(&dialect, &normalized_sql)
+        let stmts = Parser::parse_sql(&dialect, &parse_sql_str)
             .map_err(|e| RustLakeError::SqlParse(e.to_string()))?;
         let stmt = stmts
             .into_iter()
@@ -2496,13 +2509,20 @@ fn parse_col_expr(expr: &Expr, alias: Option<String>) -> Result<ColumnExpr> {
                 "NOW" | "CURRENT_TIMESTAMP" => Ok(ColumnExpr::Now {
                     alias: alias.unwrap_or_else(|| "now".into()),
                 }),
-                "LOWER" | "UPPER" | "LENGTH" | "TRIM" | "CONCAT" | "SUBSTRING" | "SUBSTR" => {
+                "LOWER" | "UPPER" | "LENGTH" | "TRIM" | "CONCAT" | "SUBSTRING" | "SUBSTR"
+                | "ARRAY_LENGTH" | "CARDINALITY" | "ARRAY_CONTAINS" | "MAP_KEYS" | "MAP_VALUES"
+                | "ELEMENT_AT" => {
                     let sf = match name.as_str() {
                         "LOWER" => StringFunc::Lower,
                         "UPPER" => StringFunc::Upper,
                         "LENGTH" => StringFunc::Length,
                         "TRIM" => StringFunc::Trim,
                         "CONCAT" => StringFunc::Concat,
+                        "ARRAY_LENGTH" | "CARDINALITY" => StringFunc::ArrayLength,
+                        "ARRAY_CONTAINS" => StringFunc::ArrayContains,
+                        "MAP_KEYS" => StringFunc::MapKeys,
+                        "MAP_VALUES" => StringFunc::MapValues,
+                        "ELEMENT_AT" => StringFunc::ElementAt,
                         _ => StringFunc::Substring,
                     };
                     let mut parsed_args = Vec::with_capacity(args.len());
@@ -2678,8 +2698,15 @@ fn map_sql_data_type(dt: &SqlDataType) -> Result<ColumnType> {
         | SqlDataType::String(_) => Ok(ColumnType::Utf8),
         SqlDataType::Boolean | SqlDataType::Bool => Ok(ColumnType::Bool),
         SqlDataType::Timestamp(_, _) | SqlDataType::Datetime(_) => Ok(ColumnType::TimestampTz),
-        SqlDataType::JSON | SqlDataType::JSONB => Ok(ColumnType::Variant),
-        SqlDataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("VARIANT") => {
+        SqlDataType::JSON | SqlDataType::JSONB | SqlDataType::Array(_) | SqlDataType::Struct(_, _) => {
+            Ok(ColumnType::Variant)
+        }
+        SqlDataType::Custom(name, _)
+            if matches!(
+                name.to_string().to_uppercase().as_str(),
+                "VARIANT" | "ARRAY" | "MAP" | "STRUCT"
+            ) =>
+        {
             Ok(ColumnType::Variant)
         }
         other => Err(RustLakeError::Plan(format!(
@@ -2727,6 +2754,40 @@ fn extract_join_keys(expr: &Expr) -> Result<(String, String)> {
 fn parse_scalar(expr: &Expr) -> Result<ScalarValue> {
     match expr {
         Expr::Nested(inner) => parse_scalar(inner),
+        Expr::Array(arr) => {
+            let mut elems = Vec::with_capacity(arr.elem.len());
+            for e in &arr.elem {
+                let sv = parse_scalar(e)?;
+                elems.push(scalar_to_json_val(&sv));
+            }
+            Ok(ScalarValue::Json(serde_json::Value::Array(elems)))
+        }
+        Expr::Function(func)
+            if matches!(
+                func.name.to_string().to_uppercase().as_str(),
+                "MAP" | "STRUCT" | "JSON_BUILD_OBJECT"
+            ) =>
+        {
+            let args = match &func.args {
+                FunctionArguments::List(list) => list.args.as_slice(),
+                _ => &[],
+            };
+            let mut map = serde_json::Map::new();
+            let mut i = 0;
+            while i + 1 < args.len() {
+                if let (
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ke)),
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ve)),
+                ) = (&args[i], &args[i + 1])
+                {
+                    let k = parse_scalar(ke)?.to_pg_text().unwrap_or_default();
+                    let v = scalar_to_json_val(&parse_scalar(ve)?);
+                    map.insert(k, v);
+                }
+                i += 2;
+            }
+            Ok(ScalarValue::Json(serde_json::Value::Object(map)))
+        }
         Expr::TypedString { value, .. } => Ok(ScalarValue::Utf8(value.clone())),
         Expr::Value(v) => match v {
             Value::Number(n, _) => {
@@ -3792,32 +3853,131 @@ fn parse_copy_from(sql: &str) -> Result<PlannedCommand> {
     })
 }
 
+fn normalize_angle_bracket_ddl_types(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let upper = sql.to_uppercase();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let matched_kw = ["STRUCT<", "MAP<", "ARRAY<"]
+            .iter()
+            .find(|kw| upper[i..].starts_with(*kw));
+        if let Some(kw) = matched_kw {
+            let mut j = i + kw.len() - 1;
+            let mut depth = 0i32;
+            while j < bytes.len() {
+                if bytes[j] == b'<' {
+                    depth += 1;
+                } else if bytes[j] == b'>' {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            out.push_str("JSONB");
+            i = j;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn parse_merge_cond(cond_str: &str) -> Option<(String, String, String)> {
+    let trimmed = cond_str.trim();
+    for op in ["!=", "<>", ">=", "<=", "=", ">", "<"] {
+        if let Some(pos) = trimmed.find(op) {
+            let lhs = trimmed[..pos]
+                .trim()
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            let rhs = trimmed[pos + op.len()..]
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_string();
+            if !lhs.is_empty() {
+                return Some((lhs, op.to_string(), rhs));
+            }
+        }
+    }
+    None
+}
+
+fn scalar_to_json_val(sv: &ScalarValue) -> serde_json::Value {
+    match sv {
+        ScalarValue::Null => serde_json::Value::Null,
+        ScalarValue::Bool(b) => serde_json::Value::Bool(*b),
+        ScalarValue::Int64(i) => serde_json::Value::from(*i),
+        ScalarValue::Float64(f) => serde_json::Value::from(*f),
+        ScalarValue::Utf8(s) => serde_json::Value::String(s.clone()),
+        ScalarValue::Json(v) => v.clone(),
+        other => serde_json::Value::String(other.to_display_string()),
+    }
+}
+
 fn parse_merge_into(sql: &str) -> Result<PlannedCommand> {
-    // Syntax:
-    // MERGE INTO <target> [AS t] USING <source> [AS s] ON t.<tk> = s.<sk>
-    //   [WHEN MATCHED THEN UPDATE SET col1 = s.col1, ... | WHEN MATCHED THEN DELETE]
-    //   [WHEN NOT MATCHED THEN INSERT ...]
+    // Syntax (Wave 37 full multi-clause conditional MERGE INTO):
+    // MERGE INTO <target> [AS t] USING (<subquery> | <source>) [AS s] ON t.<tk> = s.<sk>
+    //   [WHEN MATCHED [AND <cond>] THEN DELETE]
+    //   [WHEN MATCHED [AND <cond>] THEN UPDATE SET col1 = s.col1, ...]
+    //   [WHEN NOT MATCHED [AND <cond>] THEN INSERT ...]
     let upper = sql.to_uppercase();
     let using_pos = upper
         .find(" USING ")
         .ok_or_else(|| RustLakeError::SqlParse("MERGE INTO requires USING <source>".into()))?;
-    let on_pos = upper
-        .find(" ON ")
-        .ok_or_else(|| RustLakeError::SqlParse("MERGE INTO requires ON <cond>".into()))?;
     let when_pos = upper
         .find(" WHEN ")
         .ok_or_else(|| RustLakeError::SqlParse("MERGE INTO requires WHEN clause".into()))?;
+
+    // Find the top-level ` ON ` after USING (skipping any `ON` inside a parenthesized USING subquery).
+    let after_using = &sql[using_pos + " USING ".len()..when_pos];
+    let after_using_upper = after_using.to_uppercase();
+    let mut depth = 0i32;
+    let mut on_rel = None;
+    let bytes = after_using_upper.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 && after_using_upper[i..].starts_with(" ON ") => {
+                on_rel = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let on_pos = using_pos
+        + " USING ".len()
+        + on_rel.ok_or_else(|| RustLakeError::SqlParse("MERGE INTO requires ON <cond>".into()))?;
 
     let target_raw = sql["MERGE INTO ".len()..using_pos]
         .split_whitespace()
         .next()
         .unwrap_or("");
-    let source_raw = sql[using_pos + " USING ".len()..on_pos]
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
     let target_table = normalize_table_name(target_raw);
-    let source_table = normalize_table_name(source_raw);
+
+    let source_section = sql[using_pos + " USING ".len()..on_pos].trim();
+    let (source_table, source_subquery) = if source_section.starts_with('(') {
+        let close_paren = source_section
+            .rfind(')')
+            .ok_or_else(|| RustLakeError::SqlParse("unclosed USING subquery in MERGE INTO".into()))?;
+        (
+            String::new(),
+            Some(source_section[1..close_paren].trim().to_string()),
+        )
+    } else {
+        let source_raw = source_section.split_whitespace().next().unwrap_or("");
+        (normalize_table_name(source_raw), None)
+    };
 
     let on_clause = sql[on_pos + 4..when_pos].trim();
     let eq_parts: Vec<&str> = on_clause.split('=').collect();
@@ -3843,39 +4003,84 @@ fn parse_merge_into(sql: &str) -> Result<PlannedCommand> {
         .trim_matches('"')
         .to_string();
 
+    // Split all `WHEN ...` clauses cleanly (supporting simultaneous DELETE + UPDATE + INSERT!).
     let when_tail = &sql[when_pos..];
     let when_upper = when_tail.to_uppercase();
-    let when_matched_delete = when_upper.contains("WHEN MATCHED THEN DELETE");
-    let when_not_matched_insert = when_upper.contains("WHEN NOT MATCHED THEN INSERT");
+    let mut clause_starts = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = when_upper[search_from..].find(" WHEN ") {
+        let abs = search_from + rel;
+        clause_starts.push(abs);
+        search_from = abs + 6;
+    }
+    if clause_starts.is_empty() && when_upper.trim_start().starts_with("WHEN ") {
+        clause_starts.push(0);
+    }
 
+    let mut when_matched_delete = false;
+    let mut when_matched_delete_cond = None;
     let mut when_matched_updates = Vec::new();
-    if let Some(set_pos) = when_upper.find("WHEN MATCHED THEN UPDATE SET ") {
-        let after_set = &when_tail[set_pos + "WHEN MATCHED THEN UPDATE SET ".len()..];
-        let end = after_set
-            .to_uppercase()
-            .find(" WHEN ")
-            .unwrap_or(after_set.len());
-        let assigns_str = after_set[..end].trim();
-        for pair in assigns_str.split(',') {
-            let kv: Vec<&str> = pair.split('=').collect();
-            if kv.len() == 2 {
-                let lhs = kv[0]
-                    .trim()
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .trim_matches('"')
-                    .to_string();
-                let rhs = kv[1]
-                    .trim()
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .trim_matches('"')
-                    .to_string();
-                when_matched_updates.push((lhs, rhs));
+    let mut when_matched_update_cond = None;
+    let mut when_not_matched_insert = false;
+    let mut when_not_matched_insert_cond = None;
+
+    for idx in 0..clause_starts.len() {
+        let start = clause_starts[idx];
+        let end = clause_starts.get(idx + 1).copied().unwrap_or(when_tail.len());
+        let clause = when_tail[start..end].trim();
+        let cu = clause.to_uppercase();
+
+        if cu.starts_with("WHEN NOT MATCHED") {
+            if let Some(then_pos) = cu.find(" THEN ") {
+                let header = &clause["WHEN NOT MATCHED".len()..then_pos].trim();
+                let cond = header
+                    .strip_prefix("AND ")
+                    .or_else(|| header.strip_prefix("and "))
+                    .and_then(parse_merge_cond);
+                let action_u = cu[then_pos + 6..].trim();
+                if action_u.starts_with("INSERT") {
+                    when_not_matched_insert = true;
+                    when_not_matched_insert_cond = cond;
+                }
+            }
+        } else if cu.starts_with("WHEN MATCHED")
+            && let Some(then_pos) = cu.find(" THEN ")
+        {
+            let header = clause["WHEN MATCHED".len()..then_pos].trim();
+            let cond = header
+                .strip_prefix("AND ")
+                .or_else(|| header.strip_prefix("and "))
+                .and_then(parse_merge_cond);
+            let action = clause[then_pos + 6..].trim();
+            let action_u = action.to_uppercase();
+            if action_u.starts_with("DELETE") {
+                when_matched_delete = true;
+                when_matched_delete_cond = cond;
+            } else if let Some(set_rel) = action_u.find("UPDATE SET ") {
+                when_matched_update_cond = cond;
+                let assigns_str = action[set_rel + "UPDATE SET ".len()..].trim();
+                for pair in assigns_str.split(',') {
+                    let kv: Vec<&str> = pair.split('=').collect();
+                    if kv.len() == 2 {
+                        let lhs = kv[0]
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches('"')
+                            .to_string();
+                        let rhs = kv[1]
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches('"')
+                            .to_string();
+                        when_matched_updates.push((lhs, rhs));
+                    }
+                }
             }
         }
     }
@@ -3883,11 +4088,15 @@ fn parse_merge_into(sql: &str) -> Result<PlannedCommand> {
     Ok(PlannedCommand::MergeInto {
         target_table,
         source_table,
+        source_subquery,
         target_key,
         source_key,
         when_matched_delete,
+        when_matched_delete_cond: when_matched_delete_cond.map(Box::new),
         when_matched_updates,
+        when_matched_update_cond: when_matched_update_cond.map(Box::new),
         when_not_matched_insert,
+        when_not_matched_insert_cond: when_not_matched_insert_cond.map(Box::new),
     })
 }
 

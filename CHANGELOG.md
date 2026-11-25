@@ -2,6 +2,31 @@
 
 All notable changes to **RustLakeDB** are documented in this file.
 
+## [9.0.0] - 2026-11-25 — Next-Frontier Cloud-Native Lakehouse Release: Out-of-Core NVMe Arrow Spill, Native PostgreSQL `pgoutput` WAL & Kafka Equality-Delete CDC, OIDC Discovery/JWKS Auto-Rotation, Iceberg REST Vended Credentials, `WITH RECURSIVE`, Multi-Clause `MERGE INTO`, Complex Types & Rust Kubernetes Operator (Waves 34–38)
+
+### Wave 38 — Rust Kubernetes Operator (`rustlakedb-operator`) & `RustLakeCluster` CRD
+- **Declarative K8s Operator:** Added pure-Rust `crates/rustlakedb-operator` (`RustLakeCluster` `lakehouse.rustlakedb.io/v1alpha1`) with queue-depth & active-query driven Worker autoscaling (with cooldown protection), zero-downtime Raft rolling upgrade orchestration (Workers → Follower Coordinators → Raft Leader step-down last), live Kubernetes API client (`KubeOperatorClient`), and production CRD/RBAC manifests ([deploy/operator/crd-rustlakecluster.yaml](deploy/operator/crd-rustlakecluster.yaml), [deploy/operator/operator-deployment.yaml](deploy/operator/operator-deployment.yaml)).
+
+### Wave 37 — SQL Completeness (`WITH RECURSIVE`, Persistent Views, Multi-Clause Conditional `MERGE INTO`, Complex `ARRAY`/`MAP`/`STRUCT` Types)
+- **`WITH RECURSIVE` CTEs:** Fixed-point iterative evaluator with cycle guard supporting hierarchies, graphs, and `FROM`-less constant series anchors (`SELECT 1 AS n UNION ALL ...`).
+- **Multi-Clause Conditional `MERGE INTO`:** Added `USING (SELECT ...)` subquery sources and simultaneous `WHEN MATCHED AND <cond> THEN DELETE` + `WHEN MATCHED AND <cond> THEN UPDATE SET ...` + `WHEN NOT MATCHED AND <cond> THEN INSERT` in a single atomic Iceberg v3 snapshot.
+- **Complex Nested Types & Functions:** Added `TEXT[]` / `ARRAY<T>` / `MAP<K,V>` / `STRUCT<...>` DDL, `ARRAY[...]` / `MAP(...)` / `STRUCT(...)` constructors, and `ARRAY_LENGTH`, `ARRAY_CONTAINS`, `MAP_KEYS`, `MAP_VALUES`, `ELEMENT_AT`, plus `SHOW VIEWS`.
+
+### Wave 36 — OIDC Discovery + Auto-Rotating JWKS Cache & Standard Iceberg REST `X-Iceberg-Access-Delegation: vended-credentials`
+- **Live OIDC Discovery & Key Rotation:** Added `GovernanceState::configure_oidc_discovery` (`/.well-known/openid-configuration` → `jwks_uri`), `iss`/`aud`/`nbf` claim enforcement, and automatic zero-downtime JWKS refresh on IdP `kid` rotation.
+- **Standard Iceberg REST Vended Credentials:** Upgraded `GET /v1/namespaces/{ns}/tables/{table}` to honor `X-Iceberg-Access-Delegation: vended-credentials`, embedding AWS SigV4 STS `AssumeRole` credentials directly inside `LoadTableResult` (`config.s3.*` + `storage-credentials`).
+
+### Wave 35 — Native PostgreSQL Logical Replication (`pgoutput`) WAL Streamer & Zero-Read Kafka Equality-Delete CDC
+- **PostgreSQL `pgoutput` v1/v2 Binary Decoder & Consumer (`pgoutput.rs`):** Decodes real PostgreSQL `CopyData ('d')` / `XLogData ('w')` WAL frames (`Begin`, `Relation`, `Insert`, `Update`, `Delete`, `Truncate`, `Commit`), commits atomically via zero-read Iceberg v3 Equality Deletes, and checkpoints durable LSN watermarks for exactly-once restart recovery.
+- **Zero-Read Kafka Equality-Delete Poll:** Added `KafkaCdcConsumer::poll_once_equality_deletes` committing Kafka/Redpanda updates and deletes directly as Iceberg v3 Equality Delete Parquet files.
+
+### Wave 34 — Out-of-Core NVMe Arrow Spill for Columnar `Sort` & Grace `HashJoin` + Dynamic PGWire `server_version`
+- **NVMe Arrow Spill Operators (`columnar.rs`):** Added external K-way merge sort (`eval_columnar_sort_with_spill`) and `xxh3_64` Grace Hash Join (`eval_columnar_hash_join_with_spill`) spilling compressed Zstd `ARW1` Arrow IPC partitions to local NVMe under strict worker RAM caps with RAII temp-file cleanup and `arrow_spill_bytes_written` / `arrow_spill_files_created` telemetry.
+- **Dynamic PGWire Handshake Version:** Updated `server_version` parameter in `rustlakedb-gateway` to report `16.0 (RustLakeDB <CARGO_PKG_VERSION>)`.
+
+### Real-World Lakehouse Verification Report
+- Added comprehensive multi-source, small-to-extreme volume live cluster test report ([docs/REAL_WORLD_LAKEHOUSE_TEST_REPORT.md](docs/REAL_WORLD_LAKEHOUSE_TEST_REPORT.md)).
+
 ## [8.0.0] - 2026-11-25 — GA Hyperscale Enterprise Release: Raft-Replicated Governance, End-to-End Arrow Shuffle, Partition OCC, Iceberg v3 Equality Deletes, Window Frames/`QUALIFY`/`UNNEST`, Binary PGWire Bind, SPDX SBOM & OCI Helm (Waves 29–33)
 
 ### Wave 33 — Supply-Chain Security (SPDX 2.3 SBOM), OCI Helm Chart, Zero-Warning Node 24 CI & Benchmark Harness

@@ -155,6 +155,105 @@ impl KafkaCdcConsumer {
         })
     }
 
+    /// Wave 35: Zero-read Kafka/Redpanda CDC poll writing Iceberg v3 Equality Delete Parquet files
+    /// directly via `Coordinator::ingest_cdc_equality_deletes` (no prior table read required!).
+    pub async fn poll_once_equality_deletes(&self, key_col: &str) -> Result<KafkaPollReport> {
+        let fetch_offset = self.load_next_offset();
+        let records = match fetch_kafka_v4_records(
+            &self.broker_addr,
+            &self.topic,
+            self.partition,
+            fetch_offset,
+            1024 * 1024,
+        )
+        .await
+        {
+            Ok(recs) => recs,
+            Err(_) => {
+                fetch_kafka_v0_records(
+                    &self.broker_addr,
+                    &self.topic,
+                    self.partition,
+                    fetch_offset,
+                    1024 * 1024,
+                )
+                .await?
+            }
+        };
+
+        if records.is_empty() {
+            return Ok(KafkaPollReport {
+                messages_fetched: 0,
+                applied: 0,
+                skipped_duplicates: 0,
+                next_offset: fetch_offset,
+            });
+        }
+
+        let meta = self.coord.catalog.get_table(&self.table_name).await?;
+        let col_names: Vec<String> = meta.schema.iter().map(|f| f.name.clone()).collect();
+        let mut delete_keys = Vec::new();
+        let mut upsert_rows = Vec::new();
+        let mut max_seen_offset = fetch_offset - 1;
+        let mut applied = 0usize;
+
+        for (offset, payload) in &records {
+            if *offset > max_seen_offset {
+                max_seen_offset = *offset;
+            }
+            if let Ok(v) = serde_json::from_slice::<Value>(payload) {
+                let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("c");
+                if matches!(op, "u" | "d") {
+                    let key_src = v
+                        .get("before")
+                        .and_then(|o| o.get(key_col))
+                        .or_else(|| v.get("after").and_then(|o| o.get(key_col)))
+                        .or_else(|| v.get("key"));
+                    if let Some(kv) = key_src.and_then(json_to_scalar) {
+                        delete_keys.push(kv);
+                    }
+                }
+                if matches!(op, "c" | "u" | "r")
+                    && let Some(after) = v.get("after").and_then(|x| x.as_object())
+                {
+                    let mut row = std::collections::BTreeMap::new();
+                    for c in &col_names {
+                        let sv = after
+                            .get(c)
+                            .and_then(json_to_scalar)
+                            .unwrap_or(rustlakedb_protocol::ScalarValue::Null);
+                        row.insert(c.clone(), sv);
+                    }
+                    upsert_rows.push(row);
+                }
+                applied += 1;
+            }
+        }
+
+        if !delete_keys.is_empty() || !upsert_rows.is_empty() {
+            let batch = rustlakedb_protocol::RowBatch::new(col_names, upsert_rows);
+            self.coord
+                .ingest_cdc_equality_deletes(
+                    &self.table_name,
+                    &self.branch,
+                    key_col,
+                    delete_keys,
+                    batch,
+                )
+                .await?;
+        }
+
+        let new_next = (max_seen_offset + 1).max(fetch_offset);
+        self.save_next_offset(new_next)?;
+
+        Ok(KafkaPollReport {
+            messages_fetched: records.len(),
+            applied,
+            skipped_duplicates: 0,
+            next_offset: new_next,
+        })
+    }
+
     pub async fn run_loop(&self, poll_interval: Duration) -> Result<()> {
         loop {
             match self.poll_once().await {
@@ -776,4 +875,20 @@ pub async fn fetch_kafka_v0_records(
     }
 
     Ok(out)
+}
+
+fn json_to_scalar(v: &Value) -> Option<rustlakedb_protocol::ScalarValue> {
+    match v {
+        Value::Null => Some(rustlakedb_protocol::ScalarValue::Null),
+        Value::Bool(b) => Some(rustlakedb_protocol::ScalarValue::Bool(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(rustlakedb_protocol::ScalarValue::Int64(i))
+            } else {
+                n.as_f64().map(rustlakedb_protocol::ScalarValue::Float64)
+            }
+        }
+        Value::String(s) => Some(rustlakedb_protocol::ScalarValue::Utf8(s.clone())),
+        other => Some(rustlakedb_protocol::ScalarValue::Json(other.clone())),
+    }
 }

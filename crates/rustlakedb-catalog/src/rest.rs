@@ -5,7 +5,7 @@ use crate::{
     Catalog, ColumnType, DataFileEntry, FieldSchema, IcebergTableMetadata, TableCommitProposal,
 };
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use parking_lot::RwLock;
@@ -751,13 +751,40 @@ async fn commit_table_rest(
 
 async fn load_table(
     Path((namespace, table)): Path<(String, String)>,
+    headers: HeaderMap,
     State(state): State<RestCatalogState>,
 ) -> (StatusCode, Json<Value>) {
     match state.catalog.get_table(&table).await {
-        Ok(meta) => (
-            StatusCode::OK,
-            Json(build_load_table_response(&namespace, &meta)),
-        ),
+        Ok(meta) => {
+            let mut resp = build_load_table_response(&namespace, &meta);
+            // Wave 36: Standard Iceberg REST `X-Iceberg-Access-Delegation: vended-credentials`
+            // embeds STS / scoped credentials directly inside `LoadTableResult` (`config` + `storage-credentials`).
+            let wants_vended = headers
+                .get("x-iceberg-access-delegation")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|s| s.to_ascii_lowercase().contains("vended-credentials"));
+            if wants_vended {
+                let (st, Json(cred_doc)) =
+                    vend_table_credentials(Path((namespace, table)), State(state)).await;
+                if st == StatusCode::OK
+                    && let Some(sc) = cred_doc.get("storage-credentials").cloned()
+                {
+                    if let Some(cfg_obj) = sc
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|e| e.get("config"))
+                        .and_then(|c| c.as_object())
+                        && let Some(top_cfg) = resp.get_mut("config").and_then(|c| c.as_object_mut())
+                    {
+                        for (k, v) in cfg_obj {
+                            top_cfg.insert(k.clone(), v.clone());
+                        }
+                    }
+                    resp["storage-credentials"] = sc;
+                }
+            }
+            (StatusCode::OK, Json(resp))
+        }
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": { "message": e.to_string(), "code": 404, "type": "NoSuchTableException" } })),

@@ -32,7 +32,8 @@ fn wave33_ci_release_sbom_oci_helm_and_benchmark_pack_valid() {
     assert!(rel.contains("SPDX-2.3"), "Release must generate SPDX 2.3 SBOM");
 
     let chart = std::fs::read_to_string(root.join("deploy/helm/rustlakedb/Chart.yaml")).unwrap();
-    assert!(chart.contains("version: 8.0.0"));
+    let expected_ver = format!("version: {}", env!("CARGO_PKG_VERSION"));
+    assert!(chart.contains(&expected_ver), "expected {expected_ver} in Chart.yaml");
 
     let bench_ps1 = std::fs::read_to_string(root.join("scripts/run-tpch-bench.ps1")).unwrap();
     assert!(bench_ps1.contains("wave19_tpch_22_and_cbo"));

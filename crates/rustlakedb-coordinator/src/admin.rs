@@ -117,7 +117,7 @@ async fn register_worker_http(
     )
 }
 
-fn resolve_http_session(
+async fn resolve_http_session(
     coord: &Coordinator,
     headers: &HeaderMap,
     fallback_user: &str,
@@ -133,14 +133,10 @@ fn resolve_http_session(
             .strip_prefix("Bearer ")
             .ok_or_else(|| "Authorization header must start with 'Bearer '".to_string())?;
         if has_jwks {
-            if let Ok(sess) = coord.governance.verify_jwt_rs256(token) {
-                return Ok(sess);
-            }
-            if hs_secret.is_none() {
-                return coord
-                    .governance
-                    .verify_jwt_rs256(token)
-                    .map_err(|e| e.to_string());
+            match coord.governance.verify_jwt_rs256_auto_rotate(token).await {
+                Ok(sess) => return Ok(sess),
+                Err(e) if hs_secret.is_none() => return Err(e.to_string()),
+                Err(_) => {}
             }
         }
         if let Some(secret) = hs_secret {
@@ -190,7 +186,7 @@ async fn ingest_cdc_http(
     Query(q): Query<CdcQuery>,
     Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(e) = resolve_http_session(&coord, &headers, "postgres") {
+    if let Err(e) = resolve_http_session(&coord, &headers, "postgres").await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e })));
     }
     let events: Vec<Value> = match payload {
@@ -231,7 +227,7 @@ async fn sql_json(
     headers: HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let session = match resolve_http_session(&coord, &headers, &req.user) {
+    let session = match resolve_http_session(&coord, &headers, &req.user).await {
         Ok(s) => s,
         Err(e) => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))),
     };
@@ -289,7 +285,7 @@ async fn sql_arrow(
     headers: HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> Response {
-    let session = match resolve_http_session(&coord, &headers, &req.user) {
+    let session = match resolve_http_session(&coord, &headers, &req.user).await {
         Ok(s) => s,
         Err(e) => {
             return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))).into_response();

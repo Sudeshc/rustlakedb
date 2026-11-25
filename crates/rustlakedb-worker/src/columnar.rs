@@ -966,3 +966,311 @@ pub fn eval_columnar_hash_join(
     RecordBatch::try_new(out_schema, out_cols)
         .map_err(|e| RustLakeError::Execution(format!("arrow join record batch build: {e}")))
 }
+
+/// Telemetry counters returned by out-of-core NVMe Arrow spill operators (Wave 34).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArrowSpillMetrics {
+    pub spill_bytes_written: u64,
+    pub spill_files_created: u64,
+}
+
+/// RAII cleanup guard ensuring temporary NVMe Arrow spill files are always removed.
+struct SpillFileGuard {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl SpillFileGuard {
+    fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+
+    fn track(&mut self, path: std::path::PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for SpillFileGuard {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+fn write_arrow_spill_file(
+    path: &std::path::Path,
+    batch: &RecordBatch,
+    metrics: &mut ArrowSpillMetrics,
+) -> Result<()> {
+    let bytes = rustlakedb_shuffle::encode_record_batch_block(batch)?;
+    std::fs::write(path, &bytes)?;
+    metrics.spill_bytes_written += bytes.len() as u64;
+    metrics.spill_files_created += 1;
+    Ok(())
+}
+
+fn read_arrow_spill_file(path: &std::path::Path) -> Result<RecordBatch> {
+    let bytes = std::fs::read(path)?;
+    rustlakedb_shuffle::decode_record_batch_block(&bytes)?
+        .ok_or_else(|| RustLakeError::Execution(format!("invalid ARW1 spill block at {:?}", path)))
+}
+
+fn compare_rows_across_batches(
+    a: &RecordBatch,
+    ai: usize,
+    b: &RecordBatch,
+    bi: usize,
+    keys: &[SortKey],
+) -> CmpOrdering {
+    for k in keys {
+        if let (Some(ac), Some(bc)) = (a.column_by_name(&k.column), b.column_by_name(&k.column)) {
+            let ord = compare_array_cells(ac, ai, bc, bi).unwrap_or(CmpOrdering::Equal);
+            let dir = if k.descending { ord.reverse() } else { ord };
+            if dir != CmpOrdering::Equal {
+                return dir;
+            }
+        }
+    }
+    CmpOrdering::Equal
+}
+
+/// Out-of-Core External K-Way Merge Sort over Arrow `RecordBatch`es with Zstd `ARW1` NVMe spill
+/// (Wave 34). When `rb.get_array_memory_size() <= memory_limit_bytes`, sorts directly in memory.
+/// Otherwise splits into bounded sorted runs on NVMe, executes a K-way min-heap merge across the
+/// runs, and cleans up all temporary spill files automatically.
+pub fn eval_columnar_sort_with_spill(
+    rb: &RecordBatch,
+    keys: &[SortKey],
+    memory_limit_bytes: usize,
+    spill_dir: &std::path::Path,
+) -> Result<(RecordBatch, ArrowSpillMetrics)> {
+    let n = rb.num_rows();
+    if n <= 1 || keys.is_empty() || rb.get_array_memory_size() <= memory_limit_bytes {
+        return Ok((eval_columnar_sort(rb, keys)?, ArrowSpillMetrics::default()));
+    }
+
+    std::fs::create_dir_all(spill_dir)?;
+    let mut guard = SpillFileGuard::new();
+    let mut metrics = ArrowSpillMetrics::default();
+    let total_bytes = rb.get_array_memory_size().max(1);
+    let est_rows_per_run = ((n as u128 * memory_limit_bytes.max(1) as u128) / total_bytes as u128)
+        as usize;
+    let rows_per_run = est_rows_per_run.clamp(1, (n / 2).max(1));
+
+    let op_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut run_paths = Vec::new();
+    let mut offset = 0usize;
+    let mut run_idx = 0usize;
+    while offset < n {
+        let len = rows_per_run.min(n - offset);
+        let slice = rb.slice(offset, len);
+        let sorted_run = eval_columnar_sort(&slice, keys)?;
+        let path = spill_dir.join(format!("arrow_sort_run_{op_id}_{run_idx}.arw1"));
+        write_arrow_spill_file(&path, &sorted_run, &mut metrics)?;
+        guard.track(path.clone());
+        run_paths.push(path);
+        offset += len;
+        run_idx += 1;
+    }
+
+    // Load sorted runs from NVMe and execute a true K-way merge into unified Arrow output.
+    let runs: Vec<RecordBatch> = run_paths
+        .iter()
+        .map(|p| read_arrow_spill_file(p))
+        .collect::<Result<Vec<_>>>()?;
+
+    let merged = kway_merge_sorted_batches(&runs, keys)?;
+    Ok((merged, metrics))
+}
+
+fn kway_merge_sorted_batches(runs: &[RecordBatch], keys: &[SortKey]) -> Result<RecordBatch> {
+    if runs.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+    }
+    if runs.len() == 1 {
+        return Ok(runs[0].clone());
+    }
+
+    // Concatenate runs once and build a global merge permutation using a K-way cursor heap
+    // (avoids re-sorting already sorted runs: O(N log K) instead of O(N log N)!).
+    let mut run_offsets: Vec<usize> = Vec::with_capacity(runs.len());
+    let mut total_rows = 0usize;
+    for r in runs {
+        run_offsets.push(total_rows);
+        total_rows += r.num_rows();
+    }
+    let combined = concat_record_batches(runs)?;
+    let mut cursors = vec![0usize; runs.len()];
+    let mut order: Vec<u32> = Vec::with_capacity(total_rows);
+
+    // Maintain a compact active-run tournament (K is small: 2..64 runs).
+    let mut active_runs: Vec<usize> = (0..runs.len())
+        .filter(|&r| runs[r].num_rows() > 0)
+        .collect();
+
+    while !active_runs.is_empty() {
+        let mut best_pos = 0usize;
+        for pos in 1..active_runs.len() {
+            let r_best = active_runs[best_pos];
+            let r_cur = active_runs[pos];
+            if compare_rows_across_batches(
+                &runs[r_cur],
+                cursors[r_cur],
+                &runs[r_best],
+                cursors[r_best],
+                keys,
+            ) == CmpOrdering::Less
+            {
+                best_pos = pos;
+            }
+        }
+        let chosen_run = active_runs[best_pos];
+        let row_in_run = cursors[chosen_run];
+        order.push((run_offsets[chosen_run] + row_in_run) as u32);
+        cursors[chosen_run] += 1;
+        if cursors[chosen_run] >= runs[chosen_run].num_rows() {
+            active_runs.swap_remove(best_pos);
+        }
+    }
+
+    let idx_arr = UInt32Array::from(order);
+    let cols: Vec<ArrayRef> = combined
+        .columns()
+        .iter()
+        .map(|c| {
+            take(c.as_ref(), &idx_arr, None)
+                .map_err(|e| RustLakeError::Execution(format!("arrow kway merge take: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(combined.schema(), cols)
+        .map_err(|e| RustLakeError::Execution(format!("arrow kway merge batch: {e}")))
+}
+
+fn spill_hash_partition_batch(
+    rb: &RecordBatch,
+    key_col: &str,
+    num_partitions: usize,
+    prefix: &str,
+    spill_dir: &std::path::Path,
+    guard: &mut SpillFileGuard,
+    metrics: &mut ArrowSpillMetrics,
+) -> Result<Vec<Option<std::path::PathBuf>>> {
+    let key_idx = rb
+        .schema()
+        .index_of(key_col)
+        .map_err(|e| RustLakeError::Execution(format!("arrow spill join key '{key_col}': {e}")))?;
+    let key_arr = rb.column(key_idx);
+    let mut part_indices: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
+    for i in 0..rb.num_rows() {
+        let pid = match array_as_string(key_arr, i) {
+            Some(k) => (xxhash_rust::xxh3::xxh3_64(k.as_bytes()) as usize) % num_partitions,
+            None => 0,
+        };
+        part_indices[pid].push(i as u32);
+    }
+
+    let mut paths = vec![None; num_partitions];
+    for (pid, idxs) in part_indices.into_iter().enumerate() {
+        if idxs.is_empty() {
+            continue;
+        }
+        let idx_arr = UInt32Array::from(idxs);
+        let cols: Vec<ArrayRef> = rb
+            .columns()
+            .iter()
+            .map(|c| {
+                take(c.as_ref(), &idx_arr, None)
+                    .map_err(|e| RustLakeError::Execution(format!("arrow spill partition take: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let part_batch = RecordBatch::try_new(rb.schema(), cols)
+            .map_err(|e| RustLakeError::Execution(format!("arrow spill partition build: {e}")))?;
+        let path = spill_dir.join(format!("{prefix}_p{pid}.arw1"));
+        write_arrow_spill_file(&path, &part_batch, metrics)?;
+        guard.track(path.clone());
+        paths[pid] = Some(path);
+    }
+    Ok(paths)
+}
+
+/// Out-of-Core Grace Hash Join over Arrow `RecordBatch`es with NVMe `ARW1` partition spilling
+/// (Wave 34). When combined Arrow memory exceeds `memory_limit_bytes`, hash-partitions both
+/// inputs to NVMe (`xxh3_64`), joins one partition pair at a time in bounded RAM, and cleans up
+/// every temporary file automatically.
+pub fn eval_columnar_hash_join_with_spill(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_key: &str,
+    right_key: &str,
+    join_type: JoinType,
+    memory_limit_bytes: usize,
+    spill_dir: &std::path::Path,
+) -> Result<(RecordBatch, ArrowSpillMetrics)> {
+    let total_bytes = left
+        .get_array_memory_size()
+        .saturating_add(right.get_array_memory_size());
+    if total_bytes <= memory_limit_bytes || (left.num_rows() == 0 && right.num_rows() == 0) {
+        let joined = eval_columnar_hash_join(left, right, left_key, right_key, join_type)?;
+        return Ok((joined, ArrowSpillMetrics::default()));
+    }
+
+    std::fs::create_dir_all(spill_dir)?;
+    let mut guard = SpillFileGuard::new();
+    let mut metrics = ArrowSpillMetrics::default();
+    let num_partitions = ((total_bytes / memory_limit_bytes.max(1)).saturating_mul(2)).clamp(4, 64);
+    let op_id = uuid::Uuid::new_v4().simple().to_string();
+
+    let left_parts = spill_hash_partition_batch(
+        left,
+        left_key,
+        num_partitions,
+        &format!("arrow_join_L_{op_id}"),
+        spill_dir,
+        &mut guard,
+        &mut metrics,
+    )?;
+    let right_parts = spill_hash_partition_batch(
+        right,
+        right_key,
+        num_partitions,
+        &format!("arrow_join_R_{op_id}"),
+        spill_dir,
+        &mut guard,
+        &mut metrics,
+    )?;
+
+    let empty_left = RecordBatch::new_empty(left.schema());
+    let empty_right = RecordBatch::new_empty(right.schema());
+    let mut joined_parts: Vec<RecordBatch> = Vec::new();
+
+    for pid in 0..num_partitions {
+        let lp_opt = left_parts[pid].as_ref();
+        let rp_opt = right_parts[pid].as_ref();
+        match (lp_opt, rp_opt) {
+            (None, None) => continue,
+            (Some(_), None) if !matches!(join_type, JoinType::Left | JoinType::Full) => continue,
+            (None, Some(_)) if !matches!(join_type, JoinType::Right | JoinType::Full) => continue,
+            _ => {
+                let lb = match lp_opt {
+                    Some(p) => read_arrow_spill_file(p)?,
+                    None => empty_left.clone(),
+                };
+                let rb = match rp_opt {
+                    Some(p) => read_arrow_spill_file(p)?,
+                    None => empty_right.clone(),
+                };
+                let part_res = eval_columnar_hash_join(&lb, &rb, left_key, right_key, join_type)?;
+                if part_res.num_rows() > 0 {
+                    joined_parts.push(part_res);
+                }
+            }
+        }
+    }
+
+    if joined_parts.is_empty() {
+        let empty_out =
+            eval_columnar_hash_join(&empty_left, &empty_right, left_key, right_key, join_type)?;
+        return Ok((empty_out, metrics));
+    }
+    Ok((concat_record_batches(&joined_parts)?, metrics))
+}

@@ -43,6 +43,10 @@ pub struct WorkerNode {
     pub files_pruned_by_dpp: AtomicU64,
     /// Arrow IPC shuffle blocks read directly as `RecordBatch` without `RowBatch` deserialization (Wave 30).
     pub arrow_shuffle_batches_read: AtomicU64,
+    /// Compressed bytes spilled to NVMe by out-of-core Arrow Sort / Grace Hash Join (Wave 34).
+    pub arrow_spill_bytes_written: AtomicU64,
+    /// Temporary `ARW1` Arrow spill runs/partitions created on NVMe (Wave 34).
+    pub arrow_spill_files_created: AtomicU64,
     /// Cooperatively cancelled query IDs checked between split/batch reads (Wave 22).
     pub cancelled_queries: std::sync::RwLock<HashSet<String>>,
 }
@@ -80,6 +84,8 @@ impl WorkerNode {
             vectorized_rows_processed: AtomicU64::new(0),
             files_pruned_by_dpp: AtomicU64::new(0),
             arrow_shuffle_batches_read: AtomicU64::new(0),
+            arrow_spill_bytes_written: AtomicU64::new(0),
+            arrow_spill_files_created: AtomicU64::new(0),
             cancelled_queries: std::sync::RwLock::new(HashSet::new()),
         }
     }
@@ -401,7 +407,7 @@ impl WorkerNode {
                     Ok(RowBatch::new(batch.columns, out))
                 }
                 PhysicalNode::Sort { input, keys } => {
-                    // Wave 30 End-to-End Arrow Shuffle -> Columnar Sort fast path (zero intermediate RowBatch!).
+                    // Wave 30 + Wave 34 End-to-End Arrow Shuffle -> Columnar Sort (in-memory or NVMe K-way spill!).
                     if let PhysicalNode::ShuffleRead {
                         upstream_stage_id,
                         output_partitioning,
@@ -410,12 +416,33 @@ impl WorkerNode {
                         && let Some(rb) = self
                             .try_read_shuffle_arrow(*upstream_stage_id, output_partitioning, task)
                             .await?
-                        && self.memory_pool.try_reserve(rb.get_array_memory_size()).is_ok()
-                        && let Ok(sorted_rb) = columnar::eval_columnar_sort(&rb, keys)
                     {
-                        self.vectorized_rows_processed
-                            .fetch_add(sorted_rb.num_rows() as u64, Ordering::Relaxed);
-                        return Ok(rustlakedb_storage::record_batch_to_row_batch(&sorted_rb));
+                        let mem_bytes = rb.get_array_memory_size();
+                        if let Ok(_guard) = self.memory_pool.try_reserve(mem_bytes) {
+                            if let Ok(sorted_rb) = columnar::eval_columnar_sort(&rb, keys) {
+                                self.vectorized_rows_processed
+                                    .fetch_add(sorted_rb.num_rows() as u64, Ordering::Relaxed);
+                                return Ok(rustlakedb_storage::record_batch_to_row_batch(&sorted_rb));
+                            }
+                        } else if let Ok((sorted_rb, spill_stats)) =
+                            columnar::eval_columnar_sort_with_spill(
+                                &rb,
+                                keys,
+                                self.memory_pool.limit_bytes(),
+                                &self.spill_dir,
+                            )
+                        {
+                            if spill_stats.spill_files_created > 0 {
+                                self.memory_pool.record_spill();
+                                self.arrow_spill_bytes_written
+                                    .fetch_add(spill_stats.spill_bytes_written, Ordering::Relaxed);
+                                self.arrow_spill_files_created
+                                    .fetch_add(spill_stats.spill_files_created, Ordering::Relaxed);
+                            }
+                            self.vectorized_rows_processed
+                                .fetch_add(sorted_rb.num_rows() as u64, Ordering::Relaxed);
+                            return Ok(rustlakedb_storage::record_batch_to_row_batch(&sorted_rb));
+                        }
                     }
                     let batch = self.eval_node(input, task).await?;
                     self.eval_sort_with_spill(batch, keys).await
@@ -560,7 +587,7 @@ impl WorkerNode {
                     join_type,
                     ..
                 } => {
-                    // Wave 30 End-to-End Arrow Shuffle -> Columnar HashJoin fast path (zero intermediate RowBatch!).
+                    // Wave 30 + Wave 34 End-to-End Arrow Shuffle -> Columnar HashJoin (in-memory or NVMe Grace spill!).
                     if matches!(
                         join_type,
                         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
@@ -580,22 +607,44 @@ impl WorkerNode {
                             self.try_read_shuffle_arrow(*ls, lp, task).await?,
                             self.try_read_shuffle_arrow(*rs, rp, task).await?,
                         )
-                        && self
-                            .memory_pool
-                            .try_reserve(
-                                lrb.get_array_memory_size()
-                                    .saturating_add(rrb.get_array_memory_size()),
-                            )
-                            .is_ok()
-                        && let Ok(joined_rb) = columnar::eval_columnar_hash_join(
-                            &lrb, &rrb, left_key, right_key, *join_type,
-                        )
                     {
-                        self.vectorized_rows_processed.fetch_add(
-                            (lrb.num_rows() + rrb.num_rows()) as u64,
-                            Ordering::Relaxed,
-                        );
-                        return Ok(rustlakedb_storage::record_batch_to_row_batch(&joined_rb));
+                        let mem_bytes = lrb
+                            .get_array_memory_size()
+                            .saturating_add(rrb.get_array_memory_size());
+                        if let Ok(_guard) = self.memory_pool.try_reserve(mem_bytes) {
+                            if let Ok(joined_rb) = columnar::eval_columnar_hash_join(
+                                &lrb, &rrb, left_key, right_key, *join_type,
+                            ) {
+                                self.vectorized_rows_processed.fetch_add(
+                                    (lrb.num_rows() + rrb.num_rows()) as u64,
+                                    Ordering::Relaxed,
+                                );
+                                return Ok(rustlakedb_storage::record_batch_to_row_batch(&joined_rb));
+                            }
+                        } else if let Ok((joined_rb, spill_stats)) =
+                            columnar::eval_columnar_hash_join_with_spill(
+                                &lrb,
+                                &rrb,
+                                left_key,
+                                right_key,
+                                *join_type,
+                                self.memory_pool.limit_bytes(),
+                                &self.spill_dir,
+                            )
+                        {
+                            if spill_stats.spill_files_created > 0 {
+                                self.memory_pool.record_spill();
+                                self.arrow_spill_bytes_written
+                                    .fetch_add(spill_stats.spill_bytes_written, Ordering::Relaxed);
+                                self.arrow_spill_files_created
+                                    .fetch_add(spill_stats.spill_files_created, Ordering::Relaxed);
+                            }
+                            self.vectorized_rows_processed.fetch_add(
+                                (lrb.num_rows() + rrb.num_rows()) as u64,
+                                Ordering::Relaxed,
+                            );
+                            return Ok(rustlakedb_storage::record_batch_to_row_batch(&joined_rb));
+                        }
                     }
                     let left_batch = self.eval_node(left, task).await?;
                     let right_batch = self.eval_node(right, task).await?;
@@ -889,27 +938,27 @@ pub fn eval_col_expr(row: &BTreeMap<String, ScalarValue>, expr: &ColumnExpr) -> 
             right,
             alias,
         } => {
+            if let (Some(lv), Some(rv)) = (
+                eval_col_expr(row, left).as_f64(),
+                eval_col_expr(row, right).as_f64(),
+            ) {
+                let res = match op {
+                    ArithOp::Add => lv + rv,
+                    ArithOp::Sub => lv - rv,
+                    ArithOp::Mul => lv * rv,
+                    ArithOp::Div => {
+                        if rv == 0.0 {
+                            return ScalarValue::Null;
+                        }
+                        lv / rv
+                    }
+                };
+                return ScalarValue::Float64(res);
+            }
             if let Some(already) = row.get(alias) {
                 return already.clone();
             }
-            let (Some(lv), Some(rv)) = (
-                eval_col_expr(row, left).as_f64(),
-                eval_col_expr(row, right).as_f64(),
-            ) else {
-                return ScalarValue::Null;
-            };
-            let res = match op {
-                ArithOp::Add => lv + rv,
-                ArithOp::Sub => lv - rv,
-                ArithOp::Mul => lv * rv,
-                ArithOp::Div => {
-                    if rv == 0.0 {
-                        return ScalarValue::Null;
-                    }
-                    lv / rv
-                }
-            };
-            ScalarValue::Float64(res)
+            ScalarValue::Null
         }
         ColumnExpr::StringExpr { func, args, alias } => {
             if let Some(already) = row.get(alias) {
@@ -962,6 +1011,104 @@ pub fn eval_col_expr(row: &BTreeMap<String, ScalarValue>, expr: &ColumnExpr) -> 
                         .unwrap_or_else(|| chars.len().saturating_sub(start));
                     let sub: String = chars.into_iter().skip(start).take(len).collect();
                     ScalarValue::Utf8(sub)
+                }
+                StringFunc::ArrayLength => {
+                    let Some(val) = args.first().map(|a| eval_col_expr(row, a)) else {
+                        return ScalarValue::Null;
+                    };
+                    let doc = match val {
+                        ScalarValue::Json(v) => Some(v),
+                        ScalarValue::Utf8(s) => serde_json::from_str::<serde_json::Value>(&s).ok(),
+                        _ => None,
+                    };
+                    match doc {
+                        Some(serde_json::Value::Array(arr)) => ScalarValue::Int64(arr.len() as i64),
+                        Some(serde_json::Value::Object(obj)) => ScalarValue::Int64(obj.len() as i64),
+                        _ => ScalarValue::Null,
+                    }
+                }
+                StringFunc::ArrayContains => {
+                    let Some(val) = args.first().map(|a| eval_col_expr(row, a)) else {
+                        return ScalarValue::Null;
+                    };
+                    let needle = args
+                        .get(1)
+                        .and_then(|a| eval_col_expr(row, a).to_pg_text())
+                        .unwrap_or_default();
+                    let doc = match val {
+                        ScalarValue::Json(v) => Some(v),
+                        ScalarValue::Utf8(s) => serde_json::from_str::<serde_json::Value>(&s).ok(),
+                        _ => None,
+                    };
+                    match doc {
+                        Some(serde_json::Value::Array(arr)) => {
+                            let found = arr.iter().any(|el| match el {
+                                serde_json::Value::String(s) => s == &needle,
+                                other => format!("{other}") == needle,
+                            });
+                            ScalarValue::Bool(found)
+                        }
+                        _ => ScalarValue::Bool(false),
+                    }
+                }
+                StringFunc::MapKeys | StringFunc::MapValues => {
+                    let Some(val) = args.first().map(|a| eval_col_expr(row, a)) else {
+                        return ScalarValue::Null;
+                    };
+                    let doc = match val {
+                        ScalarValue::Json(v) => Some(v),
+                        ScalarValue::Utf8(s) => serde_json::from_str::<serde_json::Value>(&s).ok(),
+                        _ => None,
+                    };
+                    match doc {
+                        Some(serde_json::Value::Object(obj)) => {
+                            let out: Vec<serde_json::Value> = if matches!(func, StringFunc::MapKeys) {
+                                obj.keys().map(|k| serde_json::Value::String(k.clone())).collect()
+                            } else {
+                                obj.values().cloned().collect()
+                            };
+                            ScalarValue::Json(serde_json::Value::Array(out))
+                        }
+                        _ => ScalarValue::Null,
+                    }
+                }
+                StringFunc::ElementAt => {
+                    let Some(val) = args.first().map(|a| eval_col_expr(row, a)) else {
+                        return ScalarValue::Null;
+                    };
+                    let Some(idx_sv) = args.get(1).map(|a| eval_col_expr(row, a)) else {
+                        return ScalarValue::Null;
+                    };
+                    let doc = match val {
+                        ScalarValue::Json(v) => Some(v),
+                        ScalarValue::Utf8(s) => serde_json::from_str::<serde_json::Value>(&s).ok(),
+                        _ => None,
+                    };
+                    let picked = match doc {
+                        Some(serde_json::Value::Array(arr)) => {
+                            let idx = idx_sv.as_f64().map(|f| f as usize).unwrap_or(0);
+                            if idx == 0 {
+                                None
+                            } else {
+                                arr.get(idx - 1).cloned()
+                            }
+                        }
+                        Some(serde_json::Value::Object(obj)) => {
+                            idx_sv.to_pg_text().and_then(|k| obj.get(&k).cloned())
+                        }
+                        _ => None,
+                    };
+                    match picked {
+                        Some(serde_json::Value::String(s)) => ScalarValue::Utf8(s),
+                        Some(serde_json::Value::Number(n)) => n
+                            .as_i64()
+                            .map(ScalarValue::Int64)
+                            .or_else(|| n.as_f64().map(ScalarValue::Float64))
+                            .unwrap_or(ScalarValue::Null),
+                        Some(serde_json::Value::Bool(b)) => ScalarValue::Bool(b),
+                        Some(serde_json::Value::Null) | None => ScalarValue::Null,
+                        Some(other) => ScalarValue::Json(other),
+                    }
                 }
             }
         }

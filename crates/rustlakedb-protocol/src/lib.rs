@@ -270,6 +270,11 @@ pub enum StringFunc {
     Trim,
     Concat,
     Substring,
+    ArrayLength,
+    ArrayContains,
+    MapKeys,
+    MapValues,
+    ElementAt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

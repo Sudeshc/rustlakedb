@@ -92,6 +92,54 @@ pub async fn try_handle_pg_compat(
                 ScalarValue::Utf8(setting.into()),
             )));
         }
+        // Wave 37: General FROM-less constant `SELECT <lit> [AS alias], ...` (e.g. `SELECT 1 AS n`)
+        if !lower.contains('(') {
+            let body = trimmed["select ".len()..].trim();
+            let mut cols = Vec::new();
+            let mut row = BTreeMap::new();
+            let mut all_ok = true;
+            for (idx, item) in body.split(',').enumerate() {
+                let item_t = item.trim();
+                let item_u = item_t.to_uppercase();
+                let (expr_str, col_name) = if let Some(as_pos) = item_u.rfind(" AS ") {
+                    (
+                        item_t[..as_pos].trim(),
+                        item_t[as_pos + 4..]
+                            .trim()
+                            .trim_matches('"')
+                            .to_string(),
+                    )
+                } else {
+                    (item_t, format!("col_{idx}"))
+                };
+                let sv = if expr_str.starts_with('\'') && expr_str.ends_with('\'') && expr_str.len() >= 2 {
+                    ScalarValue::Utf8(expr_str[1..expr_str.len() - 1].to_string())
+                } else if expr_str.eq_ignore_ascii_case("true") {
+                    ScalarValue::Bool(true)
+                } else if expr_str.eq_ignore_ascii_case("false") {
+                    ScalarValue::Bool(false)
+                } else if expr_str.eq_ignore_ascii_case("null") {
+                    ScalarValue::Null
+                } else if let Ok(i) = expr_str.parse::<i64>() {
+                    ScalarValue::Int64(i)
+                } else if let Ok(f) = expr_str.parse::<f64>() {
+                    ScalarValue::Float64(f)
+                } else {
+                    all_ok = false;
+                    break;
+                };
+                cols.push(col_name.clone());
+                row.insert(col_name, sv);
+            }
+            if all_ok && !cols.is_empty() {
+                return Some(Ok(QueryExecutionResult {
+                    command_tag: "SELECT 1".into(),
+                    dag: None,
+                    batch: RowBatch::new(cols, vec![row]),
+                    stats: QueryExecutionStats::default(),
+                }));
+            }
+        }
     }
 
     // 3. `pg_catalog.*` virtual system tables (DBeaver / pgjdbc / DataGrip introspection).

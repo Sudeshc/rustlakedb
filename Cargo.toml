@@ -10,12 +10,13 @@ members = [
     "crates/rustlakedb-worker",
     "crates/rustlakedb-coordinator",
     "crates/rustlakedb-gateway",
+    "crates/rustlakedb-operator",
     "crates/rustlakedb-cli",
     "crates/rustlakedb-testkit",
 ]
 
 [workspace.package]
-version = "8.0.0"
+version = "9.0.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
