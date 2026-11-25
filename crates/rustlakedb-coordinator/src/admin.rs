@@ -417,14 +417,7 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
             None => (1, 1, 0, 0),
         };
 
-    let tables = coord.catalog.list_tables().await.unwrap_or_default();
-    let tables_total = tables.len();
-    let mut max_snapshots = 0usize;
-    for t in &tables {
-        if let Ok(meta) = coord.catalog.get_table(t).await {
-            max_snapshots = max_snapshots.max(meta.snapshots.len());
-        }
-    }
+    let (tables_total, max_snapshots) = coord.catalog.catalog_stats();
 
     let mut spill_bytes: u64 = 0;
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {

@@ -221,6 +221,7 @@ pub struct RaftCatalogNode {
     wal_path: Option<PathBuf>,
     snapshot_threshold: std::sync::atomic::AtomicUsize,
     leader_changes: std::sync::atomic::AtomicU64,
+    snapshot_inflight: AtomicBool,
     propose_lock: tokio::sync::Mutex<()>,
     apply_lock: tokio::sync::Mutex<()>,
     http: reqwest::Client,
@@ -259,8 +260,8 @@ impl RaftCatalogNode {
         wal_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(250))
-            .timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_millis(400))
+            .timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -302,6 +303,7 @@ impl RaftCatalogNode {
             wal_path,
             snapshot_threshold: std::sync::atomic::AtomicUsize::new(64),
             leader_changes: std::sync::atomic::AtomicU64::new(0),
+            snapshot_inflight: AtomicBool::new(false),
             propose_lock: tokio::sync::Mutex::new(()),
             apply_lock: tokio::sync::Mutex::new(()),
             http,
@@ -432,9 +434,10 @@ impl RaftCatalogNode {
     }
 
     async fn run_raft_loop(self: Arc<Self>) {
-        // Staggered election timeouts per node_id prevent split votes in 3-node quorums!
-        let election_timeout = Duration::from_millis(220 + (self.node_id % 5) * 90);
-        let heartbeat_interval = Duration::from_millis(60);
+        // Production-grade staggered election timeouts (1.0s-2.4s, matching etcd/CockroachDB)
+        // prevent spurious leadership churn under heavy I/O while failing over in ~1.2s on SIGKILL!
+        let election_timeout = Duration::from_millis(1000 + (self.node_id % 5) * 350);
+        let heartbeat_interval = Duration::from_millis(150);
 
         while !self.is_stopped() {
             tokio::time::sleep(heartbeat_interval).await;
@@ -607,7 +610,13 @@ impl RaftCatalogNode {
         }
 
         // Raft §7 InstallSnapshot: catch up any lagging/rejoining follower whose state is behind our compacted WAL!
-        if !snapshot_peers.is_empty() {
+        // Single-flight guard prevents overlapping heartbeat ticks from stacking concurrent snapshot payloads.
+        if !snapshot_peers.is_empty()
+            && self
+                .snapshot_inflight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
             let snap_req = {
                 let c = self.core.read();
                 let last_idx = c.last_applied;
@@ -644,6 +653,7 @@ impl RaftCatalogNode {
                     acks += 1;
                 }
             }
+            self.snapshot_inflight.store(false, Ordering::Release);
         }
         acks
     }
@@ -1359,6 +1369,10 @@ impl Catalog for RaftCatalogNode {
             commit_index: c.commit_index,
             leader_changes: self.leader_changes.load(Ordering::Relaxed),
         })
+    }
+
+    fn catalog_stats(&self) -> (usize, usize) {
+        self.state_machine.catalog_stats()
     }
 }
 

@@ -45,32 +45,58 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if (-not $leader) { throw "Could not detect initial Raft leader from runner logs!" }
-    $leaderContainer = "rustlakedb-ha-$leader"
 
-    # Phase 1: Real Jepsen Asymmetric Network Partition (isolate Raft leader from quorum!)
+    function Get-ActiveLeader {
+        foreach ($c in @("coord-1", "coord-2", "coord-3")) {
+            $hc = docker exec "rustlakedb-ha-$c" sh -c 'curl -sf http://127.0.0.1:8181/readyz' 2>$null
+            if ($hc -match '"is_leader":true') { return $c }
+        }
+        return $null
+    }
+
+    function Invoke-JepsenRound([int]$RoundNum, [string]$FallbackLeader) {
+        $cur = Get-ActiveLeader
+        if (-not $cur) { $cur = $FallbackLeader }
+        $lCont = "rustlakedb-ha-$cur"
+        Write-Host "`n=== [JEPSEN ROUND $RoundNum - CHAOS 1] Network-Partitioning Active Raft Leader ($lCont) ===" -ForegroundColor Yellow
+        docker network disconnect $NetName $lCont
+        Start-Sleep -Seconds 7
+        Write-Host "=== [JEPSEN ROUND $RoundNum - HEAL 1] Reconnecting Former Leader ($lCont) to Quorum ===" -ForegroundColor Green
+        docker network connect --alias $cur $NetName $lCont
+
+        Start-Sleep -Seconds 5
+        $cur2 = Get-ActiveLeader
+        if (-not $cur2) { $cur2 = $cur }
+        $lCont2 = "rustlakedb-ha-$cur2"
+        Write-Host "`n=== [JEPSEN ROUND $RoundNum - CHAOS 2] Injecting Hard SIGKILL into Current Raft Leader ($lCont2) ===" -ForegroundColor Red
+        docker kill -s SIGKILL $lCont2 | Out-Null
+        Start-Sleep -Seconds 5
+        Write-Host "=== [JEPSEN ROUND $RoundNum - RECOVERY 2] Cold-Restarting Killed Leader ($lCont2) ===" -ForegroundColor Green
+        docker start $lCont2 | Out-Null
+    }
+
+    # Immediate Round 1 Jepsen partition + leader SIGKILL
     Start-Sleep -Seconds 4
-    Write-Host "`n=== [JEPSEN CHAOS 1] Network-Partitioning Active Raft Leader ($leaderContainer) ===" -ForegroundColor Yellow
-    docker network disconnect $NetName $leaderContainer
-    Start-Sleep -Seconds 7
-    Write-Host "=== [JEPSEN HEAL 1] Reconnecting Former Leader ($leaderContainer) to Quorum ===" -ForegroundColor Green
-    docker network connect --alias $leader $NetName $leaderContainer
+    Invoke-JepsenRound -RoundNum 1 -FallbackLeader $leader
 
-    # Phase 2: Real Raft Leader SIGKILL Failover
-    Start-Sleep -Seconds 5
-    $currentLeaderContainer = ""
-    foreach ($c in @("coord-1", "coord-2", "coord-3")) {
-        $hc = docker exec "rustlakedb-ha-$c" sh -c 'curl -sf http://127.0.0.1:8181/readyz' 2>$null
-        if ($hc -match '"is_leader":true') {
-            $currentLeaderContainer = "rustlakedb-ha-$c"
-            break
+    # For long multi-hour staging soaks, repeat Jepsen chaos rounds every 30 minutes and print live memory/progress!
+    if ($EffectiveSecs -gt 120) {
+        $round = 1
+        while ((docker inspect -f "{{.State.Running}}" ha-jepsen-runner 2>$null) -eq "true") {
+            for ($tick = 0; $tick -lt 36; $tick++) {
+                Start-Sleep -Seconds 50
+                if ((docker inspect -f "{{.State.Running}}" ha-jepsen-runner 2>$null) -ne "true") { break }
+                if (($tick % 6) -eq 0) {
+                    Write-Host "`n--- [SOAK LIVE CHECKPOINT $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ---" -ForegroundColor Cyan
+                    docker logs --tail 3 ha-jepsen-runner 2>&1
+                    docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" rustlakedb-ha-coord-1 rustlakedb-ha-coord-2 rustlakedb-ha-coord-3 rustlakedb-ha-worker-1 rustlakedb-ha-worker-2 rustlakedb-ha-nlb
+                }
+            }
+            if ((docker inspect -f "{{.State.Running}}" ha-jepsen-runner 2>$null) -ne "true") { break }
+            $round += 1
+            Invoke-JepsenRound -RoundNum $round -FallbackLeader $leader
         }
     }
-    if (-not $currentLeaderContainer) { $currentLeaderContainer = $leaderContainer }
-    Write-Host "`n=== [JEPSEN CHAOS 2] Injecting Hard SIGKILL into Current Raft Leader ($currentLeaderContainer) ===" -ForegroundColor Red
-    docker kill -s SIGKILL $currentLeaderContainer | Out-Null
-    Start-Sleep -Seconds 5
-    Write-Host "=== [JEPSEN RECOVERY 2] Cold-Restarting Killed Leader ($currentLeaderContainer) ===" -ForegroundColor Green
-    docker start $currentLeaderContainer | Out-Null
 
     $exitCode = [int](docker wait ha-jepsen-runner)
     $runnerOut = (docker logs ha-jepsen-runner 2>&1) -join "`n"

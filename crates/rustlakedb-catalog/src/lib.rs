@@ -471,6 +471,10 @@ pub trait Catalog: Send + Sync {
     fn raft_telemetry(&self) -> Option<RaftTelemetry> {
         None
     }
+    /// Returns `(table_count, max_snapshots_on_any_table)` with zero metadata cloning for `/metrics`.
+    fn catalog_stats(&self) -> (usize, usize) {
+        (0, 0)
+    }
     async fn create_table(&self, metadata: IcebergTableMetadata) -> Result<()>;
     async fn drop_table(&self, table_name: &str) -> Result<()>;
     async fn get_table(&self, table_name: &str) -> Result<IcebergTableMetadata>;
@@ -542,6 +546,34 @@ pub struct InMemoryRaftCatalog {
     last_state_stamp: RwLock<Option<(std::time::SystemTime, u64)>>,
     last_views_stamp: RwLock<Option<(std::time::SystemTime, u64)>>,
     last_governance_stamp: RwLock<Option<(std::time::SystemTime, u64)>>,
+}
+
+fn max_retained_snapshots() -> usize {
+    std::env::var("RUSTLAKEDB_MAX_RETAINED_SNAPSHOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(8)
+}
+
+/// Bounds in-memory & persisted historical snapshot retention to O(1) per table while always
+/// preserving every snapshot pointed to by a live branch/tag in `table.refs`.
+fn prune_old_snapshots(table: &mut IcebergTableMetadata) {
+    let cap = max_retained_snapshots();
+    if table.snapshots.len() <= cap {
+        return;
+    }
+    let pinned: HashSet<u64> = table.refs.values().copied().collect();
+    let removable: Vec<u64> = table
+        .snapshots
+        .keys()
+        .copied()
+        .filter(|sid| !pinned.contains(sid))
+        .collect();
+    let to_drop = table.snapshots.len().saturating_sub(cap);
+    for sid in removable.into_iter().take(to_drop) {
+        table.snapshots.remove(&sid);
+    }
 }
 
 fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
@@ -616,7 +648,7 @@ impl InMemoryRaftCatalog {
     fn persist_locked(&self, tables: &HashMap<String, IcebergTableMetadata>) -> Result<()> {
         if let Some(ref path) = self.state_file {
             let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-            let bytes = serde_json::to_vec_pretty(tables)?;
+            let bytes = serde_json::to_vec(tables)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
             *self.last_state_stamp.write() = file_stamp(path);
@@ -627,7 +659,7 @@ impl InMemoryRaftCatalog {
     fn persist_views_locked(&self, views: &HashMap<String, ViewDefinition>) -> Result<()> {
         if let Some(ref path) = self.views_file {
             let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-            let bytes = serde_json::to_vec_pretty(views)?;
+            let bytes = serde_json::to_vec(views)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
             *self.last_views_stamp.write() = file_stamp(path);
@@ -638,7 +670,7 @@ impl InMemoryRaftCatalog {
     fn persist_governance_locked(&self, gov: &PersistedGovernanceState) -> Result<()> {
         if let Some(ref path) = self.governance_file {
             let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-            let bytes = serde_json::to_vec_pretty(gov)?;
+            let bytes = serde_json::to_vec(gov)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
             *self.last_governance_stamp.write() = file_stamp(path);
@@ -726,6 +758,16 @@ pub fn normalize_table_name(raw: &str) -> String {
 
 #[async_trait]
 impl Catalog for InMemoryRaftCatalog {
+    fn catalog_stats(&self) -> (usize, usize) {
+        let guard = self.tables.read();
+        let max_snaps = guard
+            .values()
+            .map(|t| t.snapshots.len())
+            .max()
+            .unwrap_or(0);
+        (guard.len(), max_snaps)
+    }
+
     async fn create_table(&self, mut metadata: IcebergTableMetadata) -> Result<()> {
         metadata.table_name = normalize_table_name(&metadata.table_name);
         let mut guard = self.tables.write();
@@ -993,6 +1035,7 @@ impl Catalog for InMemoryRaftCatalog {
                 },
             );
             table.refs.insert(prop.branch, new_id);
+            prune_old_snapshots(table);
             committed.push((prop.table_name, new_id));
         }
 

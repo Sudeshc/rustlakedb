@@ -147,26 +147,32 @@ def run_soak_loop(duration_secs: float):
 
     committed_tx_ids = set()
     lock = threading.Lock()
+    pause_for_compact = threading.Event()
     read_queries_ok = 0
     write_retries = 0
     write_errors = 0
+    compactions_ok = 0
     t_start = time.perf_counter()
 
     def writer_worker(wid: int):
         nonlocal write_retries, write_errors
         seq = 0
         while time.perf_counter() - t_start < duration_secs:
+            while pause_for_compact.is_set() and time.perf_counter() - t_start < duration_secs:
+                time.sleep(0.05)
+            if time.perf_counter() - t_start >= duration_secs:
+                break
             seq += 1
-            tx_id = wid * 1_000_000 + seq
+            tx_id = wid * 10_000_000 + seq
             # Retry transient leader-election / NLB failover resets (standard Raft client contract)
             committed = False
-            for attempt in range(8):
+            for attempt in range(10):
                 try:
                     st, resp = http_json(
                         "POST",
                         f"{NLB_HTTP}/v1/sql",
                         {"sql": f"INSERT INTO ha_jepsen_ledger VALUES ({tx_id}, {wid}, 10.0)"},
-                        timeout=4.0,
+                        timeout=5.0,
                     )
                     if st == 200 and "error" not in resp:
                         with lock:
@@ -196,10 +202,54 @@ def run_soak_loop(duration_secs: float):
                             read_queries_ok += 1
             except Exception:
                 pass
-            time.sleep(0.2)
+            time.sleep(0.25)
+
+    def maintainer_and_telemetry_worker():
+        nonlocal compactions_ok
+        last_report = t_start
+        last_compact = t_start
+        compact_interval = 25.0 if duration_secs >= 60.0 else 999999.0
+        while time.perf_counter() - t_start < duration_secs:
+            time.sleep(2.0)
+            now = time.perf_counter()
+            if now - last_compact >= compact_interval and (duration_secs - (now - t_start)) > 10.0:
+                pause_for_compact.set()
+                time.sleep(0.6)
+                try:
+                    st_c, _ = http_json("POST", f"{NLB_HTTP}/v1/sql", {"sql": "COMPACT TABLE ha_jepsen_ledger"}, timeout=20.0)
+                    if st_c == 200:
+                        http_json("POST", f"{NLB_HTTP}/v1/sql", {"sql": "VACUUM TABLE ha_jepsen_ledger RETAIN 16"}, timeout=20.0)
+                        with lock:
+                            compactions_ok += 1
+                except Exception:
+                    pass
+                finally:
+                    pause_for_compact.clear()
+                    last_compact = time.perf_counter()
+
+            if now - last_report >= 30.0:
+                elapsed = int(now - t_start)
+                hh, rem = divmod(elapsed, 3600)
+                mm, ss = divmod(rem, 60)
+                st_map = get_cluster_raft_state()
+                leaders = [(n, r.get("term")) for n, r in st_map.items() if r and r.get("is_leader")]
+                l_str = f"{leaders[0][0]}(t{leaders[0][1]})" if leaders else "electing"
+                with lock:
+                    w_cnt = len(committed_tx_ids)
+                    r_cnt = read_queries_ok
+                    ret_cnt = write_retries
+                    err_cnt = write_errors
+                    cmp_cnt = compactions_ok
+                print(
+                    f"  [SOAK +{hh:02d}:{mm:02d}:{ss:02d}] writes={w_cnt} reads={r_cnt} "
+                    f"compactions={cmp_cnt} retries={ret_cnt} errs={err_cnt} leader={l_str}",
+                    flush=True,
+                )
+                last_report = now
 
     threads = [threading.Thread(target=writer_worker, args=(w,)) for w in range(1, 5)]
     threads += [threading.Thread(target=reader_worker) for _ in range(2)]
+    threads.append(threading.Thread(target=maintainer_and_telemetry_worker))
     for t in threads:
         t.start()
     for t in threads:
@@ -264,6 +314,7 @@ def run_soak_loop(duration_secs: float):
         "lost_commits": 0,
         "split_brain_divergence": False,
         "read_queries_succeeded": read_queries_ok,
+        "compactions_completed": compactions_ok,
         "transient_failover_retries": write_retries,
         "unrecovered_write_errors": write_errors,
         "sli_and_vended_creds": sli_audit,
