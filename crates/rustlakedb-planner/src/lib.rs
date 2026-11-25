@@ -204,6 +204,20 @@ pub enum PlannedCommand {
         table_name: String,
         role: String,
     },
+    GrantRole {
+        parent_role: String,
+        child_role: String,
+    },
+    RevokeRole {
+        parent_role: String,
+        child_role: String,
+    },
+    GrantColumns {
+        privilege: String,
+        columns: Vec<String>,
+        table_name: String,
+        role: String,
+    },
     CreateRlsPolicy {
         name: String,
         table_name: String,
@@ -216,6 +230,26 @@ pub enum PlannedCommand {
         target: String,
         role: String,
         mask_value: String,
+    },
+    CreateTagMaskingPolicy {
+        name: String,
+        role: String,
+        tag_key: String,
+        tag_value: String,
+        target: String,
+        mask_value: String,
+    },
+    CreateExternalCatalog {
+        name: String,
+        catalog_type: String,
+        uri: String,
+        token: Option<String>,
+    },
+    AttachExternalTable {
+        local_table: String,
+        catalog_name: String,
+        remote_namespace: String,
+        remote_table: String,
     },
     ShowTables,
     ShowQueries,
@@ -478,11 +512,20 @@ impl DistributedPlanner {
         if upper.starts_with("REVOKE ") {
             return parse_grant_or_revoke(trimmed, false);
         }
+        if upper.starts_with("CREATE TAG MASKING POLICY ") {
+            return parse_create_tag_masking_policy(trimmed);
+        }
         if upper.starts_with("CREATE MASKING POLICY ") {
             return parse_create_masking_policy(trimmed);
         }
         if upper.starts_with("CREATE POLICY ") {
             return parse_create_rls_policy(trimmed);
+        }
+        if upper.starts_with("CREATE EXTERNAL CATALOG ") {
+            return parse_create_external_catalog(trimmed);
+        }
+        if upper.starts_with("ATTACH EXTERNAL TABLE ") {
+            return parse_attach_external_table(trimmed);
         }
         if upper.starts_with("VACUUM TABLE ") {
             let rest = trimmed["VACUUM TABLE ".len()..].trim();
@@ -4119,8 +4162,71 @@ fn parse_create_view(sql: &str, materialized: bool) -> Result<PlannedCommand> {
 }
 
 fn parse_grant_or_revoke(sql: &str, is_grant: bool) -> Result<PlannedCommand> {
-    // GRANT <PRIV> ON <table> TO <role> | REVOKE <PRIV> ON <table> FROM <role>
+    // Supports:
+    //   1) Role hierarchy: GRANT <parent_role> TO <child_role> | REVOKE <parent_role> FROM <child_role>
+    //   2) Column-level:   GRANT SELECT (col1, col2) ON <table> TO <role>
+    //   3) Hierarchical:   GRANT <PRIV> ON SCHEMA <schema> TO <role>
+    //                      GRANT <PRIV> ON ALL TABLES IN SCHEMA <schema> TO <role>
+    //                      GRANT <PRIV> ON DATABASE <db> TO <role>
+    //   4) Table-level:    GRANT/REVOKE <PRIV> ON <table> TO/FROM <role>
+    let upper = sql.to_uppercase();
     let tokens: Vec<&str> = sql.split_whitespace().collect();
+
+    // 1) Role-to-role inheritance (no ` ON ` keyword)
+    if !upper.contains(" ON ") {
+        if tokens.len() >= 4
+            && ((is_grant && tokens[2].eq_ignore_ascii_case("TO"))
+                || (!is_grant && tokens[2].eq_ignore_ascii_case("FROM")))
+        {
+            let parent_role = tokens[1].trim_matches('"').to_string();
+            let child_role = tokens[3].trim_matches('"').to_string();
+            return Ok(if is_grant {
+                PlannedCommand::GrantRole {
+                    parent_role,
+                    child_role,
+                }
+            } else {
+                PlannedCommand::RevokeRole {
+                    parent_role,
+                    child_role,
+                }
+            });
+        }
+        return Err(RustLakeError::SqlParse(
+            "expected: GRANT/REVOKE <PRIV> ON <target> TO/FROM <role> OR GRANT <parent_role> TO <child_role>".into(),
+        ));
+    }
+
+    // 2) Column-level grant: GRANT SELECT (c1, c2) ON <table> TO <role>
+    let on_pos = upper.find(" ON ").unwrap();
+    let before_on = sql[..on_pos].trim();
+    if is_grant
+        && let (Some(lp), Some(rp)) = (before_on.find('('), before_on.rfind(')'))
+        && rp > lp
+    {
+        let priv_tokens: Vec<&str> = before_on[..lp].split_whitespace().collect();
+        let privilege = priv_tokens.get(1).copied().unwrap_or("SELECT").to_uppercase();
+        let columns: Vec<String> = before_on[lp + 1..rp]
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let after_on: Vec<&str> = sql[on_pos + 4..].split_whitespace().collect();
+        let table_name = normalize_table_name(after_on.first().copied().unwrap_or(""));
+        let role = after_on
+            .last()
+            .copied()
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_string();
+        return Ok(PlannedCommand::GrantColumns {
+            privilege,
+            columns,
+            table_name,
+            role,
+        });
+    }
+
     if tokens.len() < 6 {
         return Err(RustLakeError::SqlParse(
             "expected: GRANT/REVOKE <PRIV> ON <table> TO/FROM <role>".into(),
@@ -4130,8 +4236,49 @@ fn parse_grant_or_revoke(sql: &str, is_grant: bool) -> Result<PlannedCommand> {
     let on_idx = tokens
         .iter()
         .position(|t| t.eq_ignore_ascii_case("ON"))
-        .ok_or_else(|| RustLakeError::SqlParse("GRANT/REVOKE requires ON <table>".into()))?;
-    let table_name = normalize_table_name(tokens.get(on_idx + 1).copied().unwrap_or(""));
+        .ok_or_else(|| RustLakeError::SqlParse("GRANT/REVOKE requires ON <target>".into()))?;
+
+    // 3) Hierarchical schema / database scope vs table-level scope
+    let table_name = if tokens
+        .get(on_idx + 1)
+        .is_some_and(|t| t.eq_ignore_ascii_case("DATABASE"))
+    {
+        "database:*".to_string()
+    } else if tokens
+        .get(on_idx + 1)
+        .is_some_and(|t| t.eq_ignore_ascii_case("SCHEMA"))
+    {
+        let sc = tokens
+            .get(on_idx + 2)
+            .copied()
+            .unwrap_or("public")
+            .trim_matches('"')
+            .to_lowercase();
+        format!("schema:{sc}")
+    } else if tokens
+        .get(on_idx + 1)
+        .is_some_and(|t| t.eq_ignore_ascii_case("ALL"))
+        && tokens
+            .get(on_idx + 2)
+            .is_some_and(|t| t.eq_ignore_ascii_case("TABLES"))
+        && tokens
+            .get(on_idx + 3)
+            .is_some_and(|t| t.eq_ignore_ascii_case("IN"))
+        && tokens
+            .get(on_idx + 4)
+            .is_some_and(|t| t.eq_ignore_ascii_case("SCHEMA"))
+    {
+        let sc = tokens
+            .get(on_idx + 5)
+            .copied()
+            .unwrap_or("public")
+            .trim_matches('"')
+            .to_lowercase();
+        format!("schema:{sc}")
+    } else {
+        normalize_table_name(tokens.get(on_idx + 1).copied().unwrap_or(""))
+    };
+
     let role = tokens
         .last()
         .copied()
@@ -4151,6 +4298,120 @@ fn parse_grant_or_revoke(sql: &str, is_grant: bool) -> Result<PlannedCommand> {
             role,
         })
     }
+}
+
+fn parse_create_tag_masking_policy(sql: &str) -> Result<PlannedCommand> {
+    // CREATE TAG MASKING POLICY <name> FOR <role> ON TAG <k>=<v> MASK <col_or_star> AS '<mask>'
+    let upper = sql.to_uppercase();
+    let (mask_kw_pos, kw_len) = upper
+        .find(" AS ")
+        .map(|p| (p, 4))
+        .or_else(|| upper.find(" WITH ").map(|p| (p, 6)))
+        .ok_or_else(|| {
+            RustLakeError::SqlParse("CREATE TAG MASKING POLICY requires AS/WITH '<mask>'".into())
+        })?;
+    let tokens: Vec<&str> = sql[..mask_kw_pos].split_whitespace().collect();
+    // [CREATE, TAG, MASKING, POLICY, <name>, FOR, <role>, ON, TAG, <k=v>, MASK, <target>]
+    if tokens.len() < 12 {
+        return Err(RustLakeError::SqlParse(
+            "expected: CREATE TAG MASKING POLICY <name> FOR <role> ON TAG <k>=<v> MASK <col> AS '<mask>'".into(),
+        ));
+    }
+    let name = tokens[4].trim_matches('"').to_string();
+    let role = tokens[6].trim_matches('"').to_string();
+    let tag_expr = tokens[9].trim_matches('\'');
+    let (tk, tv) = tag_expr.split_once('=').ok_or_else(|| {
+        RustLakeError::SqlParse("ON TAG requires <key>=<value> (e.g. pii=true)".into())
+    })?;
+    let target = tokens[11].trim_matches('"').to_string();
+    let mask_value = sql[mask_kw_pos + kw_len..]
+        .trim()
+        .trim_matches('\'')
+        .to_string();
+    Ok(PlannedCommand::CreateTagMaskingPolicy {
+        name,
+        role,
+        tag_key: tk.trim().trim_matches('\'').to_string(),
+        tag_value: tv.trim().trim_matches('\'').to_string(),
+        target,
+        mask_value,
+    })
+}
+
+fn parse_create_external_catalog(sql: &str) -> Result<PlannedCommand> {
+    // CREATE EXTERNAL CATALOG <name> TYPE <ICEBERG_REST|SNOWFLAKE|DATABRICKS|GLUE|BIGQUERY> URL '<uri>' [TOKEN '<tok>']
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    if tokens.len() < 8 {
+        return Err(RustLakeError::SqlParse(
+            "expected: CREATE EXTERNAL CATALOG <name> TYPE <type> URL '<uri>' [TOKEN '<tok>']".into(),
+        ));
+    }
+    let name = tokens[3].trim_matches('"').to_string();
+    let mut catalog_type = "ICEBERG_REST".to_string();
+    let mut uri = String::new();
+    let mut token = None;
+    let mut i = 4;
+    while i + 1 < tokens.len() {
+        let kw = tokens[i].to_uppercase();
+        let val = tokens[i + 1].trim_matches('\'').trim_matches('"').to_string();
+        match kw.as_str() {
+            "TYPE" => catalog_type = val.to_uppercase(),
+            "URL" | "URI" => uri = val,
+            "TOKEN" => token = Some(val),
+            _ => {}
+        }
+        i += 2;
+    }
+    if uri.is_empty() {
+        return Err(RustLakeError::SqlParse("CREATE EXTERNAL CATALOG requires URL '<uri>'".into()));
+    }
+    Ok(PlannedCommand::CreateExternalCatalog {
+        name,
+        catalog_type,
+        uri,
+        token,
+    })
+}
+
+fn parse_attach_external_table(sql: &str) -> Result<PlannedCommand> {
+    // ATTACH EXTERNAL TABLE <local_table> FROM CATALOG <catalog> NAMESPACE '<ns>' TABLE '<remote_table>'
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    if tokens.len() < 11 {
+        return Err(RustLakeError::SqlParse(
+            "expected: ATTACH EXTERNAL TABLE <local> FROM CATALOG <cat> NAMESPACE '<ns>' TABLE '<remote>'".into(),
+        ));
+    }
+    let local_table = normalize_table_name(tokens[3]);
+    let mut catalog_name = String::new();
+    let mut remote_namespace = "default".to_string();
+    let mut remote_table = String::new();
+    let mut i = 4;
+    while i + 1 < tokens.len() {
+        let kw = tokens[i].to_uppercase();
+        if kw == "FROM" {
+            i += 1;
+            continue;
+        }
+        let val = tokens[i + 1].trim_matches('\'').trim_matches('"').to_string();
+        match kw.as_str() {
+            "CATALOG" => catalog_name = val,
+            "NAMESPACE" => remote_namespace = val,
+            "TABLE" => remote_table = val,
+            _ => {}
+        }
+        i += 2;
+    }
+    if catalog_name.is_empty() || remote_table.is_empty() {
+        return Err(RustLakeError::SqlParse(
+            "ATTACH EXTERNAL TABLE requires CATALOG <cat> and TABLE '<remote>'".into(),
+        ));
+    }
+    Ok(PlannedCommand::AttachExternalTable {
+        local_table,
+        catalog_name,
+        remote_namespace,
+        remote_table,
+    })
 }
 
 fn parse_create_rls_policy(sql: &str) -> Result<PlannedCommand> {
@@ -4192,10 +4453,28 @@ fn parse_create_rls_policy(sql: &str) -> Result<PlannedCommand> {
 }
 
 fn parse_create_masking_policy(sql: &str) -> Result<PlannedCommand> {
-    // CREATE MASKING POLICY <name> ON <table>.<col_or_path> FOR <role> AS '<mask>'
+    // Supports BOTH:
+    //   CREATE MASKING POLICY <name> ON <table>.<col_or_path> FOR <role> AS '<mask>'
+    //   CREATE MASKING POLICY <name> ON <table> FOR <role> MASK <col_or_path> WITH '<mask>'
     let upper = sql.to_uppercase();
+    if let Some(mask_pos) = upper.find(" MASK ")
+        && let Some(with_pos) = upper.find(" WITH ")
+        && with_pos > mask_pos
+    {
+        let header: Vec<&str> = sql[..mask_pos].split_whitespace().collect();
+        // [CREATE, MASKING, POLICY, <name>, ON, <table>, FOR, <role>]
+        if header.len() >= 8 {
+            return Ok(PlannedCommand::CreateMaskingPolicy {
+                name: header[3].trim_matches('"').to_string(),
+                table_name: normalize_table_name(header[5]),
+                target: sql[mask_pos + 6..with_pos].trim().trim_matches('"').to_string(),
+                role: header[7].trim_matches('"').to_string(),
+                mask_value: sql[with_pos + 6..].trim().trim_matches('\'').to_string(),
+            });
+        }
+    }
     let as_pos = upper.find(" AS ").ok_or_else(|| {
-        RustLakeError::SqlParse("CREATE MASKING POLICY requires AS '<mask>'".into())
+        RustLakeError::SqlParse("CREATE MASKING POLICY requires AS '<mask>' or MASK <col> WITH '<mask>'".into())
     })?;
     let header_tokens: Vec<&str> = sql[..as_pos].split_whitespace().collect();
     // [CREATE, MASKING, POLICY, <name>, ON, <table.target>, FOR, <role>]

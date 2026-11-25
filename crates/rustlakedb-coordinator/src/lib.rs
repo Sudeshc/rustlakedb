@@ -610,6 +610,39 @@ impl Coordinator {
             });
         }
 
+        if lower == "show external catalogs" {
+            if let Ok(gov) = self.catalog.get_governance().await {
+                self.governance.hydrate_from_catalog(gov);
+            }
+            let cats = self.governance.list_external_catalogs();
+            let rows: Vec<BTreeMap<String, ScalarValue>> = cats
+                .into_iter()
+                .map(|c| {
+                    BTreeMap::from([
+                        ("catalog_name".into(), ScalarValue::Utf8(c.name)),
+                        ("catalog_type".into(), ScalarValue::Utf8(c.catalog_type)),
+                        ("uri".into(), ScalarValue::Utf8(c.uri)),
+                        ("auth_configured".into(), ScalarValue::Bool(c.token.is_some())),
+                    ])
+                })
+                .collect();
+            let n = rows.len();
+            return Ok(QueryExecutionResult {
+                command_tag: format!("SELECT {n}"),
+                dag: None,
+                batch: RowBatch::new(
+                    vec![
+                        "catalog_name".into(),
+                        "catalog_type".into(),
+                        "uri".into(),
+                        "auth_configured".into(),
+                    ],
+                    rows,
+                ),
+                stats: QueryExecutionStats::default(),
+            });
+        }
+
         // Wave 37: `SHOW VIEWS` catalog inspection
         if lower == "show views" {
             let views = self.catalog.list_views().await?;
@@ -686,6 +719,9 @@ impl Coordinator {
             });
         }
         if lower.contains("system.audit_log") {
+            if let Ok(gov) = self.catalog.get_governance().await {
+                self.governance.hydrate_from_catalog(gov);
+            }
             let entries = self.governance.audit_log_snapshot();
             let cols = vec![
                 "timestamp_ms".into(),
@@ -703,6 +739,44 @@ impl Coordinator {
                         ("action".into(), ScalarValue::Utf8(e.action)),
                         ("target".into(), ScalarValue::Utf8(e.target)),
                         ("outcome".into(), ScalarValue::Utf8(e.outcome)),
+                    ])
+                })
+                .collect();
+            let n = rows.len();
+            return Ok(QueryExecutionResult {
+                command_tag: format!("SELECT {n}"),
+                dag: None,
+                batch: RowBatch::new(cols, rows),
+                stats: QueryExecutionStats::default(),
+            });
+        }
+        if lower.contains("system.access_history") {
+            if let Ok(gov) = self.catalog.get_governance().await {
+                self.governance.hydrate_from_catalog(gov);
+            }
+            let entries = self.governance.access_history_snapshot();
+            let cols = vec![
+                "timestamp_ms".into(),
+                "query_id".into(),
+                "user_name".into(),
+                "role_name".into(),
+                "table_name".into(),
+                "columns".into(),
+                "action".into(),
+                "protocol".into(),
+            ];
+            let rows: Vec<BTreeMap<String, ScalarValue>> = entries
+                .into_iter()
+                .map(|e| {
+                    BTreeMap::from([
+                        ("timestamp_ms".into(), ScalarValue::Int64(e.timestamp_ms as i64)),
+                        ("query_id".into(), ScalarValue::Utf8(e.query_id)),
+                        ("user_name".into(), ScalarValue::Utf8(e.user)),
+                        ("role_name".into(), ScalarValue::Utf8(e.role)),
+                        ("table_name".into(), ScalarValue::Utf8(e.table)),
+                        ("columns".into(), ScalarValue::Utf8(e.columns.join(","))),
+                        ("action".into(), ScalarValue::Utf8(e.action)),
+                        ("protocol".into(), ScalarValue::Utf8(e.protocol)),
                     ])
                 })
                 .collect();
@@ -927,14 +1001,43 @@ impl Coordinator {
         match cmd {
             PlannedCommand::Query(mut dag) => {
                 let tables = collect_dag_tables(&dag);
+                let qid_str = dag.query_id.to_string();
+                let mut table_tags: HashMap<String, BTreeMap<String, String>> = HashMap::new();
                 for t in &tables {
                     self.governance.check_access(session, t, "SELECT")?;
+                    if let Ok(meta) = self.catalog.get_table(t).await
+                        && !meta.tags.is_empty()
+                    {
+                        table_tags.insert(t.clone(), meta.tags);
+                    }
                 }
                 inject_rls_into_dag(&mut dag, session, &self.governance);
                 track_hot_json_paths_in_dag(&dag, &self.governance);
                 let mut res = self.execute_dag(dag).await?;
+                self.governance.enforce_column_grants(
+                    session,
+                    &tables,
+                    &res.batch,
+                    &effective_sql,
+                )?;
                 self.governance
                     .apply_masking(session, &tables, &mut res.batch);
+                self.governance
+                    .apply_tag_masking(session, &table_tags, &mut res.batch);
+                for t in &tables {
+                    let entry = self.governance.record_access(
+                        &qid_str,
+                        session,
+                        t,
+                        res.batch.columns.clone(),
+                        "SELECT",
+                        "SQL",
+                    );
+                    let _ = self
+                        .catalog
+                        .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAccess(entry))
+                        .await;
+                }
                 Ok(res)
             }
             PlannedCommand::ExplainAnalyze(mut dag) => {
@@ -1967,9 +2070,17 @@ impl Coordinator {
                 })
             }
             PlannedCommand::AlterSetTags { table_name, tags } => {
+                self.governance
+                    .require_security_admin(session, "SET TAGS", &table_name)?;
                 self.catalog.set_table_tags(&table_name, tags.clone()).await?;
                 self.governance
                     .record_audit(&session.user, "SET TAGS", &table_name, "OK");
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(session, "SET TAGS", &table_name, "OK", "SQL"),
+                    ))
+                    .await;
                 Ok(QueryExecutionResult {
                     command_tag: format!("ALTER TABLE SET TAGS ({})", tags.len()),
                     dag: None,
@@ -2625,6 +2736,8 @@ impl Coordinator {
                 })
             }
             PlannedCommand::CreateRole { role } => {
+                self.governance
+                    .require_security_admin(session, "CREATE ROLE", &role)?;
                 self.governance.create_role(&role);
                 let _ = self
                     .catalog
@@ -2632,6 +2745,12 @@ impl Coordinator {
                     .await;
                 self.governance
                     .record_audit(&session.user, "CREATE ROLE", &role, "OK");
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(session, "CREATE ROLE", &role, "OK", "SQL"),
+                    ))
+                    .await;
                 Ok(QueryExecutionResult {
                     command_tag: "CREATE ROLE".into(),
                     dag: None,
@@ -2644,6 +2763,8 @@ impl Coordinator {
                 table_name,
                 role,
             } => {
+                self.governance
+                    .require_security_admin(session, "GRANT", &format!("{table_name} TO {role}"))?;
                 self.governance.grant(&role, &table_name, &privilege);
                 let _ = self
                     .catalog
@@ -2653,12 +2774,16 @@ impl Coordinator {
                         privilege: privilege.clone(),
                     })
                     .await;
-                self.governance.record_audit(
-                    &session.user,
-                    &format!("GRANT {privilege}"),
-                    &format!("{table_name} TO {role}"),
-                    "OK",
-                );
+                let action = format!("GRANT {privilege}");
+                let target = format!("{table_name} TO {role}");
+                self.governance
+                    .record_audit(&session.user, &action, &target, "OK");
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(session, &action, &target, "OK", "SQL"),
+                    ))
+                    .await;
                 Ok(QueryExecutionResult {
                     command_tag: "GRANT".into(),
                     dag: None,
@@ -2671,6 +2796,11 @@ impl Coordinator {
                 table_name,
                 role,
             } => {
+                self.governance.require_security_admin(
+                    session,
+                    "REVOKE",
+                    &format!("{table_name} FROM {role}"),
+                )?;
                 self.governance.revoke(&role, &table_name, &privilege);
                 let _ = self
                     .catalog
@@ -2680,14 +2810,108 @@ impl Coordinator {
                         privilege: privilege.clone(),
                     })
                     .await;
-                self.governance.record_audit(
-                    &session.user,
-                    &format!("REVOKE {privilege}"),
-                    &format!("{table_name} FROM {role}"),
-                    "OK",
-                );
+                let action = format!("REVOKE {privilege}");
+                let target = format!("{table_name} FROM {role}");
+                self.governance
+                    .record_audit(&session.user, &action, &target, "OK");
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(session, &action, &target, "OK", "SQL"),
+                    ))
+                    .await;
                 Ok(QueryExecutionResult {
                     command_tag: "REVOKE".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::GrantRole {
+                parent_role,
+                child_role,
+            } => {
+                let target = format!("{parent_role} TO {child_role}");
+                self.governance
+                    .require_security_admin(session, "GRANT ROLE", &target)?;
+                self.governance
+                    .grant_role_to_role(&parent_role, &child_role);
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::GrantRoleToRole {
+                        parent_role,
+                        child_role,
+                    })
+                    .await;
+                self.governance
+                    .record_audit(&session.user, "GRANT ROLE", &target, "OK");
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(session, "GRANT ROLE", &target, "OK", "SQL"),
+                    ))
+                    .await;
+                Ok(QueryExecutionResult {
+                    command_tag: "GRANT ROLE".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::RevokeRole {
+                parent_role,
+                child_role,
+            } => {
+                let target = format!("{parent_role} FROM {child_role}");
+                self.governance
+                    .require_security_admin(session, "REVOKE ROLE", &target)?;
+                self.governance
+                    .revoke_role_from_role(&parent_role, &child_role);
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RevokeRoleFromRole {
+                        parent_role,
+                        child_role,
+                    })
+                    .await;
+                self.governance
+                    .record_audit(&session.user, "REVOKE ROLE", &target, "OK");
+                Ok(QueryExecutionResult {
+                    command_tag: "REVOKE ROLE".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::GrantColumns {
+                privilege,
+                columns,
+                table_name,
+                role,
+            } => {
+                let target = format!("{}({}) ON {} TO {}", privilege, columns.join(","), table_name, role);
+                self.governance
+                    .require_security_admin(session, "GRANT COLUMNS", &target)?;
+                self.governance
+                    .grant_columns(&role, &table_name, columns.clone());
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::GrantColumns {
+                        role,
+                        table: table_name,
+                        columns,
+                    })
+                    .await;
+                self.governance
+                    .record_audit(&session.user, "GRANT COLUMNS", &target, "OK");
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(session, "GRANT COLUMNS", &target, "OK", "SQL"),
+                    ))
+                    .await;
+                Ok(QueryExecutionResult {
+                    command_tag: "GRANT".into(),
                     dag: None,
                     batch: RowBatch::default(),
                     stats: QueryExecutionStats::default(),
@@ -2699,6 +2923,9 @@ impl Coordinator {
                 role,
                 predicate,
             } => {
+                let target = format!("{name} ON {table_name} FOR {role}");
+                self.governance
+                    .require_security_admin(session, "CREATE POLICY", &target)?;
                 self.governance
                     .add_rls_policy(&role, &table_name, predicate.clone());
                 let _ = self
@@ -2709,12 +2936,14 @@ impl Coordinator {
                         predicate,
                     })
                     .await;
-                self.governance.record_audit(
-                    &session.user,
-                    "CREATE POLICY",
-                    &format!("{name} ON {table_name} FOR {role}"),
-                    "OK",
-                );
+                self.governance
+                    .record_audit(&session.user, "CREATE POLICY", &target, "OK");
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(session, "CREATE POLICY", &target, "OK", "SQL"),
+                    ))
+                    .await;
                 Ok(QueryExecutionResult {
                     command_tag: "CREATE POLICY".into(),
                     dag: None,
@@ -2729,6 +2958,9 @@ impl Coordinator {
                 role,
                 mask_value,
             } => {
+                let audit_target = format!("{name} ON {table_name}.{target} FOR {role}");
+                self.governance
+                    .require_security_admin(session, "CREATE MASKING POLICY", &audit_target)?;
                 self.governance.add_masking_policy(
                     &role,
                     &table_name,
@@ -2753,11 +2985,266 @@ impl Coordinator {
                 self.governance.record_audit(
                     &session.user,
                     "CREATE MASKING POLICY",
-                    &format!("{name} ON {table_name}.{target} FOR {role}"),
+                    &audit_target,
+                    "OK",
+                );
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(
+                            session,
+                            "CREATE MASKING POLICY",
+                            &audit_target,
+                            "OK",
+                            "SQL",
+                        ),
+                    ))
+                    .await;
+                Ok(QueryExecutionResult {
+                    command_tag: "CREATE MASKING POLICY".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::CreateTagMaskingPolicy {
+                name,
+                role,
+                tag_key,
+                tag_value,
+                target,
+                mask_value,
+            } => {
+                let audit_target = format!("{name} FOR {role} ON TAG {tag_key}={tag_value} MASK {target}");
+                self.governance.require_security_admin(
+                    session,
+                    "CREATE TAG MASKING POLICY",
+                    &audit_target,
+                )?;
+                let rule = rustlakedb_catalog::PersistedTagMaskingRule {
+                    name,
+                    role,
+                    tag_key,
+                    tag_value,
+                    target,
+                    mask_value,
+                };
+                self.governance.add_tag_masking_policy(rule.clone());
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::AddTagMaskingPolicy(rule))
+                    .await;
+                self.governance.record_audit(
+                    &session.user,
+                    "CREATE TAG MASKING POLICY",
+                    &audit_target,
                     "OK",
                 );
                 Ok(QueryExecutionResult {
-                    command_tag: "CREATE MASKING POLICY".into(),
+                    command_tag: "CREATE TAG MASKING POLICY".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::CreateExternalCatalog {
+                name,
+                catalog_type,
+                uri,
+                token,
+            } => {
+                self.governance
+                    .require_security_admin(session, "CREATE EXTERNAL CATALOG", &name)?;
+                let cfg = rustlakedb_catalog::ExternalCatalogConfig {
+                    name: name.clone(),
+                    catalog_type: catalog_type.clone(),
+                    uri: uri.clone(),
+                    token,
+                };
+                self.governance.register_external_catalog(cfg.clone());
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RegisterExternalCatalog(cfg))
+                    .await;
+                self.governance.record_audit(
+                    &session.user,
+                    "CREATE EXTERNAL CATALOG",
+                    &format!("{name} ({catalog_type} @ {uri})"),
+                    "OK",
+                );
+                Ok(QueryExecutionResult {
+                    command_tag: "CREATE EXTERNAL CATALOG".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::AttachExternalTable {
+                local_table,
+                catalog_name,
+                remote_namespace,
+                remote_table,
+            } => {
+                self.governance
+                    .require_security_admin(session, "ATTACH EXTERNAL TABLE", &local_table)?;
+                if let Ok(gov) = self.catalog.get_governance().await {
+                    self.governance.hydrate_from_catalog(gov);
+                }
+                let ext = self
+                    .governance
+                    .get_external_catalog(&catalog_name)
+                    .ok_or_else(|| {
+                        RustLakeError::Catalog(format!(
+                            "external catalog '{catalog_name}' not found"
+                        ))
+                    })?;
+                let load_url = format!(
+                    "{}/v1/namespaces/{}/tables/{}",
+                    ext.uri.trim_end_matches('/'),
+                    remote_namespace,
+                    remote_table
+                );
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                    .map_err(|e| RustLakeError::Execution(format!("federation client: {e}")))?;
+                let mut req = client.get(&load_url);
+                if let Some(ref tok) = ext.token {
+                    req = req.bearer_auth(tok);
+                }
+                let resp = req.send().await.map_err(|e| {
+                    RustLakeError::Execution(format!(
+                        "federated catalog '{}' request failed ({load_url}): {e}",
+                        ext.name
+                    ))
+                })?;
+                if !resp.status().is_success() {
+                    return Err(RustLakeError::Execution(format!(
+                        "federated catalog '{}' returned HTTP {} for {remote_namespace}.{remote_table}",
+                        ext.name,
+                        resp.status()
+                    )));
+                }
+                let doc: serde_json::Value = resp.json().await.map_err(|e| {
+                    RustLakeError::Execution(format!("parse federated LoadTableResult: {e}"))
+                })?;
+
+                // Parse Iceberg REST OpenAPI v1/v3 `metadata.schemas[0].fields` -> FieldSchema
+                let mut schema = Vec::new();
+                if let Some(fields) = doc
+                    .get("metadata")
+                    .and_then(|m| m.get("schemas"))
+                    .and_then(|s| s.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|s| s.get("fields"))
+                    .and_then(|f| f.as_array())
+                {
+                    for f in fields {
+                        let fid = f.get("id").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                        let fname = f
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("col")
+                            .to_string();
+                        let required = f.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let dt = match f.get("type").and_then(|v| v.as_str()).unwrap_or("string") {
+                            "long" | "int" => ColumnType::Int64,
+                            "double" | "float" => ColumnType::Float64,
+                            "boolean" => ColumnType::Bool,
+                            "date" => ColumnType::Date,
+                            "timestamp" | "timestamptz" => ColumnType::TimestampTz,
+                            "variant" => ColumnType::Variant,
+                            _ => ColumnType::Utf8,
+                        };
+                        schema.push(FieldSchema {
+                            field_id: fid,
+                            name: fname,
+                            data_type: dt,
+                            nullable: !required,
+                        });
+                    }
+                }
+                if schema.is_empty() {
+                    return Err(RustLakeError::Execution(
+                        "federated LoadTableResult contained no Iceberg schema fields".into(),
+                    ));
+                }
+
+                let mut meta = IcebergTableMetadata::new(local_table.clone(), schema);
+                meta.tags
+                    .insert("federated_catalog".into(), ext.name.clone());
+                meta.tags
+                    .insert("federated_type".into(), ext.catalog_type.clone());
+                meta.tags
+                    .insert("federated_namespace".into(), remote_namespace.clone());
+                meta.tags
+                    .insert("federated_table".into(), remote_table.clone());
+                if let Some(mloc) = doc.get("metadata-location").and_then(|v| v.as_str()) {
+                    meta.tags
+                        .insert("federated_metadata_location".into(), mloc.to_string());
+                }
+                let _ = self.catalog.drop_table(&local_table).await;
+                self.catalog.create_table(meta).await?;
+
+                // Attach active Iceberg data files from the remote catalog response if provided
+                let mut attached_files = Vec::new();
+                if let Some(files) = doc
+                    .get("metadata")
+                    .and_then(|m| m.get("snapshots"))
+                    .and_then(|s| s.as_array())
+                    .and_then(|a| a.last())
+                    .and_then(|s| s.get("data-files"))
+                    .and_then(|f| f.as_array())
+                {
+                    for f in files {
+                        if let Some(fp) = f.get("file-path").and_then(|v| v.as_str()) {
+                            attached_files.push(rustlakedb_catalog::DataFileEntry {
+                                file_path: fp.to_string(),
+                                row_group_id: 0,
+                                row_count: f
+                                    .get("record-count")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                byte_size: f
+                                    .get("file-size-in-bytes")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                deletion_vector: Default::default(),
+                                puffin_index: Default::default(),
+                                ndv_estimates: HashMap::new(),
+                                column_min: HashMap::new(),
+                                column_max: HashMap::new(),
+                                partition_values: HashMap::new(),
+                                dv_path: None,
+                                deleted_row_count: 0,
+                            });
+                        }
+                    }
+                }
+                if !attached_files.is_empty() {
+                    let cur_meta = self.catalog.get_table(&local_table).await?;
+                    let snap_id = cur_meta.current_snapshot("main")?.snapshot_id;
+                    let _ = self
+                        .catalog
+                        .commit_table(TableCommitProposal {
+                            table_name: local_table.clone(),
+                            branch: "main".into(),
+                            expected_snapshot_id: snap_id,
+                            added_files: attached_files,
+                            removed_files: vec![],
+                            is_append_only: true,
+                        })
+                        .await;
+                }
+
+                self.governance.record_audit(
+                    &session.user,
+                    "ATTACH EXTERNAL TABLE",
+                    &format!("{local_table} FROM {catalog_name}.{remote_namespace}.{remote_table}"),
+                    "OK",
+                );
+                Ok(QueryExecutionResult {
+                    command_tag: format!("ATTACH EXTERNAL TABLE {local_table}"),
                     dag: None,
                     batch: RowBatch::default(),
                     stats: QueryExecutionStats::default(),

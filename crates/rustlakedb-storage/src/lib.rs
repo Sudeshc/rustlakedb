@@ -257,6 +257,11 @@ impl IcebergObjectStore {
         self.store.clone()
     }
 
+    /// Configured base URI (e.g. `s3://bucket`, `gs://bucket`, `file:///path`, or `memory://`).
+    pub fn base_uri(&self) -> Option<&str> {
+        self.base_uri.as_deref()
+    }
+
     /// Writes raw bytes to an arbitrary object key (used by `COPY TO` for local & cloud URIs, Wave 26).
     pub async fn put_raw_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         self.store

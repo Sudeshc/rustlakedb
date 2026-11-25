@@ -61,7 +61,9 @@ impl ControlPlaneServer {
 }
 
 pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
-    let iceberg_rest = rustlakedb_catalog::rest::build_router(coord.catalog.clone());
+    let iceberg_rest = rustlakedb_catalog::rest::build_router(coord.catalog.clone()).layer(
+        axum::middleware::from_fn_with_state(coord.clone(), enforce_iceberg_rest_rbac),
+    );
     Router::new()
         .route("/", get(web_ui))
         .route("/readyz", get(healthz_http))
@@ -79,10 +81,84 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
         .route("/v1/governance/lineage", get(get_lineage_http))
         .route("/v1/governance/tags", get(get_tags_http))
         .route("/v1/governance/audit", get(get_audit_http))
+        .route("/v1/governance/access-history", get(get_access_history_http))
+        .route("/v1/governance/query-history", get(get_query_history_http))
+        .route("/v1/federation/catalogs", get(get_external_catalogs_http))
+        .route("/v1/federation/export/{table}", get(export_federation_descriptors_http))
         .route("/v1/tables/{table}/snapshots", get(get_table_snapshots_http))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(coord)
         .merge(iceberg_rest)
+}
+
+/// Wave 40: Enforces OIDC/JWT AuthN + Table RBAC + Access/Audit Logging on External Iceberg REST
+/// Catalog table endpoints (`/v1/namespaces/{ns}/tables/{table}` and `/credentials`) so Spark,
+/// Trino, Snowflake, Databricks, and PyIceberg obey identical governance as SQL!
+async fn enforce_iceberg_rest_rbac(
+    State(coord): State<Arc<Coordinator>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    // Parse `/v1/namespaces/{ns}/tables/{table}[/credentials]`
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() >= 5 && segs[0] == "v1" && segs[1] == "namespaces" && segs[3] == "tables" {
+        let table = segs[4];
+        let has_bearer = req.headers().contains_key("authorization");
+        let auth_required = std::env::var("RUSTLAKEDB_REST_AUTH_REQUIRED")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+        if has_bearer || auth_required {
+            let session = match resolve_http_session(&coord, req.headers(), "anonymous").await {
+                Ok(s) => s,
+                Err(e) => {
+                    return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))).into_response();
+                }
+            };
+            if !session.is_superuser()
+                && let Ok(gov) = coord.catalog.get_governance().await
+            {
+                coord.governance.hydrate_from_catalog(gov);
+            }
+            let priv_needed = match method.as_str() {
+                "POST" => "INSERT",
+                "DELETE" => "DELETE",
+                _ => "SELECT",
+            };
+            if let Err(e) = coord.governance.check_access(&session, table, priv_needed) {
+                let _ = coord
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        crate::security::make_persisted_audit(
+                            &session,
+                            priv_needed,
+                            table,
+                            "DENIED (42501)",
+                            "ICEBERG_REST",
+                        ),
+                    ))
+                    .await;
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": { "message": e.to_string(), "type": "ForbiddenException", "code": 403 } })),
+                )
+                    .into_response();
+            }
+            let entry = coord.governance.record_access(
+                "iceberg-rest",
+                &session,
+                table,
+                vec!["*".into()],
+                priv_needed,
+                "ICEBERG_REST",
+            );
+            let _ = coord
+                .catalog
+                .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAccess(entry))
+                .await;
+        }
+    }
+    next.run(req).await
 }
 
 #[derive(Deserialize)]
@@ -556,8 +632,106 @@ async fn get_tags_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
 }
 
 async fn get_audit_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    if let Ok(gov) = coord.catalog.get_governance().await {
+        coord.governance.hydrate_from_catalog(gov);
+    }
     let entries = coord.governance.audit_log_snapshot();
     Json(json!({ "count": entries.len(), "audit_log": entries }))
+}
+
+async fn get_access_history_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    if let Ok(gov) = coord.catalog.get_governance().await {
+        coord.governance.hydrate_from_catalog(gov);
+    }
+    let entries = coord.governance.access_history_snapshot();
+    Json(json!({ "count": entries.len(), "access_history": entries }))
+}
+
+async fn get_query_history_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    let entries = coord.governance.query_history_snapshot();
+    Json(json!({ "count": entries.len(), "query_history": entries }))
+}
+
+async fn get_external_catalogs_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    if let Ok(gov) = coord.catalog.get_governance().await {
+        coord.governance.hydrate_from_catalog(gov);
+    }
+    let catalogs = coord.governance.list_external_catalogs();
+    Json(json!({ "count": catalogs.len(), "external_catalogs": catalogs }))
+}
+
+/// Outbound Multi-Engine Catalog Federation Descriptor (Wave 40):
+/// Generates turnkey Iceberg v3 federation snippets so Snowflake, Databricks Unity Catalog,
+/// AWS Glue, and Google BigQuery BigLake can query this RustLakeDB table with ZERO data copying!
+async fn export_federation_descriptors_http(
+    Path(table): Path<String>,
+    State(coord): State<Arc<Coordinator>>,
+) -> (StatusCode, Json<Value>) {
+    match coord.catalog.get_table(&table).await {
+        Ok(meta) => {
+            let snap_id = meta.current_snapshot("main").map(|s| s.snapshot_id).unwrap_or(1);
+            let base_uri = coord
+                .store
+                .base_uri()
+                .unwrap_or("s3://rustlakedb-warehouse");
+            let rest_uri = std::env::var("RUSTLAKEDB_PUBLIC_REST_URI")
+                .unwrap_or_else(|_| "https://rustlakedb-coordinator:8181".into());
+            let metadata_location = format!(
+                "{}/{}/metadata/v{snap_id}.metadata.json",
+                base_uri.trim_end_matches('/'),
+                meta.table_name
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "table": meta.table_name,
+                    "format": "apache-iceberg-v3",
+                    "snapshot_id": snap_id,
+                    "metadata_location": metadata_location,
+                    "iceberg_rest_uri": rest_uri,
+                    "tags": meta.tags,
+                    "federation": {
+                        "snowflake": {
+                            "catalog_integration_sql": format!(
+                                "CREATE OR REPLACE CATALOG INTEGRATION rustlakedb_rest_int CATALOG_SOURCE = ICEBERG_REST TABLE_FORMAT = ICEBERG REST_CONFIG = (CATALOG_URI = '{rest_uri}', WAREHOUSE = 'default') ENABLED = TRUE;"
+                            ),
+                            "create_table_sql": format!(
+                                "CREATE OR REPLACE ICEBERG TABLE {} CATALOG = 'rustlakedb_rest_int' CATALOG_NAMESPACE = 'default' CATALOG_TABLE_NAME = '{}' AUTO_REFRESH = TRUE;",
+                                meta.table_name, meta.table_name
+                            )
+                        },
+                        "databricks_unity_catalog": {
+                            "create_connection_sql": format!(
+                                "CREATE CONNECTION rustlakedb_conn TYPE ICEBERG_REST OPTIONS (host '{rest_uri}', credential '<oidc_jwt>');"
+                            ),
+                            "create_foreign_catalog_sql": "CREATE FOREIGN CATALOG rustlakedb_fed USING CONNECTION rustlakedb_conn;".to_string(),
+                            "query_sql": format!("SELECT * FROM rustlakedb_fed.default.{};", meta.table_name)
+                        },
+                        "aws_glue": {
+                            "table_input": {
+                                "Name": meta.table_name,
+                                "TableType": "EXTERNAL_TABLE",
+                                "Parameters": {
+                                    "table_type": "ICEBERG",
+                                    "metadata_location": metadata_location
+                                }
+                            }
+                        },
+                        "google_bigquery": {
+                            "create_external_table_sql": format!(
+                                "CREATE EXTERNAL TABLE `project.dataset.{}` WITH CONNECTION `us.rustlakedb_biglake` OPTIONS (format = 'ICEBERG', uris = ['{metadata_location}']);",
+                                meta.table_name
+                            )
+                        }
+                    }
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
 }
 
 async fn get_table_snapshots_http(

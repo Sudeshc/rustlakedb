@@ -400,6 +400,54 @@ pub struct PersistedMaskingRule {
     pub mask_value: String,
 }
 
+/// Tag-based ABAC masking policy applied automatically across ALL tables carrying `(tag_key=tag_value)` (Wave 40).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedTagMaskingRule {
+    pub name: String,
+    pub role: String,
+    pub tag_key: String,
+    pub tag_value: String,
+    pub target: String,
+    pub mask_value: String,
+}
+
+/// Federated external Iceberg catalog registration (Snowflake Polaris, Databricks Unity, AWS Glue, BigQuery, Wave 40).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalCatalogConfig {
+    pub name: String,
+    /// `ICEBERG_REST`, `SNOWFLAKE`, `DATABRICKS`, `GLUE`, or `BIGQUERY`
+    pub catalog_type: String,
+    pub uri: String,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Durable Raft-persisted audit trail entry (Wave 40).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedAuditEntry {
+    pub timestamp_ms: u64,
+    pub user: String,
+    pub role: String,
+    pub action: String,
+    pub target: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub protocol: String,
+}
+
+/// Durable Snowflake `ACCESS_HISTORY` / Unity Catalog `system.access.audit` record (Wave 40).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedAccessEntry {
+    pub timestamp_ms: u64,
+    pub query_id: String,
+    pub user: String,
+    pub role: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub action: String,
+    pub protocol: String,
+}
+
 /// Persisted table-level data lineage edge replicated via Raft (Wave 29).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedLineageEdge {
@@ -410,26 +458,45 @@ pub struct PersistedLineageEdge {
     pub timestamp_ms: u64,
 }
 
-/// Crash-safe, Raft-replicated Enterprise Governance State (RBAC, RLS, Masking, Lineage, Wave 29).
+/// Crash-safe, Raft-replicated Enterprise Governance State (RBAC, Role Hierarchy, Column Grants,
+/// RLS, Dynamic & Tag-ABAC Masking, Lineage, Audit, Access History & External Catalogs, Waves 29 + 40).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedGovernanceState {
     #[serde(default)]
     pub roles: Vec<String>,
-    /// `(role, table, privilege)` tuples
+    /// `(role, table_or_scope, privilege)` tuples (`table`, `schema:<ns>`, or `database:*`)
     #[serde(default)]
     pub grants: Vec<(String, String, String)>,
+    /// `(parent_role, child_role)` role inheritance hierarchy (`GRANT parent TO child`)
+    #[serde(default)]
+    pub role_memberships: Vec<(String, String)>,
+    /// `(role, table, allowed_columns)` column-level SELECT grants
+    #[serde(default)]
+    pub column_grants: Vec<(String, String, Vec<String>)>,
     /// `(role, table, predicate)` RLS policies
     #[serde(default)]
     pub rls_policies: Vec<(String, String, FilterExpr)>,
     /// `(role, table, rule)` masking rules
     #[serde(default)]
     pub masking_policies: Vec<(String, String, PersistedMaskingRule)>,
+    /// Tag-driven ABAC masking policies across all matching tagged tables
+    #[serde(default)]
+    pub tag_masking_policies: Vec<PersistedTagMaskingRule>,
+    /// Federated external Iceberg catalogs (Snowflake, Databricks, Glue, BigQuery)
+    #[serde(default)]
+    pub external_catalogs: Vec<ExternalCatalogConfig>,
     /// Table-level data lineage graph edges
     #[serde(default)]
     pub lineage: Vec<PersistedLineageEdge>,
+    /// Durable governance & security audit trail
+    #[serde(default)]
+    pub audit_log: Vec<PersistedAuditEntry>,
+    /// Durable Snowflake-style table/column access history
+    #[serde(default)]
+    pub access_history: Vec<PersistedAccessEntry>,
 }
 
-/// Replicated governance mutation committed through the Raft WAL (Wave 29).
+/// Replicated governance mutation committed through the Raft WAL (Waves 29 + 40).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceOp {
     CreateRole(String),
@@ -443,6 +510,19 @@ pub enum GovernanceOp {
         table: String,
         privilege: String,
     },
+    GrantRoleToRole {
+        parent_role: String,
+        child_role: String,
+    },
+    RevokeRoleFromRole {
+        parent_role: String,
+        child_role: String,
+    },
+    GrantColumns {
+        role: String,
+        table: String,
+        columns: Vec<String>,
+    },
     AddRlsPolicy {
         role: String,
         table: String,
@@ -453,7 +533,11 @@ pub enum GovernanceOp {
         table: String,
         rule: PersistedMaskingRule,
     },
+    AddTagMaskingPolicy(PersistedTagMaskingRule),
+    RegisterExternalCatalog(ExternalCatalogConfig),
     RecordLineage(PersistedLineageEdge),
+    RecordAudit(PersistedAuditEntry),
+    RecordAccess(PersistedAccessEntry),
 }
 
 /// Live Raft consensus telemetry exported to `/healthz` and Prometheus `/metrics`.
@@ -1408,6 +1492,40 @@ impl Catalog for InMemoryRaftCatalog {
                     !(r == &role && t == &table && (p == "ALL" || priv_name == &p))
                 });
             }
+            GovernanceOp::GrantRoleToRole {
+                parent_role,
+                child_role,
+            } => {
+                if !g.roles.contains(&parent_role) {
+                    g.roles.push(parent_role.clone());
+                }
+                if !g.roles.contains(&child_role) {
+                    g.roles.push(child_role.clone());
+                }
+                let pair = (parent_role, child_role);
+                if !g.role_memberships.contains(&pair) {
+                    g.role_memberships.push(pair);
+                }
+            }
+            GovernanceOp::RevokeRoleFromRole {
+                parent_role,
+                child_role,
+            } => {
+                g.role_memberships
+                    .retain(|(p, c)| !(p == &parent_role && c == &child_role));
+            }
+            GovernanceOp::GrantColumns {
+                role,
+                table,
+                columns,
+            } => {
+                if !g.roles.contains(&role) {
+                    g.roles.push(role.clone());
+                }
+                g.column_grants
+                    .retain(|(r, t, _)| !(r == &role && t == &table));
+                g.column_grants.push((role, table, columns));
+            }
             GovernanceOp::AddRlsPolicy {
                 role,
                 table,
@@ -1419,11 +1537,32 @@ impl Catalog for InMemoryRaftCatalog {
             GovernanceOp::AddMaskingPolicy { role, table, rule } => {
                 g.masking_policies.push((role, table, rule));
             }
+            GovernanceOp::AddTagMaskingPolicy(rule) => {
+                g.tag_masking_policies
+                    .retain(|r| !(r.name == rule.name && r.role == rule.role));
+                g.tag_masking_policies.push(rule);
+            }
+            GovernanceOp::RegisterExternalCatalog(cfg) => {
+                g.external_catalogs.retain(|c| c.name != cfg.name);
+                g.external_catalogs.push(cfg);
+            }
             GovernanceOp::RecordLineage(edge) => {
                 if g.lineage.len() >= 1000 {
                     g.lineage.remove(0);
                 }
                 g.lineage.push(edge);
+            }
+            GovernanceOp::RecordAudit(entry) => {
+                if g.audit_log.len() >= 2000 {
+                    g.audit_log.remove(0);
+                }
+                g.audit_log.push(entry);
+            }
+            GovernanceOp::RecordAccess(entry) => {
+                if g.access_history.len() >= 2000 {
+                    g.access_history.remove(0);
+                }
+                g.access_history.push(entry);
             }
         }
         self.persist_governance_locked(&g)?;

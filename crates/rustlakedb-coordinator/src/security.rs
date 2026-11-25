@@ -9,7 +9,10 @@ use ring::rand::SystemRandom;
 use ring::signature::{
     KeyPair, RsaKeyPair, RsaPublicKeyComponents, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
 };
-use rustlakedb_catalog::TableCommitProposal;
+use rustlakedb_catalog::{
+    ExternalCatalogConfig, PersistedAccessEntry, PersistedAuditEntry, PersistedTagMaskingRule,
+    TableCommitProposal,
+};
 use rustlakedb_common::{Result, RustLakeError};
 use rustlakedb_protocol::{FilterExpr, RowBatch, ScalarValue};
 use serde::{Deserialize, Serialize};
@@ -24,11 +27,13 @@ pub fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Authenticated session context propagated from PostgreSQL v3 Wire Protocol or HTTP API.
+/// Authenticated session context propagated from PostgreSQL v3 Wire Protocol, HTTP, or OIDC JWT.
 #[derive(Debug, Clone)]
 pub struct SessionContext {
     pub user: String,
     pub role: String,
+    /// Additional group/role claims propagated from enterprise OIDC IdPs (`groups`/`roles` JWT array).
+    pub groups: Vec<String>,
 }
 
 impl Default for SessionContext {
@@ -36,6 +41,7 @@ impl Default for SessionContext {
         Self {
             user: "postgres".into(),
             role: "postgres".into(),
+            groups: Vec::new(),
         }
     }
 }
@@ -46,11 +52,38 @@ impl SessionContext {
         Self {
             role: u.clone(),
             user: u,
+            groups: Vec::new(),
+        }
+    }
+
+    pub fn with_groups(
+        user: impl Into<String>,
+        role: impl Into<String>,
+        groups: Vec<String>,
+    ) -> Self {
+        Self {
+            user: user.into(),
+            role: role.into(),
+            groups,
         }
     }
 
     pub fn is_superuser(&self) -> bool {
-        self.role.eq_ignore_ascii_case("postgres") || self.role.eq_ignore_ascii_case("admin")
+        self.role.eq_ignore_ascii_case("postgres")
+            || self.role.eq_ignore_ascii_case("admin")
+            || self
+                .groups
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case("postgres") || g.eq_ignore_ascii_case("admin"))
+    }
+
+    pub fn is_security_admin(&self) -> bool {
+        self.is_superuser()
+            || self.role.eq_ignore_ascii_case("securityadmin")
+            || self
+                .groups
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case("securityadmin"))
     }
 }
 
@@ -124,16 +157,26 @@ pub struct JwkRsaKey {
 /// Enterprise Governance, RBAC, RLS, Dynamic Masking, WLM & Observability Engine (Waves 3–21).
 pub struct GovernanceState {
     roles: RwLock<HashSet<String>>,
-    /// (role, table) -> granted privileges ("SELECT", "INSERT", "UPDATE", "DELETE", "ALL")
+    /// (role, table_or_scope) -> granted privileges ("SELECT", "INSERT", "UPDATE", "DELETE", "ALL")
     grants: RwLock<HashMap<(String, String), HashSet<String>>>,
+    /// child_role -> inherited parent_roles (`GRANT parent TO child`, Wave 40)
+    role_memberships: RwLock<HashMap<String, HashSet<String>>>,
+    /// (role, table) -> allowed column names for column-level `GRANT SELECT (c1, c2)` (Wave 40)
+    column_grants: RwLock<HashMap<(String, String), HashSet<String>>>,
     /// (role, table) -> RLS filter predicate injected automatically onto table scans
     rls_policies: RwLock<HashMap<(String, String), FilterExpr>>,
     /// (role, table) -> Dynamic column / JSON-path masking rules
     masking_policies: RwLock<HashMap<(String, String), Vec<MaskingRule>>>,
+    /// Tag-driven ABAC masking policies applied across all tables carrying matching `(tag_key=tag_value)` (Wave 40)
+    tag_masking_policies: RwLock<Vec<PersistedTagMaskingRule>>,
+    /// Federated external Iceberg catalogs (Snowflake Polaris, Databricks Unity, Glue, BigQuery, Wave 40)
+    external_catalogs: RwLock<HashMap<String, ExternalCatalogConfig>>,
     /// Ring buffer for `system.query_history`
     query_history: RwLock<VecDeque<QueryHistoryEntry>>,
     /// Ring buffer for `system.audit_log`
     audit_log: RwLock<VecDeque<AuditLogEntry>>,
+    /// Ring buffer for `system.access_history` (Snowflake `ACCESS_HISTORY` / Unity `system.access.audit`, Wave 40)
+    access_history: RwLock<VecDeque<PersistedAccessEntry>>,
     /// Automatic table-level data lineage graph for `system.lineage` (Wave 24)
     lineage: RwLock<VecDeque<LineageEdge>>,
     /// Active queries for WLM & `SHOW QUERIES`
@@ -178,10 +221,15 @@ impl Default for GovernanceState {
         Self {
             roles: RwLock::new(roles),
             grants: RwLock::new(HashMap::new()),
+            role_memberships: RwLock::new(HashMap::new()),
+            column_grants: RwLock::new(HashMap::new()),
             rls_policies: RwLock::new(HashMap::new()),
             masking_policies: RwLock::new(HashMap::new()),
+            tag_masking_policies: RwLock::new(Vec::new()),
+            external_catalogs: RwLock::new(HashMap::new()),
             query_history: RwLock::new(VecDeque::with_capacity(512)),
             audit_log: RwLock::new(VecDeque::with_capacity(512)),
+            access_history: RwLock::new(VecDeque::with_capacity(512)),
             lineage: RwLock::new(VecDeque::with_capacity(512)),
             active_queries: RwLock::new(HashMap::new()),
             cancelled_queries: RwLock::new(HashSet::new()),
@@ -237,22 +285,287 @@ impl GovernanceState {
         }
     }
 
+    pub fn require_security_admin(
+        &self,
+        session: &SessionContext,
+        action: &str,
+        target: &str,
+    ) -> Result<()> {
+        let eff = self.effective_roles(session);
+        if session.is_security_admin()
+            || eff.iter().any(|r| {
+                r.eq_ignore_ascii_case("postgres")
+                    || r.eq_ignore_ascii_case("admin")
+                    || r.eq_ignore_ascii_case("securityadmin")
+            })
+        {
+            return Ok(());
+        }
+        self.record_audit(&session.user, action, target, "DENIED (42501)");
+        Err(RustLakeError::Execution(format!(
+            "permission denied (42501): role '{}' requires SECURITYADMIN/admin privilege for {} on '{}'",
+            session.role, action, target
+        )))
+    }
+
+    pub fn grant_role_to_role(&self, parent_role: &str, child_role: &str) {
+        self.roles.write().insert(parent_role.to_string());
+        self.roles.write().insert(child_role.to_string());
+        self.role_memberships
+            .write()
+            .entry(child_role.to_string())
+            .or_default()
+            .insert(parent_role.to_string());
+    }
+
+    pub fn revoke_role_from_role(&self, parent_role: &str, child_role: &str) {
+        if let Some(parents) = self.role_memberships.write().get_mut(child_role) {
+            parents.remove(parent_role);
+        }
+    }
+
+    /// Computes all effective roles for `session` via transitive BFS over `session.role`,
+    /// OIDC `session.groups`, and Raft-replicated `GRANT parent_role TO child_role` hierarchy.
+    pub fn effective_roles(&self, session: &SessionContext) -> HashSet<String> {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(session.role.clone());
+        queue.push_back(session.role.clone());
+        for g in &session.groups {
+            if visited.insert(g.clone()) {
+                queue.push_back(g.clone());
+            }
+        }
+        let memberships = self.role_memberships.read();
+        while let Some(cur) = queue.pop_front() {
+            if let Some(parents) = memberships.get(&cur) {
+                for p in parents {
+                    if visited.insert(p.clone()) {
+                        queue.push_back(p.clone());
+                    }
+                }
+            }
+        }
+        visited
+    }
+
+    pub fn grant_columns(&self, role: &str, table: &str, columns: Vec<String>) {
+        self.roles.write().insert(role.to_string());
+        let set: HashSet<String> = columns.into_iter().map(|c| c.to_lowercase()).collect();
+        self.column_grants
+            .write()
+            .insert((role.to_string(), table.to_string()), set);
+    }
+
+    /// Returns `Some(allowed_columns)` if the caller ONLY holds column-scoped `SELECT` on `table`
+    /// (and does NOT hold full table/schema/database `SELECT`/`ALL`).
+    pub fn restricted_select_columns(
+        &self,
+        session: &SessionContext,
+        table: &str,
+    ) -> Option<HashSet<String>> {
+        if session.is_superuser() {
+            return None;
+        }
+        let eff = self.effective_roles(session);
+        if eff
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case("postgres") || r.eq_ignore_ascii_case("admin"))
+        {
+            return None;
+        }
+        let grants = self.grants.read();
+        let scopes = table_grant_scopes(table);
+        for r in &eff {
+            for sc in &scopes {
+                if let Some(privs) = grants.get(&(r.clone(), sc.clone()))
+                    && (privs.contains("ALL") || privs.contains("SELECT"))
+                {
+                    return None; // Full table/schema/db SELECT overrides column restriction
+                }
+            }
+        }
+        let col_grants = self.column_grants.read();
+        let mut union_cols: HashSet<String> = HashSet::new();
+        let mut found = false;
+        for r in &eff {
+            if let Some(cols) = col_grants.get(&(r.clone(), table.to_string())) {
+                found = true;
+                union_cols.extend(cols.iter().cloned());
+            }
+        }
+        if found { Some(union_cols) } else { None }
+    }
+
+    /// Enforces column-level SELECT grants on projected result batches (rejecting unauthorized
+    /// explicit columns or masking/dropping restricted columns cleanly).
+    pub fn enforce_column_grants(
+        &self,
+        session: &SessionContext,
+        tables: &[String],
+        batch: &RowBatch,
+        explicit_sql: &str,
+    ) -> Result<()> {
+        if session.is_superuser() || tables.is_empty() {
+            return Ok(());
+        }
+        for t in tables {
+            if let Some(allowed) = self.restricted_select_columns(session, t) {
+                for col in &batch.columns {
+                    let lc = col.to_lowercase();
+                    // Allow aggregate aliases like `count`, `sum_amount` only if referenced columns were allowed
+                    if !allowed.contains(&lc) {
+                        self.record_audit(
+                            &session.user,
+                            "SELECT COLUMN",
+                            &format!("{t}.{col}"),
+                            "DENIED (42501)",
+                        );
+                        return Err(RustLakeError::Execution(format!(
+                            "permission denied (42501): role '{}' lacks column SELECT privilege on '{}.{}' (query: {})",
+                            session.role,
+                            t,
+                            col,
+                            explicit_sql.chars().take(80).collect::<String>()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add_tag_masking_policy(&self, rule: PersistedTagMaskingRule) {
+        let mut guard = self.tag_masking_policies.write();
+        guard.retain(|r| !(r.name == rule.name && r.role == rule.role));
+        guard.push(rule);
+    }
+
+    pub fn apply_tag_masking(
+        &self,
+        session: &SessionContext,
+        table_tags: &HashMap<String, std::collections::BTreeMap<String, String>>,
+        batch: &mut RowBatch,
+    ) {
+        if session.is_superuser() || table_tags.is_empty() {
+            return;
+        }
+        let eff = self.effective_roles(session);
+        if eff
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case("postgres") || r.eq_ignore_ascii_case("admin"))
+        {
+            return;
+        }
+        let policies = self.tag_masking_policies.read();
+        let mut applicable: Vec<MaskingRule> = Vec::new();
+        for p in policies.iter() {
+            if !eff.contains(&p.role) && p.role != "*" {
+                continue;
+            }
+            let tag_matches = table_tags.values().any(|tags| {
+                tags.get(&p.tag_key)
+                    .is_some_and(|v| v.eq_ignore_ascii_case(&p.tag_value))
+            });
+            if tag_matches {
+                applicable.push(MaskingRule {
+                    name: p.name.clone(),
+                    target: p.target.clone(),
+                    mask_value: p.mask_value.clone(),
+                });
+            }
+        }
+        drop(policies);
+        if applicable.is_empty() {
+            return;
+        }
+        apply_masking_rules(&applicable, batch);
+    }
+
+    pub fn register_external_catalog(&self, cfg: ExternalCatalogConfig) {
+        self.external_catalogs
+            .write()
+            .insert(cfg.name.clone(), cfg);
+    }
+
+    pub fn get_external_catalog(&self, name: &str) -> Option<ExternalCatalogConfig> {
+        self.external_catalogs.read().get(name).cloned()
+    }
+
+    pub fn list_external_catalogs(&self) -> Vec<ExternalCatalogConfig> {
+        let mut out: Vec<_> = self.external_catalogs.read().values().cloned().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    pub fn record_access(
+        &self,
+        query_id: &str,
+        session: &SessionContext,
+        table: &str,
+        columns: Vec<String>,
+        action: &str,
+        protocol: &str,
+    ) -> PersistedAccessEntry {
+        let entry = PersistedAccessEntry {
+            timestamp_ms: epoch_ms(),
+            query_id: query_id.to_string(),
+            user: session.user.clone(),
+            role: session.role.clone(),
+            table: table.to_string(),
+            columns,
+            action: action.to_string(),
+            protocol: protocol.to_string(),
+        };
+        let mut guard = self.access_history.write();
+        if guard.len() >= 2000 {
+            guard.pop_front();
+        }
+        guard.push_back(entry.clone());
+        entry
+    }
+
+    pub fn access_history_snapshot(&self) -> Vec<PersistedAccessEntry> {
+        self.access_history.read().iter().cloned().collect()
+    }
+
     pub fn check_access(&self, session: &SessionContext, table: &str, privilege: &str) -> Result<()> {
         if session.is_superuser() {
             return Ok(());
         }
-        let guard = self.grants.read();
-        if let Some(privs) = guard.get(&(session.role.clone(), table.to_string()))
-            && (privs.contains("ALL") || privs.contains(&privilege.to_uppercase()))
+        let eff = self.effective_roles(session);
+        if eff
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case("postgres") || r.eq_ignore_ascii_case("admin"))
         {
             return Ok(());
         }
-        self.record_audit(
-            &session.user,
-            privilege,
-            table,
-            "DENIED (42501)",
-        );
+        let want = privilege.to_uppercase();
+        let scopes = table_grant_scopes(table);
+        let guard = self.grants.read();
+        for r in &eff {
+            for sc in &scopes {
+                if let Some(privs) = guard.get(&(r.clone(), sc.clone()))
+                    && (privs.contains("ALL") || privs.contains(&want))
+                {
+                    return Ok(());
+                }
+            }
+        }
+        drop(guard);
+        // Column-level SELECT grant also permits opening SELECT on `table` (column enforcement follows!)
+        if want == "SELECT" {
+            let col_grants = self.column_grants.read();
+            for r in &eff {
+                if col_grants
+                    .get(&(r.clone(), table.to_string()))
+                    .is_some_and(|cols| !cols.is_empty())
+                {
+                    return Ok(());
+                }
+            }
+        }
+        self.record_audit(&session.user, privilege, table, "DENIED (42501)");
         Err(RustLakeError::Execution(format!(
             "permission denied (42501): role '{}' lacks {} privilege on table '{}'",
             session.role, privilege, table
@@ -269,10 +582,18 @@ impl GovernanceState {
         if session.is_superuser() {
             return None;
         }
-        self.rls_policies
-            .read()
-            .get(&(session.role.clone(), table.to_string()))
-            .cloned()
+        let eff = self.effective_roles(session);
+        let guard = self.rls_policies.read();
+        // Direct role policy takes precedence, then inherited roles/groups
+        if let Some(p) = guard.get(&(session.role.clone(), table.to_string())) {
+            return Some(p.clone());
+        }
+        for r in eff {
+            if let Some(p) = guard.get(&(r, table.to_string())) {
+                return Some(p.clone());
+            }
+        }
+        None
     }
 
     pub fn add_masking_policy(&self, role: &str, table: &str, rule: MaskingRule) {
@@ -287,48 +608,27 @@ impl GovernanceState {
         if session.is_superuser() || tables.is_empty() {
             return;
         }
+        let eff = self.effective_roles(session);
+        if eff
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case("postgres") || r.eq_ignore_ascii_case("admin"))
+        {
+            return;
+        }
         let guard = self.masking_policies.read();
         let mut rules: Vec<MaskingRule> = Vec::new();
         for t in tables {
-            if let Some(list) = guard.get(&(session.role.clone(), t.clone())) {
-                rules.extend(list.clone());
-            }
-        }
-        if rules.is_empty() {
-            return;
-        }
-
-        for row in &mut batch.rows {
-            for rule in &rules {
-                // Support both direct column (`email`) and JSON path (`payload.ssn` or `payload->>ssn`).
-                if let Some((json_col, json_path)) = rule
-                    .target
-                    .split_once('.')
-                    .or_else(|| rule.target.split_once("->>"))
-                {
-                    let clean_path = json_path.trim_matches('\'');
-                    if let Some(ScalarValue::Json(doc)) = row.get_mut(json_col) {
-                        mask_json_path(doc, clean_path, &rule.mask_value);
-                    }
-                    // Also mask any projected column named `<col>_<path>` or `<path>`!
-                    let default_alias = format!("{json_col}_{clean_path}");
-                    if row.contains_key(&default_alias) {
-                        row.insert(default_alias, ScalarValue::Utf8(rule.mask_value.clone()));
-                    }
-                    if row.contains_key(clean_path) {
-                        row.insert(
-                            clean_path.to_string(),
-                            ScalarValue::Utf8(rule.mask_value.clone()),
-                        );
-                    }
-                } else if row.contains_key(&rule.target) {
-                    row.insert(
-                        rule.target.clone(),
-                        ScalarValue::Utf8(rule.mask_value.clone()),
-                    );
+            for r in &eff {
+                if let Some(list) = guard.get(&(r.clone(), t.clone())) {
+                    rules.extend(list.clone());
                 }
             }
         }
+        drop(guard);
+        if rules.is_empty() {
+            return;
+        }
+        apply_masking_rules(&rules, batch);
     }
 
     pub fn record_query(
@@ -422,6 +722,54 @@ impl GovernanceState {
                     target: rule.target,
                     mask_value: rule.mask_value,
                 });
+            }
+        }
+        if !snap.role_memberships.is_empty() {
+            let mut rm = self.role_memberships.write();
+            rm.clear();
+            for (parent, child) in snap.role_memberships {
+                rm.entry(child).or_default().insert(parent);
+            }
+        }
+        if !snap.column_grants.is_empty() {
+            let mut cg = self.column_grants.write();
+            cg.clear();
+            for (role, tbl, cols) in snap.column_grants {
+                cg.insert((role, tbl), cols.into_iter().collect());
+            }
+        }
+        if !snap.tag_masking_policies.is_empty() {
+            *self.tag_masking_policies.write() = snap.tag_masking_policies;
+        }
+        if !snap.external_catalogs.is_empty() {
+            let mut ec = self.external_catalogs.write();
+            ec.clear();
+            for c in snap.external_catalogs {
+                ec.insert(c.name.clone(), c);
+            }
+        }
+        if !snap.audit_log.is_empty() {
+            let mut al = self.audit_log.write();
+            if al.len() < snap.audit_log.len() {
+                al.clear();
+                for e in snap.audit_log {
+                    al.push_back(AuditLogEntry {
+                        timestamp_ms: e.timestamp_ms,
+                        user: e.user,
+                        action: e.action,
+                        target: e.target,
+                        outcome: e.outcome,
+                    });
+                }
+            }
+        }
+        if !snap.access_history.is_empty() {
+            let mut ah = self.access_history.write();
+            if ah.len() < snap.access_history.len() {
+                ah.clear();
+                for e in snap.access_history {
+                    ah.push_back(e);
+                }
             }
         }
         if !snap.lineage.is_empty() {
@@ -924,7 +1272,8 @@ pub fn verify_jwt_hs256(secret: &str, token: &str) -> Result<SessionContext> {
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| user.clone());
-    Ok(SessionContext { user, role })
+    let groups = extract_jwt_groups(&claims);
+    Ok(SessionContext { user, role, groups })
 }
 
 /// Signs an RFC 7519 **RS256** (RSA-SHA256) JWT using a PKCS#8 DER RSA private key (Wave 21).
@@ -1102,7 +1451,93 @@ pub fn verify_jwt_rs256_with_keys_and_claims(
         })
         .map(String::from)
         .unwrap_or_else(|| user.clone());
-    Ok(SessionContext { user, role })
+    let groups = extract_jwt_groups(&claims);
+    Ok(SessionContext { user, role, groups })
+}
+
+fn extract_jwt_groups(claims: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["groups", "roles"] {
+        if let Some(arr) = claims.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str()
+                    && !out.iter().any(|x| x == s)
+                {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn table_grant_scopes(table: &str) -> Vec<String> {
+    let mut scopes = vec![table.to_string(), "database:*".to_string(), "schema:*".to_string()];
+    if let Some((schema, _)) = table.split_once('.') {
+        scopes.push(format!("schema:{}", schema.to_lowercase()));
+    } else {
+        scopes.push("schema:public".to_string());
+        scopes.push("schema:default".to_string());
+    }
+    scopes
+}
+
+fn apply_masking_rules(rules: &[MaskingRule], batch: &mut RowBatch) {
+    for row in &mut batch.rows {
+        for rule in rules {
+            if rule.target == "*" {
+                for (k, v) in row.iter_mut() {
+                    if !k.eq_ignore_ascii_case("id") && matches!(v, ScalarValue::Utf8(_)) {
+                        *v = ScalarValue::Utf8(rule.mask_value.clone());
+                    }
+                }
+                continue;
+            }
+            if let Some((json_col, json_path)) = rule
+                .target
+                .split_once('.')
+                .or_else(|| rule.target.split_once("->>"))
+            {
+                let clean_path = json_path.trim_matches('\'');
+                if let Some(ScalarValue::Json(doc)) = row.get_mut(json_col) {
+                    mask_json_path(doc, clean_path, &rule.mask_value);
+                }
+                let default_alias = format!("{json_col}_{clean_path}");
+                if row.contains_key(&default_alias) {
+                    row.insert(default_alias, ScalarValue::Utf8(rule.mask_value.clone()));
+                }
+                if row.contains_key(clean_path) {
+                    row.insert(
+                        clean_path.to_string(),
+                        ScalarValue::Utf8(rule.mask_value.clone()),
+                    );
+                }
+            } else if row.contains_key(&rule.target) {
+                row.insert(
+                    rule.target.clone(),
+                    ScalarValue::Utf8(rule.mask_value.clone()),
+                );
+            }
+        }
+    }
+}
+
+pub fn make_persisted_audit(
+    session: &SessionContext,
+    action: &str,
+    target: &str,
+    outcome: &str,
+    protocol: &str,
+) -> PersistedAuditEntry {
+    PersistedAuditEntry {
+        timestamp_ms: epoch_ms(),
+        user: session.user.clone(),
+        role: session.role.clone(),
+        action: action.to_string(),
+        target: target.to_string(),
+        outcome: outcome.to_string(),
+        protocol: protocol.to_string(),
+    }
 }
 
 /// Extracts `(modulus_n, exponent_e)` big-endian unsigned bytes from an ASN.1 DER `RSAPublicKey`.
