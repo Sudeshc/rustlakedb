@@ -2,6 +2,19 @@
 
 All notable changes to **RustLakeDB** are documented in this file.
 
+## [6.0.0] - 2026-11-24 — Battle-Tested Production Lakehouse Release: Zero-Rewrite Field-ID Evolution, Live Redpanda/PyIceberg/ADBC Verification, Cooperative Cancel, OIDC Poller, Observability Pack & Jepsen Chaos Hardening (Waves 22–23)
+
+### Wave 23 — Jepsen-Style Chaos & Soak Hardening + Production Adoption Pack
+- **50-Writer Concurrent OCC Commit Storm:** Proved strict linearizability across 50 simultaneous mutating OCC commits (1 winner, 49 conflict rejections) and 25 concurrent fast-forward append commits (zero lost updates).
+- **3-Node Raft Split-Brain Leader Fencing & Majority Failover:** Verified killed/partitioned old leaders are fenced from split-brain writes while the surviving majority automatically elects a new leader at a strictly higher Raft term and replicates schema evolution.
+- **Mid-Shuffle Worker Crash Soak & Production Adoption Pack:** Added 10-iteration alternating worker-fault distributed join soak test, plus prebuilt Grafana Dashboard ([deploy/observability/grafana-dashboard.json](deploy/observability/grafana-dashboard.json)), Prometheus alert rules ([deploy/observability/prometheus-alerts.yaml](deploy/observability/prometheus-alerts.yaml)), `dbt-postgres` quickstart ([examples/dbt_quickstart/](examples/dbt_quickstart/)), and Cloud Production Playbook ([docs/PRODUCTION_DEPLOYMENT.md](docs/PRODUCTION_DEPLOYMENT.md)).
+
+### Wave 22 — Zero-Rewrite Iceberg Field-ID Schema Evolution, Pure Arrow Window, Cooperative Cancellation, Live OIDC Poller & Live Ecosystem Verification
+- **True Zero-Rewrite Iceberg Field-ID Schema Evolution:** Added `ALTER TABLE RENAME COLUMN`, `ALTER TABLE DROP COLUMN [IF EXISTS]`, and `ALTER TABLE ALTER COLUMN ... TYPE` (`Int64 -> Float64`, `Decimal` scale widening) resolving historical Parquet files transparently via stable Iceberg `field_id` + `column_aliases` with zero Parquet rewrites.
+- **Pure Arrow `RecordBatch` Window Fast Path:** Wired `columnar::eval_columnar_window` directly into `WorkerNode::eval_node` for vectorized window execution across single-node and distributed stages.
+- **Cooperative In-Flight Query Cancellation & Live OIDC JWKS Poller:** Propagated query cancellation checks across `Coordinator::execute_dag` stages and `WorkerNode` split scans, and wired `RUSTLAKEDB_OIDC_JWKS_URL` live HTTP background key rotation in `rustlakedb-cli`.
+- **Live Third-Party Ecosystem Verification & 10M-Row Release Benchmark:** Verified end-to-end against **live Redpanda (`redpandadata/redpanda`, adding Snappy `codec=2` xerial/raw RecordBatch v2 support!)**, **live `adbc-driver-flightsql` (`:8815`, 999,984 rows in `310.9 ms`)**, and **live `pyiceberg` (`:8181`, deterministic RFC 4122 `table-uuid` + create/insert/evolve/reload/drop round-trip)**; benchmarked **10,000,000 rows** (40 Zstd Parquet splits, `38.72 MB`): `491 ms` full-scan `GROUP BY` (**20.4M rows/s**), `479 ms` distributed Top-N (**20.9M rows/s**), `1,605 ms` 10M×20K hash join, and `2 ms` zero-rewrite `RENAME COLUMN`!
+
 ## [5.0.0] - 2026-11-24 — Tier-1 Lakehouse Parity Release: Flight SQL, Bi-Directional REST Catalog, Kafka RecordBatch v2, Full 22-Query Analytics + CBO, Columnar Arrow Pipeline & OIDC/JWKS (Waves 17–21)
 
 ### Wave 21 — Enterprise OIDC/JWKS `RS256` Auth, Active Query Cancellation, Upgraded Web Console & Helm v5

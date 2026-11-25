@@ -1,0 +1,27 @@
+groups:
+  - name: rustlakedb.rules
+    rules:
+      - alert: RustLakeDBWorkerDown
+        expr: rustlakedb_workers_healthy < rustlakedb_workers_total
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "One or more RustLakeDB workers are unhealthy"
+          description: "Healthy workers ({{ $value }}) < total registered workers for > 1m."
+
+      - alert: RustLakeDBHighQueryErrorRate
+        expr: rate(rustlakedb_query_errors_total[5m]) / clamp_min(rate(rustlakedb_queries_total[5m]), 1) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RustLakeDB query error rate exceeds 5%"
+
+      - alert: RustLakeDBHighQueryLatency
+        expr: rate(rustlakedb_query_duration_ms_sum[5m]) / clamp_min(rate(rustlakedb_queries_total[5m]), 1) > 2000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RustLakeDB average query latency exceeds 2000ms"

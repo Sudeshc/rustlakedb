@@ -379,6 +379,51 @@ impl GovernanceState {
         !self.jwks_keys.read().is_empty()
     }
 
+    /// Fetches and atomically installs OIDC JWKS RSA public keys from an HTTPS/HTTP endpoint (Wave 22).
+    pub async fn refresh_jwks_from_url(&self, jwks_url: &str) -> Result<usize> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| RustLakeError::Execution(format!("OIDC JWKS HTTP client: {e}")))?;
+        let resp = client
+            .get(jwks_url)
+            .send()
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("fetch OIDC JWKS '{jwks_url}': {e}")))?;
+        if !resp.status().is_success() {
+            return Err(RustLakeError::Execution(format!(
+                "OIDC JWKS HTTP {}: {jwks_url}",
+                resp.status()
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("read OIDC JWKS body: {e}")))?;
+        self.set_jwks_json(&body)
+    }
+
+    /// Spawns a background OIDC JWKS auto-refresh poller for zero-downtime key rotation (Wave 22).
+    pub fn spawn_oidc_jwks_poller(
+        self: std::sync::Arc<Self>,
+        jwks_url: String,
+        interval: std::time::Duration,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                match self.refresh_jwks_from_url(&jwks_url).await {
+                    Ok(n) => {
+                        tracing::info!(url = %jwks_url, keys = n, "refreshed OIDC JWKS keys");
+                    }
+                    Err(e) => {
+                        tracing::warn!(url = %jwks_url, error = %e, "OIDC JWKS refresh failed");
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
     /// Verifies an OIDC `RS256` JWT against the configured JWKS key set (Wave 21).
     pub fn verify_jwt_rs256(&self, token: &str) -> Result<SessionContext> {
         let keys = self.jwks_keys.read().clone();

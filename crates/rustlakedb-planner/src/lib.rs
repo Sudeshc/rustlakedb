@@ -96,6 +96,21 @@ pub enum PlannedCommand {
         column_name: String,
         data_type: ColumnType,
     },
+    AlterRenameColumn {
+        table_name: String,
+        old_name: String,
+        new_name: String,
+    },
+    AlterDropColumn {
+        table_name: String,
+        column_name: String,
+        if_exists: bool,
+    },
+    AlterColumnType {
+        table_name: String,
+        column_name: String,
+        data_type: ColumnType,
+    },
     AlterClusterBy {
         table_name: String,
         columns: Vec<String>,
@@ -529,6 +544,36 @@ impl DistributedPlanner {
                             data_type,
                         })
                     }
+                    Some(AlterTableOperation::RenameColumn {
+                        old_column_name,
+                        new_column_name,
+                    }) => Ok(PlannedCommand::AlterRenameColumn {
+                        table_name,
+                        old_name: old_column_name.value,
+                        new_name: new_column_name.value,
+                    }),
+                    Some(AlterTableOperation::DropColumn {
+                        column_name,
+                        if_exists,
+                        ..
+                    }) => Ok(PlannedCommand::AlterDropColumn {
+                        table_name,
+                        column_name: column_name.value,
+                        if_exists,
+                    }),
+                    Some(AlterTableOperation::AlterColumn { column_name, op }) => match op {
+                        sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. } => {
+                            let dt = map_sql_data_type(&data_type)?;
+                            Ok(PlannedCommand::AlterColumnType {
+                                table_name,
+                                column_name: column_name.value,
+                                data_type: dt,
+                            })
+                        }
+                        other => Err(RustLakeError::Plan(format!(
+                            "unsupported ALTER COLUMN operation: {other:?}"
+                        ))),
+                    },
                     other => Err(RustLakeError::Plan(format!(
                         "unsupported ALTER TABLE operation: {other:?}"
                     ))),

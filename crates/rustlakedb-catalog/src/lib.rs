@@ -219,6 +219,9 @@ pub struct IcebergTableMetadata {
     /// Iceberg Hidden Partitioning spec expressions (`CREATE TABLE ... PARTITION BY (...)`, Wave 12).
     #[serde(default)]
     pub partition_by: Vec<String>,
+    /// Zero-rewrite Iceberg field-ID rename history: `current_col_name -> [historical_parquet_names]` (Wave 22).
+    #[serde(default)]
+    pub column_aliases: HashMap<String, Vec<String>>,
 }
 
 impl IcebergTableMetadata {
@@ -245,6 +248,7 @@ impl IcebergTableMetadata {
             next_snapshot_id: 2,
             cluster_by: Vec::new(),
             partition_by: Vec::new(),
+            column_aliases: HashMap::new(),
         }
     }
 
@@ -342,6 +346,12 @@ pub trait Catalog: Send + Sync {
     async fn list_views(&self) -> Result<Vec<ViewDefinition>>;
     async fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()>;
     async fn truncate_table(&self, table_name: &str, branch: &str) -> Result<u64>;
+    /// Zero-rewrite Iceberg field-ID column rename (`ALTER TABLE t RENAME COLUMN a TO b`, Wave 22).
+    async fn rename_column(&self, table_name: &str, old_col: &str, new_col: &str) -> Result<i32>;
+    /// Zero-rewrite Iceberg column drop (`ALTER TABLE t DROP COLUMN c`, Wave 22).
+    async fn drop_column(&self, table_name: &str, col_name: &str, if_exists: bool) -> Result<()>;
+    /// Zero-rewrite Iceberg column type widening (`ALTER TABLE t ALTER COLUMN c TYPE ...`, Wave 22).
+    async fn widen_column(&self, table_name: &str, col_name: &str, new_type: ColumnType) -> Result<()>;
 }
 
 /// Embedded Iceberg v3 catalog modeling the `openraft` state machine (RFC-002).
@@ -754,6 +764,80 @@ impl Catalog for InMemoryRaftCatalog {
         table.refs.insert(branch.to_string(), new_id);
         self.persist_locked(&guard)?;
         Ok(new_id)
+    }
+
+    async fn rename_column(&self, table_name: &str, old_col: &str, new_col: &str) -> Result<i32> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        if table.schema.iter().any(|f| f.name.eq_ignore_ascii_case(new_col)) {
+            return Err(RustLakeError::Catalog(format!(
+                "column '{new_col}' already exists in '{table_name}'"
+            )));
+        }
+        let field = table
+            .schema
+            .iter_mut()
+            .find(|f| f.name.eq_ignore_ascii_case(old_col))
+            .ok_or_else(|| {
+                RustLakeError::Catalog(format!("column '{old_col}' not found in '{table_name}'"))
+            })?;
+        let fid = field.field_id;
+        let prev_name = field.name.clone();
+        field.name = new_col.to_string();
+        let mut hist = table.column_aliases.remove(&prev_name).unwrap_or_default();
+        if !hist.contains(&prev_name) {
+            hist.push(prev_name);
+        }
+        table.column_aliases.insert(new_col.to_string(), hist);
+        self.persist_locked(&guard)?;
+        Ok(fid)
+    }
+
+    async fn drop_column(&self, table_name: &str, col_name: &str, if_exists: bool) -> Result<()> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        let before = table.schema.len();
+        table.schema.retain(|f| !f.name.eq_ignore_ascii_case(col_name));
+        if table.schema.len() == before {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(RustLakeError::Catalog(format!(
+                "column '{col_name}' not found in '{table_name}'"
+            )));
+        }
+        table.column_aliases.remove(col_name);
+        self.persist_locked(&guard)?;
+        Ok(())
+    }
+
+    async fn widen_column(
+        &self,
+        table_name: &str,
+        col_name: &str,
+        new_type: ColumnType,
+    ) -> Result<()> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        let field = table
+            .schema
+            .iter_mut()
+            .find(|f| f.name.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| {
+                RustLakeError::Catalog(format!("column '{col_name}' not found in '{table_name}'"))
+            })?;
+        field.data_type = new_type;
+        self.persist_locked(&guard)?;
+        Ok(())
     }
 }
 

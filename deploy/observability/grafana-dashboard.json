@@ -1,0 +1,58 @@
+{
+  "title": "RustLakeDB — Distributed Iceberg v3 Lakehouse",
+  "uid": "rustlakedb-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Healthy Workers",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "rustlakedb_workers_healthy", "legendFormat": "Healthy" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total Queries Executed",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "rustlakedb_queries_total", "legendFormat": "Queries" }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Query Errors",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "rustlakedb_query_errors_total", "legendFormat": "Errors" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "RAM+NVMe Cache Hits",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "rustlakedb_cache_hits_total", "legendFormat": "Cache Hits" }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Query Throughput (QPS) & Avg Latency (ms)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(rustlakedb_queries_total[1m])", "legendFormat": "Queries/sec" },
+        { "expr": "rate(rustlakedb_query_duration_ms_sum[1m]) / clamp_min(rate(rustlakedb_queries_total[1m]), 1)", "legendFormat": "Avg Latency (ms)" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Iceberg v3 Pruning Efficiency (Puffin + Zone-Map + Parquet Reads)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(rustlakedb_puffin_pruned_total[1m])", "legendFormat": "Puffin JSON Pruned/s" },
+        { "expr": "rate(rustlakedb_zonemap_pruned_total[1m])", "legendFormat": "Zone-Map Pruned/s" },
+        { "expr": "rate(rustlakedb_parquet_files_read_total[1m])", "legendFormat": "Parquet Read/s" }
+      ]
+    }
+  ]
+}

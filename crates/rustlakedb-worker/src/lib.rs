@@ -39,6 +39,8 @@ pub struct WorkerNode {
     fail_once: AtomicBool,
     pub tasks_executed: AtomicU64,
     pub vectorized_rows_processed: AtomicU64,
+    /// Cooperatively cancelled query IDs checked between split/batch reads (Wave 22).
+    pub cancelled_queries: std::sync::RwLock<HashSet<String>>,
 }
 
 impl WorkerNode {
@@ -72,7 +74,22 @@ impl WorkerNode {
             fail_once: AtomicBool::new(false),
             tasks_executed: AtomicU64::new(0),
             vectorized_rows_processed: AtomicU64::new(0),
+            cancelled_queries: std::sync::RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Marks a query ID as cancelled so in-flight scans on this worker abort cooperatively (Wave 22).
+    pub fn cancel_query(&self, query_id: &str) {
+        if let Ok(mut g) = self.cancelled_queries.write() {
+            g.insert(query_id.to_string());
+        }
+    }
+
+    pub fn is_query_cancelled(&self, query_id: &str) -> bool {
+        self.cancelled_queries
+            .read()
+            .map(|g| g.contains(query_id))
+            .unwrap_or(false)
     }
 
     pub fn store(&self) -> &Arc<IcebergObjectStore> {
@@ -223,9 +240,18 @@ impl WorkerNode {
                             None => None,
                         };
 
+                        // Cooperative in-flight query cancellation check between splits (Wave 22)
+                        if self.is_query_cancelled(&task.attempt_id.query_id.0.to_string()) {
+                            return Err(RustLakeError::Execution(format!(
+                                "query '{}' cancelled by user on worker '{}'",
+                                task.attempt_id.query_id, self.id
+                            )));
+                        }
+
                         // Wave 12 Vectorized Arrow Filtered Scan: evaluate simple column predicates
                         // directly over Arrow RecordBatches and materialize ONLY matching rows!
                         if candidate_rows.is_none()
+                            && meta.column_aliases.is_empty()
                             && let Some(pred) = pushed_filter
                             && let Some(vec_rows) = self
                                 .try_eval_vectorized_filtered_scan(
@@ -247,9 +273,10 @@ impl WorkerNode {
                         };
                         let file_batch = self
                             .store
-                            .read_data_file_projected(
+                            .read_data_file_with_aliases(
                                 &split.file_path,
                                 &meta.schema,
+                                &meta.column_aliases,
                                 proj_opt,
                                 candidate_rows.as_ref(),
                             )
@@ -477,7 +504,60 @@ impl WorkerNode {
                     .await
                 }
                 PhysicalNode::Window { input, specs } => {
+                    // Wave 22 Pure Arrow RecordBatch Window Fast Path: when input is a single-table
+                    // IcebergScan with no schema aliases, execute Window directly on Arrow RecordBatches!
+                    if let PhysicalNode::IcebergScan {
+                        table_name,
+                        pushed_filter,
+                        splits,
+                        ..
+                    } = input.as_ref()
+                        && let Ok(meta) = self.catalog.get_table(table_name).await
+                        && meta.column_aliases.is_empty()
+                    {
+                        let effective_splits = if !task.assigned_splits.is_empty() {
+                            &task.assigned_splits
+                        } else {
+                            splits
+                        };
+                        if effective_splits.len() == 1
+                            && let Ok((batches, dv)) = self
+                                .store
+                                .read_arrow_batches(&effective_splits[0].file_path, None)
+                                .await
+                            && dv.is_empty()
+                            && batches.len() == 1
+                        {
+                            let mut rb = batches.into_iter().next().unwrap();
+                            let ok_filter = if let Some(pred) = pushed_filter {
+                                match columnar::apply_columnar_filter(&rb, pred) {
+                                    Some(f) => {
+                                        rb = f;
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            } else {
+                                true
+                            };
+                            if ok_filter
+                                && let Ok(win_rb) = columnar::eval_columnar_window(&rb, specs)
+                            {
+                                self.vectorized_rows_processed
+                                    .fetch_add(win_rb.num_rows() as u64, Ordering::Relaxed);
+                                return Ok(rustlakedb_storage::record_batch_to_row_batch(&win_rb));
+                            }
+                        }
+                    }
                     let batch = self.eval_node(input, task).await?;
+                    if !batch.rows.is_empty()
+                        && let Ok(rb) = rustlakedb_storage::row_batch_to_record_batch(&batch)
+                        && let Ok(win_rb) = columnar::eval_columnar_window(&rb, specs)
+                    {
+                        self.vectorized_rows_processed
+                            .fetch_add(win_rb.num_rows() as u64, Ordering::Relaxed);
+                        return Ok(rustlakedb_storage::record_batch_to_row_batch(&win_rb));
+                    }
                     Ok(eval_window(batch, specs))
                 }
                 PhysicalNode::UnionAll { inputs, distinct } => {

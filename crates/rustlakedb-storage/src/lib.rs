@@ -479,7 +479,45 @@ impl IcebergObjectStore {
         projected_columns: Option<&[String]>,
         candidate_rows: Option<&RoaringBitmap>,
     ) -> Result<RowBatch> {
-        let (batches, dv) = self.read_arrow_batches(file_path, projected_columns).await?;
+        self.read_data_file_with_aliases(
+            file_path,
+            schema,
+            &HashMap::new(),
+            projected_columns,
+            candidate_rows,
+        )
+        .await
+    }
+
+    /// Reads a real Apache Parquet file with full Iceberg v3 Field-ID Schema Evolution (Wave 22):
+    /// - Transparently resolves renamed columns via `column_aliases` without rewriting old Parquet files
+    /// - Drops removed columns cleanly on read
+    /// - Widens numeric/decimal types (`Int64 -> Float64`, `Decimal(p1, s1) -> Decimal(p2, s2)`) on read!
+    pub async fn read_data_file_with_aliases(
+        &self,
+        file_path: &str,
+        schema: &[FieldSchema],
+        column_aliases: &HashMap<String, Vec<String>>,
+        projected_columns: Option<&[String]>,
+        candidate_rows: Option<&RoaringBitmap>,
+    ) -> Result<RowBatch> {
+        // Expand projected columns to include historical physical names of renamed columns!
+        let expanded_proj: Option<Vec<String>> = projected_columns.map(|cols| {
+            let mut v = cols.to_vec();
+            for c in cols {
+                if let Some(hist) = column_aliases.get(c) {
+                    for old in hist {
+                        if !v.contains(old) {
+                            v.push(old.clone());
+                        }
+                    }
+                }
+            }
+            v
+        });
+        let (batches, dv) = self
+            .read_arrow_batches(file_path, expanded_proj.as_deref())
+            .await?;
 
         let schema_names: HashSet<&str> = schema.iter().map(|f| f.name.as_str()).collect();
         let logical_cols: Vec<String> = match projected_columns {
@@ -497,10 +535,17 @@ impl IcebergObjectStore {
             }
             _ => schema.iter().map(|f| f.name.clone()).collect(),
         };
-        let col_types: HashMap<&str, &ColumnType> = schema
-            .iter()
-            .map(|f| (f.name.as_str(), &f.data_type))
-            .collect();
+
+        // Map every physical column name (current OR historical alias) -> (&logical_name, &ColumnType)
+        let mut phys_to_logical: HashMap<&str, (&str, &ColumnType)> = HashMap::new();
+        for f in schema {
+            phys_to_logical.insert(f.name.as_str(), (f.name.as_str(), &f.data_type));
+            if let Some(hist) = column_aliases.get(&f.name) {
+                for old in hist {
+                    phys_to_logical.insert(old.as_str(), (f.name.as_str(), &f.data_type));
+                }
+            }
+        }
 
         let mut out_rows = Vec::new();
         let mut global_row_id: u32 = 0;
@@ -523,18 +568,25 @@ impl IcebergObjectStore {
 
                 let mut row = BTreeMap::new();
                 for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
-                    if field.name().starts_with("__shred_")
-                        && projected_columns.is_none()
-                    {
+                    let pname = field.name().as_str();
+                    if pname.starts_with("__shred_") {
+                        if projected_columns.is_none() {
+                            continue;
+                        }
+                        let arr = rb.column(col_idx);
+                        let val = extract_scalar(arr.as_ref(), row_idx, None);
+                        row.insert(pname.to_string(), val);
                         continue;
                     }
+                    // Skip columns dropped via ALTER TABLE DROP COLUMN!
+                    let Some(&(logical_name, target_type)) = phys_to_logical.get(pname) else {
+                        continue;
+                    };
                     let arr = rb.column(col_idx);
-                    let val = extract_scalar(
-                        arr.as_ref(),
-                        row_idx,
-                        col_types.get(field.name().as_str()).copied(),
-                    );
-                    row.insert(field.name().clone(), val);
+                    let raw_val = extract_scalar(arr.as_ref(), row_idx, Some(target_type));
+                    // Apply transparent Iceberg type widening on read (Int64 -> Float64, Decimal scale)
+                    let val = widen_scalar_on_read(raw_val, target_type);
+                    row.insert(logical_name.to_string(), val);
                 }
                 for col_name in &logical_cols {
                     row.entry(col_name.clone()).or_insert(ScalarValue::Null);
@@ -1223,6 +1275,31 @@ fn index_json_recursive(
                 puffin.index_json_field(&full_path, &other.to_string(), row_idx);
             }
         }
+    }
+}
+
+/// Transparently widens physical Parquet scalar values on read to match an evolved Iceberg schema
+/// (`Int64 -> Float64`, `Int64 -> Decimal`, `Decimal(v, s1) -> Decimal(v, s2)`, Wave 22).
+fn widen_scalar_on_read(val: ScalarValue, target: &ColumnType) -> ScalarValue {
+    match (val, target) {
+        (ScalarValue::Int64(i), ColumnType::Float64) => ScalarValue::Float64(i as f64),
+        (ScalarValue::Int64(i), ColumnType::Decimal { scale, .. }) => {
+            let factor = 10i128.pow(*scale as u32);
+            ScalarValue::Decimal((i as i128) * factor, *scale)
+        }
+        (ScalarValue::Decimal(v, s1), ColumnType::Decimal { scale: s2, .. }) if s1 != *s2 => {
+            if *s2 > s1 {
+                let factor = 10i128.pow((*s2 - s1) as u32);
+                ScalarValue::Decimal(v * factor, *s2)
+            } else {
+                let factor = 10i128.pow((s1 - *s2) as u32);
+                ScalarValue::Decimal(v / factor, *s2)
+            }
+        }
+        (ScalarValue::Decimal(v, s), ColumnType::Float64) => {
+            ScalarValue::Float64((v as f64) / 10f64.powi(s as i32))
+        }
+        (other, _) => other,
     }
 }
 

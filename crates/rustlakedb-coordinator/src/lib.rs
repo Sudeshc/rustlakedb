@@ -858,6 +858,58 @@ impl Coordinator {
                     stats: QueryExecutionStats::default(),
                 })
             }
+            PlannedCommand::AlterRenameColumn {
+                table_name,
+                old_name,
+                new_name,
+            } => {
+                let fid = self
+                    .catalog
+                    .rename_column(&table_name, &old_name, &new_name)
+                    .await?;
+                let updated = self.catalog.get_table(&table_name).await?;
+                self.store.write_iceberg_metadata(&updated, branch).await?;
+                Ok(QueryExecutionResult {
+                    command_tag: format!("ALTER TABLE RENAME COLUMN field_id={fid}"),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::AlterDropColumn {
+                table_name,
+                column_name,
+                if_exists,
+            } => {
+                self.catalog
+                    .drop_column(&table_name, &column_name, if_exists)
+                    .await?;
+                let updated = self.catalog.get_table(&table_name).await?;
+                self.store.write_iceberg_metadata(&updated, branch).await?;
+                Ok(QueryExecutionResult {
+                    command_tag: "ALTER TABLE DROP COLUMN".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::AlterColumnType {
+                table_name,
+                column_name,
+                data_type,
+            } => {
+                self.catalog
+                    .widen_column(&table_name, &column_name, data_type)
+                    .await?;
+                let updated = self.catalog.get_table(&table_name).await?;
+                self.store.write_iceberg_metadata(&updated, branch).await?;
+                Ok(QueryExecutionResult {
+                    command_tag: "ALTER TABLE ALTER COLUMN TYPE".into(),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
             PlannedCommand::CreateIndex { table_name, spec } => {
                 let is_hnsw = spec.index_type == PuffinIndexType::Hnsw;
                 let idx_col = spec.column.clone();
@@ -2723,6 +2775,13 @@ impl Coordinator {
         let mut final_batches: Vec<RowBatch> = Vec::new();
 
         for stage in &dag.stages {
+            // Cooperative in-flight query cancellation check between DAG stages (Wave 22)
+            if self.governance.is_query_cancelled(&dag.query_id.0.to_string()) {
+                return Err(RustLakeError::Execution(format!(
+                    "query '{}' cancelled by user before stage {}",
+                    dag.query_id, stage.stage_id
+                )));
+            }
             stats.stages_executed += 1;
             let leaf_splits = collect_leaf_splits(&stage.plan);
 

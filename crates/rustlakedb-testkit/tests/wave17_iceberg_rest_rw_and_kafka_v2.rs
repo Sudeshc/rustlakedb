@@ -397,3 +397,80 @@ async fn wave17_kafka_record_batch_v2_zstd_metadata_list_offsets_cdc() {
     assert_eq!(rep2.messages_fetched, 0);
     assert_eq!(rep2.next_offset, 14);
 }
+
+#[tokio::test]
+#[ignore = "requires live Redpanda/Kafka broker at 127.0.0.1:19092 with topic cdc.orders"]
+async fn live_redpanda_record_batch_v2_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryRaftCatalog::open(dir.path()).unwrap());
+    let store = Arc::new(IcebergObjectStore::local_fs(dir.path()).unwrap());
+    let shuffle: Arc<dyn ShuffleTransport> =
+        Arc::new(HybridShuffleManager::new(dir.path().join("_shuffle")).unwrap());
+    let worker = Arc::new(WorkerNode::new(
+        "w1",
+        catalog.clone(),
+        shuffle.clone(),
+        store.clone(),
+    ));
+    let coord = Arc::new(Coordinator::new(
+        catalog,
+        store,
+        shuffle,
+        vec![worker],
+        PlannerConfig::default(),
+    ));
+
+    coord
+        .execute_sql(
+            "CREATE TABLE rp_orders (id BIGINT, customer TEXT, amount DOUBLE)",
+            "main",
+        )
+        .await
+        .unwrap();
+
+    let broker = "127.0.0.1:19092";
+    let parts = fetch_kafka_topic_partitions(broker, "cdc.orders")
+        .await
+        .unwrap();
+    println!("Live Redpanda Metadata v1 partitions for cdc.orders: {parts:?}");
+    assert_eq!(parts, vec![0]);
+
+    let latest = list_kafka_offset(broker, "cdc.orders", 0, -1).await.unwrap();
+    println!("Live Redpanda ListOffsets v1 latest offset: {latest}");
+    assert!(latest >= 4);
+
+    let v4_direct = rustlakedb_coordinator::kafka_ingest::fetch_kafka_v4_records(
+        broker, "cdc.orders", 0, 0, 1024 * 1024,
+    )
+    .await;
+    println!("Direct Fetch v4 result: {v4_direct:?}");
+    let consumer = KafkaCdcConsumer::new(
+        coord.clone(),
+        broker,
+        "cdc.orders",
+        0,
+        "rp_orders",
+        dir.path().join("_kafka"),
+    )
+    .unwrap();
+    let rep = consumer.poll_once().await.unwrap();
+    println!("Live Redpanda Fetch v4 RecordBatch v2 CDC report: {rep:?}");
+    assert_eq!(rep.messages_fetched, 4);
+    assert_eq!(rep.applied, 4);
+    assert_eq!(rep.next_offset, 4);
+
+    let res = coord
+        .execute_sql("SELECT id, customer, amount FROM rp_orders ORDER BY id", "main")
+        .await
+        .unwrap();
+    assert_eq!(res.batch.num_rows(), 1);
+    assert_eq!(
+        res.batch.rows[0].get("customer"),
+        Some(&ScalarValue::Utf8("Alice".into()))
+    );
+    assert_eq!(
+        res.batch.rows[0].get("amount"),
+        Some(&ScalarValue::Float64(300.0))
+    );
+    println!("LIVE REDPANDA STREAMING CDC -> ICEBERG v3 VERIFIED 100%!");
+}

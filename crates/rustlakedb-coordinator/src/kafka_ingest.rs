@@ -460,6 +460,10 @@ pub fn decode_kafka_record_set(mut buf: &[u8]) -> Result<Vec<(i64, Vec<u8>)>> {
             let decompressed: Vec<u8>;
             let mut rec_cur: &[u8] = match codec {
                 0 => hdr,
+                2 => {
+                    decompressed = decompress_kafka_snappy(hdr)?;
+                    &decompressed
+                }
                 4 => {
                     decompressed = zstd::bulk::decompress(hdr, 64 * 1024 * 1024).map_err(|e| {
                         RustLakeError::Execution(format!("kafka zstd decompress: {e}"))
@@ -468,7 +472,7 @@ pub fn decode_kafka_record_set(mut buf: &[u8]) -> Result<Vec<(i64, Vec<u8>)>> {
                 }
                 other => {
                     return Err(RustLakeError::Execution(format!(
-                        "unsupported Kafka RecordBatch v2 compression codec {other} (supported: none=0, zstd=4)"
+                        "unsupported Kafka RecordBatch v2 compression codec {other} (supported: none=0, snappy=2, zstd=4)"
                     )));
                 }
             };
@@ -586,6 +590,33 @@ pub fn encode_kafka_record_batch_v2(
     out.put_i32(batch_body.len() as i32);
     out.put_slice(&batch_body);
     Ok(out.to_vec())
+}
+
+/// Decompresses Kafka/Redpanda Snappy (`codec=2`) payloads (handles both xerial framed
+/// `\x82SNAPPY\x00` chunks and raw Snappy blocks, Wave 17 / Live Redpanda verified!).
+fn decompress_kafka_snappy(data: &[u8]) -> Result<Vec<u8>> {
+    const XERIAL_MAGIC: &[u8; 8] = b"\x82SNAPPY\x00";
+    let mut dec = snap::raw::Decoder::new();
+    if data.len() >= 16 && &data[..8] == XERIAL_MAGIC {
+        let mut cur = &data[16..]; // skip 8B magic + 4B version + 4B compat version
+        let mut out = Vec::new();
+        while cur.len() >= 4 {
+            let chunk_len = u32::from_be_bytes(cur[..4].try_into().unwrap()) as usize;
+            cur = &cur[4..];
+            if cur.len() < chunk_len {
+                break;
+            }
+            let chunk = dec
+                .decompress_vec(&cur[..chunk_len])
+                .map_err(|e| RustLakeError::Execution(format!("kafka snappy chunk: {e}")))?;
+            out.extend_from_slice(&chunk);
+            cur = &cur[chunk_len..];
+        }
+        Ok(out)
+    } else {
+        dec.decompress_vec(data)
+            .map_err(|e| RustLakeError::Execution(format!("kafka raw snappy: {e}")))
+    }
 }
 
 /// Pure-Rust CRC-32C (Castagnoli) checksum matching Kafka RecordBatch v2 specification.

@@ -395,13 +395,20 @@ fn build_load_table_response(namespace: &str, meta: &IcebergTableMetadata) -> Va
         .map(|(k, v)| (k.clone(), json!({ "snapshot-id": v, "type": "branch" })))
         .collect();
 
-    let table_uuid = uuid::Uuid::new_v4().to_string();
-    let _ = table_uuid;
+    // Deterministic valid RFC 4122 UUID (required by PyIceberg/Spark TableResponse pydantic validation!)
+    let h1 = xxhash_rust::xxh3::xxh3_64(format!("rldb-uuid-1:{namespace}:{}", meta.table_name).as_bytes());
+    let h2 = xxhash_rust::xxh3::xxh3_64(format!("rldb-uuid-2:{namespace}:{}", meta.table_name).as_bytes());
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes[..8].copy_from_slice(&h1.to_be_bytes());
+    uuid_bytes[8..].copy_from_slice(&h2.to_be_bytes());
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40; // version 4
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let table_uuid = uuid::Uuid::from_bytes(uuid_bytes).to_string();
     json!({
         "metadata-location": format!("{}/metadata/v{}.metadata.json", meta.table_name, current_snap),
         "metadata": {
             "format-version": meta.format_version,
-            "table-uuid": format!("rustlakedb-{}-{}", namespace, meta.table_name),
+            "table-uuid": table_uuid,
             "location": location,
             "last-sequence-number": current_snap,
             "last-updated-ms": last_updated_ms,

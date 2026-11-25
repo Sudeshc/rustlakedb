@@ -302,6 +302,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 },
             ));
+            if let Ok(jwks_url) = std::env::var("RUSTLAKEDB_OIDC_JWKS_URL")
+                && !jwks_url.trim().is_empty()
+            {
+                println!("OIDC JWKS Auto-Refresh Poller enabled for {jwks_url}");
+                coord.governance.clone().spawn_oidc_jwks_poller(
+                    jwks_url,
+                    std::time::Duration::from_secs(300),
+                );
+            }
             if let Some(ref rest_addr) = args.rest_addr {
                 let cp = rustlakedb_coordinator::admin::ControlPlaneServer::bind(
                     rest_addr,

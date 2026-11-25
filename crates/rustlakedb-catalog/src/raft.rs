@@ -78,6 +78,21 @@ pub enum CatalogCommand {
         table_name: String,
         branch: String,
     },
+    RenameColumn {
+        table_name: String,
+        old_col: String,
+        new_col: String,
+    },
+    DropColumn {
+        table_name: String,
+        col_name: String,
+        if_exists: bool,
+    },
+    WidenColumn {
+        table_name: String,
+        col_name: String,
+        new_type: ColumnType,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -786,6 +801,37 @@ impl RaftCatalogNode {
                     .await?;
                 Ok(json!({ "snapshot_id": s }))
             }
+            CatalogCommand::RenameColumn {
+                table_name,
+                old_col,
+                new_col,
+            } => {
+                let fid = self
+                    .state_machine
+                    .rename_column(&table_name, &old_col, &new_col)
+                    .await?;
+                Ok(json!({ "field_id": fid }))
+            }
+            CatalogCommand::DropColumn {
+                table_name,
+                col_name,
+                if_exists,
+            } => {
+                self.state_machine
+                    .drop_column(&table_name, &col_name, if_exists)
+                    .await?;
+                Ok(json!({ "ok": true }))
+            }
+            CatalogCommand::WidenColumn {
+                table_name,
+                col_name,
+                new_type,
+            } => {
+                self.state_machine
+                    .widen_column(&table_name, &col_name, new_type)
+                    .await?;
+                Ok(json!({ "ok": true }))
+            }
         }
     }
 }
@@ -942,6 +988,42 @@ impl Catalog for RaftCatalogNode {
             })
             .await?;
         Ok(v["snapshot_id"].as_u64().unwrap_or(1))
+    }
+
+    async fn rename_column(&self, table_name: &str, old_col: &str, new_col: &str) -> Result<i32> {
+        let v = self
+            .propose(CatalogCommand::RenameColumn {
+                table_name: table_name.to_string(),
+                old_col: old_col.to_string(),
+                new_col: new_col.to_string(),
+            })
+            .await?;
+        Ok(v["field_id"].as_i64().unwrap_or(0) as i32)
+    }
+
+    async fn drop_column(&self, table_name: &str, col_name: &str, if_exists: bool) -> Result<()> {
+        self.propose(CatalogCommand::DropColumn {
+            table_name: table_name.to_string(),
+            col_name: col_name.to_string(),
+            if_exists,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn widen_column(
+        &self,
+        table_name: &str,
+        col_name: &str,
+        new_type: ColumnType,
+    ) -> Result<()> {
+        self.propose(CatalogCommand::WidenColumn {
+            table_name: table_name.to_string(),
+            col_name: col_name.to_string(),
+            new_type,
+        })
+        .await?;
+        Ok(())
     }
 }
 

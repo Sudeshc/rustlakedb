@@ -1,0 +1,9 @@
+name: 'rustlakedb_quickstart'
+version: '1.0.0'
+config-version: 2
+profile: 'rustlakedb'
+
+model-paths: ["models"]
+models:
+  rustlakedb_quickstart:
+    +materialized: table
