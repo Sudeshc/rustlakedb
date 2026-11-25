@@ -1,0 +1,195 @@
+# Copyright (C) 2026 Sudeshc
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Turnkey RustLakeDB v7.0.0 Production Lakehouse Stack (100% Rust Storage + Compute!):
+#   - RustFS S3-Compatible Object Store (`s3://warehouse`, API :19000, Console :19001)
+#   - 2 Distributed RustLakeDB Workers + Coordinator (PGWire :25432, Iceberg REST & UI :28181, Arrow Flight SQL :28815)
+#   - Prometheus scraping /metrics with preloaded alert rules (:19090)
+#   - Grafana auto-provisioned with the RustLakeDB dashboard (:13000, admin/admin)
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustlakedb-prod-rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - prod_rustfs_data:/data
+    command: ["/data"]
+
+  s3-init:
+    image: python:3.12-slim
+    depends_on:
+      - rustfs
+    entrypoint:
+      - sh
+      - -c
+      - |
+        pip install -q boto3 && python3 - <<'PY'
+        import time, boto3
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="http://rustfs:9000",
+            aws_access_key_id="rustfsadmin",
+            aws_secret_access_key="rustfsadmin",
+            region_name="us-east-1",
+        )
+        for _ in range(30):
+            try:
+                s3.create_bucket(Bucket="warehouse")
+                break
+            except Exception as e:
+                if "BucketAlreadyOwnedByYou" in str(e) or "BucketAlreadyExists" in str(e):
+                    break
+                time.sleep(1)
+        print("Bucket s3://warehouse ready on RustFS")
+        PY
+
+  worker-1:
+    image: rustlakedb:7.0.0
+    container_name: rustlakedb-prod-worker-1
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ENDPOINT_URL: http://rustfs:9000
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ALLOW_HTTP: "true"
+      RUSTLAKEDB_WAREHOUSE: s3://warehouse
+    command:
+      - --mode
+      - worker
+      - --worker-id
+      - worker-1
+      - --data-dir
+      - /catalog
+      - --storage-uri
+      - s3://warehouse
+      - --bind
+      - 0.0.0.0:7001
+      - --advertise-url
+      - http://worker-1:7001
+      - --coordinator-url
+      - http://coordinator:8181
+    volumes:
+      - prod_catalog_data:/catalog
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7001/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  worker-2:
+    image: rustlakedb:7.0.0
+    container_name: rustlakedb-prod-worker-2
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ENDPOINT_URL: http://rustfs:9000
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ALLOW_HTTP: "true"
+      RUSTLAKEDB_WAREHOUSE: s3://warehouse
+    command:
+      - --mode
+      - worker
+      - --worker-id
+      - worker-2
+      - --data-dir
+      - /catalog
+      - --storage-uri
+      - s3://warehouse
+      - --bind
+      - 0.0.0.0:7002
+      - --advertise-url
+      - http://worker-2:7002
+      - --coordinator-url
+      - http://coordinator:8181
+    volumes:
+      - prod_catalog_data:/catalog
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7002/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  coordinator:
+    image: rustlakedb:7.0.0
+    container_name: rustlakedb-prod-coordinator
+    depends_on:
+      worker-1:
+        condition: service_healthy
+      worker-2:
+        condition: service_healthy
+    environment:
+      AWS_ENDPOINT_URL: http://rustfs:9000
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ALLOW_HTTP: "true"
+      RUSTLAKEDB_WAREHOUSE: s3://warehouse
+    command:
+      - --mode
+      - coordinator
+      - --data-dir
+      - /catalog
+      - --storage-uri
+      - s3://warehouse
+      - --worker-urls
+      - http://worker-1:7001,http://worker-2:7002
+      - --pg-addr
+      - 0.0.0.0:5432
+      - --rest-addr
+      - 0.0.0.0:8181
+      - --flight-addr
+      - 0.0.0.0:8815
+    ports:
+      - "25432:5432"
+      - "28181:8181"
+      - "28815:8815"
+    volumes:
+      - prod_catalog_data:/catalog
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rustlakedb-prod-prometheus
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    ports:
+      - "19090:9090"
+    volumes:
+      - ../deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../deploy/observability/prometheus-alerts.yaml:/etc/prometheus/prometheus-alerts.yaml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rustlakedb-prod-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "13000:3000"
+    volumes:
+      - ../deploy/observability/grafana-provisioning:/etc/grafana/provisioning:ro
+      - ../deploy/observability/grafana-dashboard.json:/var/lib/grafana/dashboards/rustlakedb.json:ro
+
+volumes:
+  prod_rustfs_data:
+  prod_catalog_data:

@@ -132,6 +132,7 @@ impl BoundedObjectCache {
 /// with hybrid RAM + NVMe caching, column projection pushdown, and shredded JSON sub-columns.
 pub struct IcebergObjectStore {
     store: Arc<dyn ObjectStore>,
+    base_uri: Option<String>,
     cache: Mutex<BoundedObjectCache>,
     pub parquet_files_written: AtomicU64,
     pub parquet_files_read: AtomicU64,
@@ -146,7 +147,7 @@ pub struct IcebergObjectStore {
 
 impl IcebergObjectStore {
     pub fn in_memory() -> Self {
-        Self::with_store(Arc::new(InMemory::new()), 128 * 1024 * 1024, None)
+        Self::with_store(Arc::new(InMemory::new()), 128 * 1024 * 1024, None, None)
     }
 
     pub fn local_fs(root: impl AsRef<Path>) -> Result<Self> {
@@ -154,10 +155,19 @@ impl IcebergObjectStore {
         let fs = LocalFileSystem::new_with_prefix(root.as_ref())
             .map_err(|e| RustLakeError::Execution(format!("local object store init: {e}")))?;
         let nvme_cache = root.as_ref().join("_nvme_cache");
+        let abs = std::fs::canonicalize(root.as_ref()).unwrap_or_else(|_| root.as_ref().to_path_buf());
+        let norm = abs.to_string_lossy().replace('\\', "/");
+        let clean = norm.strip_prefix("//?/").unwrap_or(&norm);
+        let base_uri = if clean.starts_with('/') {
+            format!("file://{clean}")
+        } else {
+            format!("file:///{clean}")
+        };
         Ok(Self::with_store(
             Arc::new(fs),
             128 * 1024 * 1024,
             Some(nvme_cache),
+            Some(base_uri),
         ))
     }
 
@@ -165,9 +175,11 @@ impl IcebergObjectStore {
         store: Arc<dyn ObjectStore>,
         ram_cache_bytes: usize,
         nvme_dir: Option<PathBuf>,
+        base_uri: Option<String>,
     ) -> Self {
         Self {
             store,
+            base_uri,
             cache: Mutex::new(BoundedObjectCache::new(ram_cache_bytes, nvme_dir)),
             parquet_files_written: AtomicU64::new(0),
             parquet_files_read: AtomicU64::new(0),
@@ -199,7 +211,12 @@ impl IcebergObjectStore {
                     .with_allow_http(true)
                     .build()
                     .map_err(|e| RustLakeError::Execution(format!("S3 object_store init: {e}")))?;
-                return Ok(Self::with_store(Arc::new(s3), 256 * 1024 * 1024, None));
+                return Ok(Self::with_store(
+                    Arc::new(s3),
+                    256 * 1024 * 1024,
+                    None,
+                    Some(format!("s3://{bucket_name}")),
+                ));
             }
             if let Some(bucket) = uri.strip_prefix("gs://") {
                 let bucket_name = bucket.split('/').next().unwrap_or(bucket);
@@ -207,7 +224,12 @@ impl IcebergObjectStore {
                     .with_bucket_name(bucket_name)
                     .build()
                     .map_err(|e| RustLakeError::Execution(format!("GCS object_store init: {e}")))?;
-                return Ok(Self::with_store(Arc::new(gcs), 256 * 1024 * 1024, None));
+                return Ok(Self::with_store(
+                    Arc::new(gcs),
+                    256 * 1024 * 1024,
+                    None,
+                    Some(format!("gs://{bucket_name}")),
+                ));
             }
             if let Some(container) = uri.strip_prefix("az://") {
                 let name = container.split('/').next().unwrap_or(container);
@@ -215,7 +237,12 @@ impl IcebergObjectStore {
                     .with_container_name(name)
                     .build()
                     .map_err(|e| RustLakeError::Execution(format!("Azure object_store init: {e}")))?;
-                return Ok(Self::with_store(Arc::new(az), 256 * 1024 * 1024, None));
+                return Ok(Self::with_store(
+                    Arc::new(az),
+                    256 * 1024 * 1024,
+                    None,
+                    Some(format!("az://{name}")),
+                ));
             }
         }
         if uri.starts_with("s3://") || uri.starts_with("gs://") || uri.starts_with("az://") {
@@ -228,6 +255,29 @@ impl IcebergObjectStore {
 
     pub fn inner(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
+    }
+
+    /// Writes raw bytes to an arbitrary object key (used by `COPY TO` for local & cloud URIs, Wave 26).
+    pub async fn put_raw_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        self.store
+            .put(&ObjPath::from(key), PutPayload::from(Bytes::from(bytes)))
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("object_store put '{key}': {e}")))?;
+        Ok(())
+    }
+
+    /// Reads raw bytes from an arbitrary object key (used by `COPY FROM` for cloud URIs, Wave 26).
+    pub async fn get_raw_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .store
+            .get(&ObjPath::from(key))
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("object_store get '{key}': {e}")))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| RustLakeError::Execution(format!("object_store read '{key}': {e}")))?;
+        Ok(bytes.to_vec())
     }
 
     /// Reads an immutable object (`*.parquet` or `*.puffin.json`) through the hybrid RAM + NVMe cache.
@@ -654,10 +704,12 @@ impl IcebergObjectStore {
 
     pub async fn write_iceberg_metadata(&self, meta: &IcebergTableMetadata, branch: &str) -> Result<String> {
         let snap = meta.current_snapshot(branch)?;
+        let base_ref = self.base_uri.as_deref();
 
         // 1. Write genuine Apache Iceberg v3 Avro Manifest (`snap-{id}-m0.avro`)
         let manifest_path = format!("{}/metadata/snap-{}-m0.avro", meta.table_name, snap.snapshot_id);
-        let manifest_bytes = iceberg_avro::encode_iceberg_v3_manifest(meta, snap);
+        let manifest_bytes =
+            iceberg_avro::encode_iceberg_v3_manifest_with_base(meta, snap, base_ref);
         let manifest_len = manifest_bytes.len() as i64;
         self.store
             .put(&ObjPath::from(manifest_path.as_str()), PutPayload::from(Bytes::from(manifest_bytes)))
@@ -666,8 +718,12 @@ impl IcebergObjectStore {
 
         // 2. Write genuine Apache Iceberg v3 Avro Manifest List (`snap-{id}.avro`)
         let manifest_list_path = format!("{}/metadata/snap-{}.avro", meta.table_name, snap.snapshot_id);
+        let manifest_uri = match base_ref {
+            Some(base) => format!("{}/{}", base.trim_end_matches('/'), manifest_path),
+            None => manifest_path.clone(),
+        };
         let manifest_list_bytes =
-            iceberg_avro::encode_iceberg_v3_manifest_list(snap, &manifest_path, manifest_len);
+            iceberg_avro::encode_iceberg_v3_manifest_list(snap, &manifest_uri, manifest_len);
         self.store
             .put(
                 &ObjPath::from(manifest_list_path.as_str()),
@@ -1244,6 +1300,26 @@ fn row_batch_to_arrow_and_puffin(
             }
         }
     }
+
+    // Attach official Iceberg `PARQUET:field_id` metadata to every Arrow Field so PyIceberg,
+    // Spark, DuckDB, and Trino resolve columns by stable Iceberg Field ID directly from Parquet! (Wave 27)
+    let id_by_name: HashMap<&str, i32> = schema
+        .iter()
+        .map(|f| (f.name.as_str(), f.field_id))
+        .collect();
+    let fields: Vec<Field> = fields
+        .into_iter()
+        .map(|f| {
+            if let Some(&fid) = id_by_name.get(f.name().as_str()) {
+                f.with_metadata(HashMap::from([(
+                    "PARQUET:field_id".to_string(),
+                    fid.to_string(),
+                )]))
+            } else {
+                f
+            }
+        })
+        .collect();
 
     let arrow_schema = Arc::new(Schema::new(fields));
     let rb = RecordBatch::try_new(arrow_schema, arrays)

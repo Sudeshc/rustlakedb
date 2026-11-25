@@ -23,8 +23,12 @@ pub async fn try_handle_pg_compat(
     // 1. `SHOW <param>` queries sent by JDBC / DBeaver / psql.
     if let Some(rest) = lower.strip_prefix("show ") {
         let param = rest.trim().trim_matches('"');
-        if param == "tables" || param == "queries" {
-            return None; // Handled by native `SHOW TABLES` / `SHOW QUERIES`.
+        if param == "tables"
+            || param == "queries"
+            || param.starts_with("snapshots")
+            || param.starts_with("tags")
+        {
+            return None; // Handled by native `SHOW TABLES` / `SHOW QUERIES` / `SHOW SNAPSHOTS` / `SHOW TAGS`.
         }
         let val = match param {
             "transaction_isolation" | "transaction isolation level" => "read committed",

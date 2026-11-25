@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::{
-    Catalog, ColumnType, IcebergTableMetadata, InMemoryRaftCatalog, PuffinIndexSpec,
+    Catalog, ColumnStats, ColumnType, IcebergTableMetadata, InMemoryRaftCatalog, PuffinIndexSpec,
     TableCommitProposal, ViewDefinition,
 };
 use async_trait::async_trait;
@@ -34,7 +34,7 @@ pub enum RaftRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CatalogCommand {
-    CreateTable(IcebergTableMetadata),
+    CreateTable(Box<IcebergTableMetadata>),
     DropTable(String),
     AddColumn {
         table_name: String,
@@ -92,6 +92,24 @@ pub enum CatalogCommand {
         table_name: String,
         col_name: String,
         new_type: ColumnType,
+    },
+    RestoreTable {
+        table_name: String,
+        branch: String,
+        target_snapshot_id: u64,
+    },
+    SetTableTags {
+        table_name: String,
+        tags: std::collections::BTreeMap<String, String>,
+    },
+    SetColumnDefault {
+        table_name: String,
+        col_name: String,
+        default_val: String,
+    },
+    SetColumnStats {
+        table_name: String,
+        stats: HashMap<String, ColumnStats>,
     },
 }
 
@@ -319,6 +337,24 @@ impl RaftCatalogNode {
 
     pub fn stop(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        let mut c = self.core.write();
+        c.role = RaftRole::Follower;
+    }
+
+    /// Rejoins a previously stopped node to the Raft quorum as a Follower (rolling-upgrade support, Wave 28).
+    pub fn resume(self: &Arc<Self>) {
+        let was_stopped = self.shutdown.swap(false, Ordering::SeqCst);
+        {
+            let mut c = self.core.write();
+            c.role = RaftRole::Follower;
+            c.last_heartbeat = Instant::now();
+        }
+        if was_stopped {
+            let loop_node = self.clone();
+            tokio::spawn(async move {
+                loop_node.run_raft_loop().await;
+            });
+        }
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -713,7 +749,7 @@ impl RaftCatalogNode {
     async fn apply_command_locally(&self, cmd: CatalogCommand) -> Result<Value> {
         match cmd {
             CatalogCommand::CreateTable(meta) => {
-                self.state_machine.create_table(meta).await?;
+                self.state_machine.create_table(*meta).await?;
                 Ok(json!({ "ok": true }))
             }
             CatalogCommand::DropTable(name) => {
@@ -832,6 +868,37 @@ impl RaftCatalogNode {
                     .await?;
                 Ok(json!({ "ok": true }))
             }
+            CatalogCommand::RestoreTable {
+                table_name,
+                branch,
+                target_snapshot_id,
+            } => {
+                let s = self
+                    .state_machine
+                    .restore_table(&table_name, &branch, target_snapshot_id)
+                    .await?;
+                Ok(json!({ "snapshot_id": s }))
+            }
+            CatalogCommand::SetTableTags { table_name, tags } => {
+                self.state_machine.set_table_tags(&table_name, tags).await?;
+                Ok(json!({ "ok": true }))
+            }
+            CatalogCommand::SetColumnDefault {
+                table_name,
+                col_name,
+                default_val,
+            } => {
+                self.state_machine
+                    .set_column_default(&table_name, &col_name, default_val)
+                    .await?;
+                Ok(json!({ "ok": true }))
+            }
+            CatalogCommand::SetColumnStats { table_name, stats } => {
+                self.state_machine
+                    .set_column_stats(&table_name, stats)
+                    .await?;
+                Ok(json!({ "ok": true }))
+            }
         }
     }
 }
@@ -839,7 +906,8 @@ impl RaftCatalogNode {
 #[async_trait]
 impl Catalog for RaftCatalogNode {
     async fn create_table(&self, metadata: IcebergTableMetadata) -> Result<()> {
-        self.propose(CatalogCommand::CreateTable(metadata)).await?;
+        self.propose(CatalogCommand::CreateTable(Box::new(metadata)))
+            .await?;
         Ok(())
     }
 
@@ -1021,6 +1089,63 @@ impl Catalog for RaftCatalogNode {
             table_name: table_name.to_string(),
             col_name: col_name.to_string(),
             new_type,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn restore_table(
+        &self,
+        table_name: &str,
+        branch: &str,
+        target_snapshot_id: u64,
+    ) -> Result<u64> {
+        let v = self
+            .propose(CatalogCommand::RestoreTable {
+                table_name: table_name.to_string(),
+                branch: branch.to_string(),
+                target_snapshot_id,
+            })
+            .await?;
+        Ok(v["snapshot_id"].as_u64().unwrap_or(1))
+    }
+
+    async fn set_table_tags(
+        &self,
+        table_name: &str,
+        tags: std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.propose(CatalogCommand::SetTableTags {
+            table_name: table_name.to_string(),
+            tags,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn set_column_default(
+        &self,
+        table_name: &str,
+        col_name: &str,
+        default_val: String,
+    ) -> Result<()> {
+        self.propose(CatalogCommand::SetColumnDefault {
+            table_name: table_name.to_string(),
+            col_name: col_name.to_string(),
+            default_val,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn set_column_stats(
+        &self,
+        table_name: &str,
+        stats: HashMap<String, ColumnStats>,
+    ) -> Result<()> {
+        self.propose(CatalogCommand::SetColumnStats {
+            table_name: table_name.to_string(),
+            stats,
         })
         .await?;
         Ok(())

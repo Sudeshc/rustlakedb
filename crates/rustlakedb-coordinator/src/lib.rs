@@ -432,6 +432,131 @@ impl Coordinator {
                 stats: QueryExecutionStats::default(),
             });
         }
+        if lower.contains("system.lineage") {
+            let entries = self.governance.lineage_snapshot();
+            let cols = vec![
+                "source_table".into(),
+                "target_table".into(),
+                "operation".into(),
+                "user_name".into(),
+                "timestamp_ms".into(),
+            ];
+            let rows: Vec<BTreeMap<String, ScalarValue>> = entries
+                .into_iter()
+                .map(|e| {
+                    BTreeMap::from([
+                        ("source_table".into(), ScalarValue::Utf8(e.source_table)),
+                        ("target_table".into(), ScalarValue::Utf8(e.target_table)),
+                        ("operation".into(), ScalarValue::Utf8(e.operation)),
+                        ("user_name".into(), ScalarValue::Utf8(e.user)),
+                        ("timestamp_ms".into(), ScalarValue::Int64(e.timestamp_ms as i64)),
+                    ])
+                })
+                .collect();
+            let n = rows.len();
+            return Ok(QueryExecutionResult {
+                command_tag: format!("SELECT {n}"),
+                dag: None,
+                batch: RowBatch::new(cols, rows),
+                stats: QueryExecutionStats::default(),
+            });
+        }
+        if lower.contains("system.tags") {
+            let tables = self.catalog.list_tables().await?;
+            let cols = vec!["table_name".into(), "tag_key".into(), "tag_value".into()];
+            let mut rows = Vec::new();
+            for t in tables {
+                if let Ok(meta) = self.catalog.get_table(&t).await {
+                    for (k, v) in meta.tags {
+                        rows.push(BTreeMap::from([
+                            ("table_name".into(), ScalarValue::Utf8(meta.table_name.clone())),
+                            ("tag_key".into(), ScalarValue::Utf8(k)),
+                            ("tag_value".into(), ScalarValue::Utf8(v)),
+                        ]));
+                    }
+                }
+            }
+            let n = rows.len();
+            return Ok(QueryExecutionResult {
+                command_tag: format!("SELECT {n}"),
+                dag: None,
+                batch: RowBatch::new(cols, rows),
+                stats: QueryExecutionStats::default(),
+            });
+        }
+        if lower.contains("system.snapshots") {
+            let tables = self.catalog.list_tables().await?;
+            let cols = vec![
+                "table_name".into(),
+                "snapshot_id".into(),
+                "parent_snapshot_id".into(),
+                "timestamp_ms".into(),
+                "file_count".into(),
+                "row_count".into(),
+            ];
+            let mut rows = Vec::new();
+            for t in tables {
+                if let Ok(meta) = self.catalog.get_table(&t).await {
+                    for snap in meta.snapshots.values() {
+                        let rc: u64 = snap.data_files.iter().map(|f| f.row_count).sum();
+                        rows.push(BTreeMap::from([
+                            ("table_name".into(), ScalarValue::Utf8(meta.table_name.clone())),
+                            ("snapshot_id".into(), ScalarValue::Int64(snap.snapshot_id as i64)),
+                            (
+                                "parent_snapshot_id".into(),
+                                snap.parent_snapshot_id
+                                    .map(|p| ScalarValue::Int64(p as i64))
+                                    .unwrap_or(ScalarValue::Null),
+                            ),
+                            ("timestamp_ms".into(), ScalarValue::Int64(snap.timestamp_ms as i64)),
+                            ("file_count".into(), ScalarValue::Int64(snap.data_files.len() as i64)),
+                            ("row_count".into(), ScalarValue::Int64(rc as i64)),
+                        ]));
+                    }
+                }
+            }
+            let n = rows.len();
+            return Ok(QueryExecutionResult {
+                command_tag: format!("SELECT {n}"),
+                dag: None,
+                batch: RowBatch::new(cols, rows),
+                stats: QueryExecutionStats::default(),
+            });
+        }
+        if lower.contains("system.tables") {
+            let tables = self.catalog.list_tables().await?;
+            let cols = vec![
+                "table_name".into(),
+                "format_version".into(),
+                "columns".into(),
+                "snapshots".into(),
+                "total_rows".into(),
+                "total_bytes".into(),
+                "tags".into(),
+            ];
+            let mut rows = Vec::new();
+            for t in tables {
+                if let Ok(meta) = self.catalog.get_table(&t).await {
+                    let tags_str = serde_json::to_string(&meta.tags).unwrap_or_default();
+                    rows.push(BTreeMap::from([
+                        ("table_name".into(), ScalarValue::Utf8(meta.table_name.clone())),
+                        ("format_version".into(), ScalarValue::Int64(meta.format_version as i64)),
+                        ("columns".into(), ScalarValue::Int64(meta.schema.len() as i64)),
+                        ("snapshots".into(), ScalarValue::Int64(meta.snapshots.len() as i64)),
+                        ("total_rows".into(), ScalarValue::Int64(meta.total_rows(branch) as i64)),
+                        ("total_bytes".into(), ScalarValue::Int64(meta.total_bytes(branch) as i64)),
+                        ("tags".into(), ScalarValue::Utf8(tags_str)),
+                    ]));
+                }
+            }
+            let n = rows.len();
+            return Ok(QueryExecutionResult {
+                command_tag: format!("SELECT {n}"),
+                dag: None,
+                batch: RowBatch::new(cols, rows),
+                stats: QueryExecutionStats::default(),
+            });
+        }
 
         let qid = Uuid::new_v4().to_string();
         let tid = trace_id
@@ -613,6 +738,8 @@ impl Coordinator {
                 schema,
                 if_not_exists,
                 partition_by,
+                column_defaults,
+                check_constraints,
             } => {
                 if if_not_exists && self.catalog.get_table(&table_name).await.is_ok() {
                     return Ok(QueryExecutionResult {
@@ -624,8 +751,12 @@ impl Coordinator {
                 }
                 let mut meta = IcebergTableMetadata::new(&table_name, schema);
                 meta.partition_by = partition_by;
+                meta.column_defaults = column_defaults;
+                meta.check_constraints = check_constraints;
                 self.catalog.create_table(meta.clone()).await?;
                 self.store.write_iceberg_metadata(&meta, "main").await?;
+                self.governance
+                    .record_audit(&session.user, "CREATE TABLE", &table_name, "OK");
                 Ok(QueryExecutionResult {
                     command_tag: "CREATE TABLE".into(),
                     dag: None,
@@ -640,6 +771,10 @@ impl Coordinator {
                 let rows_written = self
                     .materialize_view_table(&table_name, &query_sql, branch, session)
                     .await?;
+                if let Some(src) = extract_primary_from_table(&query_sql) {
+                    self.governance
+                        .record_lineage(&src, &table_name, "CREATE TABLE AS", &session.user);
+                }
                 Ok(QueryExecutionResult {
                     command_tag: format!("SELECT {rows_written}"),
                     dag: None,
@@ -677,7 +812,8 @@ impl Coordinator {
                             out
                         })
                         .collect();
-                    let batch = RowBatch::new(target_cols, mapped_rows);
+                    let mut batch = RowBatch::new(target_cols, mapped_rows);
+                    enforce_table_schema(&meta, &mut batch)?;
                     let added_files = self
                         .write_partitioned_data_files(&meta, "ins-sel", &batch)
                         .await?;
@@ -696,6 +832,10 @@ impl Coordinator {
                         let updated = self.catalog.get_table(&table_name).await?;
                         self.store.write_iceberg_metadata(&updated, branch).await?;
                     }
+                }
+                if let Some(src) = extract_primary_from_table(&query_sql) {
+                    self.governance
+                        .record_lineage(&src, &table_name, "INSERT SELECT", &session.user);
                 }
                 Ok(QueryExecutionResult {
                     command_tag: format!("INSERT 0 {count}"),
@@ -844,11 +984,17 @@ impl Coordinator {
                 table_name,
                 column_name,
                 data_type,
+                default_value,
             } => {
                 let fid = self
                     .catalog
-                    .add_column(&table_name, column_name, data_type)
+                    .add_column(&table_name, column_name.clone(), data_type)
                     .await?;
+                if let Some(dv) = default_value {
+                    self.catalog
+                        .set_column_default(&table_name, &column_name, dv)
+                        .await?;
+                }
                 let updated = self.catalog.get_table(&table_name).await?;
                 self.store.write_iceberg_metadata(&updated, branch).await?;
                 Ok(QueryExecutionResult {
@@ -957,9 +1103,13 @@ impl Coordinator {
                     stats: QueryExecutionStats::default(),
                 })
             }
-            PlannedCommand::Insert { table_name, batch } => {
+            PlannedCommand::Insert {
+                table_name,
+                mut batch,
+            } => {
                 self.governance.check_access(session, &table_name, "INSERT")?;
                 let meta = self.catalog.get_table(&table_name).await?;
+                enforce_table_schema(&meta, &mut batch)?;
                 let snap = meta.current_snapshot(branch)?;
                 let count = batch.num_rows();
                 let added_files = self
@@ -1314,6 +1464,134 @@ impl Coordinator {
                     stats: QueryExecutionStats::default(),
                 })
             }
+            PlannedCommand::RestoreTable {
+                table_name,
+                snapshot_id,
+                timestamp_ms,
+            } => {
+                self.governance.check_access(session, &table_name, "UPDATE")?;
+                let meta = self.catalog.get_table(&table_name).await?;
+                let target_snap = if let Some(sid) = snapshot_id {
+                    sid
+                } else if let Some(ts) = timestamp_ms {
+                    meta.snapshot_at_timestamp(ts)?.snapshot_id
+                } else {
+                    return Err(RustLakeError::Plan(
+                        "RESTORE TABLE requires VERSION or TIMESTAMP".into(),
+                    ));
+                };
+                let new_snap = self
+                    .catalog
+                    .restore_table(&table_name, branch, target_snap)
+                    .await?;
+                let updated = self.catalog.get_table(&table_name).await?;
+                self.store.write_iceberg_metadata(&updated, branch).await?;
+                self.governance
+                    .record_audit(&session.user, "RESTORE TABLE", &table_name, "OK");
+                Ok(QueryExecutionResult {
+                    command_tag: format!("RESTORE TABLE {table_name} TO {target_snap} (snapshot={new_snap})"),
+                    dag: None,
+                    batch: RowBatch::new(
+                        vec!["table_name".into(), "restored_from".into(), "new_snapshot_id".into()],
+                        vec![BTreeMap::from([
+                            ("table_name".into(), ScalarValue::Utf8(table_name)),
+                            ("restored_from".into(), ScalarValue::Int64(target_snap as i64)),
+                            ("new_snapshot_id".into(), ScalarValue::Int64(new_snap as i64)),
+                        ])],
+                    ),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::ShowSnapshots { table_name } => {
+                let meta = self.catalog.get_table(&table_name).await?;
+                let cols = vec![
+                    "snapshot_id".into(),
+                    "parent_snapshot_id".into(),
+                    "timestamp_ms".into(),
+                    "file_count".into(),
+                    "row_count".into(),
+                    "operation".into(),
+                ];
+                let rows: Vec<BTreeMap<String, ScalarValue>> = meta
+                    .snapshots
+                    .values()
+                    .map(|s| {
+                        let rc: u64 = s.data_files.iter().map(|f| f.row_count).sum();
+                        let op = s
+                            .summary
+                            .get("operation")
+                            .cloned()
+                            .unwrap_or_else(|| "append".into());
+                        BTreeMap::from([
+                            ("snapshot_id".into(), ScalarValue::Int64(s.snapshot_id as i64)),
+                            (
+                                "parent_snapshot_id".into(),
+                                s.parent_snapshot_id
+                                    .map(|p| ScalarValue::Int64(p as i64))
+                                    .unwrap_or(ScalarValue::Null),
+                            ),
+                            ("timestamp_ms".into(), ScalarValue::Int64(s.timestamp_ms as i64)),
+                            ("file_count".into(), ScalarValue::Int64(s.data_files.len() as i64)),
+                            ("row_count".into(), ScalarValue::Int64(rc as i64)),
+                            ("operation".into(), ScalarValue::Utf8(op)),
+                        ])
+                    })
+                    .collect();
+                let n = rows.len();
+                Ok(QueryExecutionResult {
+                    command_tag: format!("SELECT {n}"),
+                    dag: None,
+                    batch: RowBatch::new(cols, rows),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::AlterSetTags { table_name, tags } => {
+                self.catalog.set_table_tags(&table_name, tags.clone()).await?;
+                self.governance
+                    .record_audit(&session.user, "SET TAGS", &table_name, "OK");
+                Ok(QueryExecutionResult {
+                    command_tag: format!("ALTER TABLE SET TAGS ({})", tags.len()),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::ShowTags { table_name } => {
+                let tables = match table_name {
+                    Some(t) => vec![t],
+                    None => self.catalog.list_tables().await?,
+                };
+                let cols = vec!["table_name".into(), "tag_key".into(), "tag_value".into()];
+                let mut rows = Vec::new();
+                for t in tables {
+                    if let Ok(meta) = self.catalog.get_table(&t).await {
+                        for (k, v) in meta.tags {
+                            rows.push(BTreeMap::from([
+                                ("table_name".into(), ScalarValue::Utf8(meta.table_name.clone())),
+                                ("tag_key".into(), ScalarValue::Utf8(k)),
+                                ("tag_value".into(), ScalarValue::Utf8(v)),
+                            ]));
+                        }
+                    }
+                }
+                let n = rows.len();
+                Ok(QueryExecutionResult {
+                    command_tag: format!("SELECT {n}"),
+                    dag: None,
+                    batch: RowBatch::new(cols, rows),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::AnalyzeTable { table_name } => {
+                Box::pin(self.exec_analyze_table(table_name, branch, session)).await
+            }
+            PlannedCommand::CopyTo {
+                query_sql,
+                target_path,
+                format,
+            } => {
+                Box::pin(self.exec_copy_to(query_sql, target_path, format, branch, session)).await
+            }
             PlannedCommand::ServerVersion => {
                 let rows = vec![BTreeMap::from([(
                     "version".to_string(),
@@ -1360,17 +1638,38 @@ impl Coordinator {
                 on_error_continue,
             } => {
                 self.governance.check_access(session, &table_name, "INSERT")?;
-                let clean_path = source_path.strip_prefix("file://").unwrap_or(&source_path);
+                let (local_tmp_guard, clean_path): (Option<std::path::PathBuf>, String) =
+                    if source_path.starts_with("s3://")
+                        || source_path.starts_with("gs://")
+                        || source_path.starts_with("az://")
+                    {
+                        let (scheme_bucket, obj_key) = split_cloud_uri(&source_path)?;
+                        let cloud_store = IcebergObjectStore::from_uri(&scheme_bucket)?;
+                        let bytes = cloud_store.get_raw_bytes(&obj_key).await?;
+                        let tmp = std::env::temp_dir()
+                            .join(format!("rldb-copyfrom-{}.dat", Uuid::new_v4()));
+                        std::fs::write(&tmp, &bytes)?;
+                        let p = tmp.to_string_lossy().to_string();
+                        (Some(tmp), p)
+                    } else {
+                        (
+                            None,
+                            source_path
+                                .strip_prefix("file://")
+                                .unwrap_or(&source_path)
+                                .to_string(),
+                        )
+                    };
                 let (loaded, dlq) = match format {
                     CopyFormat::Json => {
-                        let raw = std::fs::read_to_string(clean_path).map_err(|e| {
+                        let raw = std::fs::read_to_string(&clean_path).map_err(|e| {
                             RustLakeError::Execution(format!("COPY read '{clean_path}': {e}"))
                         })?;
                         self.ingest_ndjson(&table_name, branch, &raw, on_error_continue)
                             .await?
                     }
                     CopyFormat::Csv => {
-                        let raw = std::fs::read_to_string(clean_path).map_err(|e| {
+                        let raw = std::fs::read_to_string(&clean_path).map_err(|e| {
                             RustLakeError::Execution(format!("COPY CSV read '{clean_path}': {e}"))
                         })?;
                         self.ingest_csv(&table_name, branch, &raw, on_error_continue)
@@ -1379,10 +1678,11 @@ impl Coordinator {
                     CopyFormat::Parquet => {
                         let meta = self.catalog.get_table(&table_name).await?;
                         let snap = meta.current_snapshot(branch)?;
-                        let batch =
+                        let mut batch =
                             rustlakedb_storage::read_external_parquet(std::path::Path::new(
-                                clean_path,
+                                &clean_path,
                             ))?;
+                        enforce_table_schema(&meta, &mut batch)?;
                         let count = batch.num_rows();
                         if count > 0 {
                             let file_path =
@@ -1407,6 +1707,11 @@ impl Coordinator {
                         (count, 0)
                     }
                 };
+                if let Some(tmp) = local_tmp_guard {
+                    let _ = std::fs::remove_file(tmp);
+                }
+                self.governance
+                    .record_lineage(&source_path, &table_name, "COPY FROM", &session.user);
                 self.governance
                     .record_audit(&session.user, "COPY", &table_name, "OK");
                 let tag = if dlq > 0 {
@@ -3578,4 +3883,416 @@ fn detect_skewed_partitions(metrics: &HashMap<usize, PartitionMetrics>) -> Vec<u
         })
         .map(|m| m.reduce_partition)
         .collect()
+}
+
+impl Coordinator {
+    async fn exec_analyze_table(
+        &self,
+        table_name: String,
+        branch: &str,
+        session: &SessionContext,
+    ) -> Result<QueryExecutionResult> {
+        let meta = self.catalog.get_table(&table_name).await?;
+        let snap = meta.current_snapshot(branch)?;
+        let mut distinct_sets: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        let mut null_counts: HashMap<String, u64> = HashMap::new();
+        let mut min_vals: HashMap<String, ScalarValue> = HashMap::new();
+        let mut max_vals: HashMap<String, ScalarValue> = HashMap::new();
+        let mut total_rows = 0u64;
+        for f in &meta.schema {
+            distinct_sets.insert(f.name.clone(), std::collections::HashSet::new());
+            null_counts.insert(f.name.clone(), 0);
+        }
+        for df in &snap.data_files {
+            let fb = self
+                .store
+                .read_data_file_with_aliases(
+                    &df.file_path,
+                    &meta.schema,
+                    &meta.column_aliases,
+                    None,
+                    None,
+                )
+                .await?;
+            for row in &fb.rows {
+                total_rows += 1;
+                for f in &meta.schema {
+                    match row.get(&f.name) {
+                        None | Some(ScalarValue::Null) => {
+                            *null_counts.entry(f.name.clone()).or_default() += 1;
+                        }
+                        Some(val) => {
+                            let s = val.to_display_string();
+                            if let Some(set) = distinct_sets.get_mut(&f.name)
+                                && set.len() < 100_000
+                            {
+                                set.insert(s);
+                            }
+                            min_vals
+                                .entry(f.name.clone())
+                                .and_modify(|cur| {
+                                    let is_less = match (val.as_f64(), cur.as_f64()) {
+                                        (Some(a), Some(b)) => a < b,
+                                        _ => val.to_display_string() < cur.to_display_string(),
+                                    };
+                                    if is_less {
+                                        *cur = val.clone();
+                                    }
+                                })
+                                .or_insert_with(|| val.clone());
+                            max_vals
+                                .entry(f.name.clone())
+                                .and_modify(|cur| {
+                                    let is_greater = match (val.as_f64(), cur.as_f64()) {
+                                        (Some(a), Some(b)) => a > b,
+                                        _ => val.to_display_string() > cur.to_display_string(),
+                                    };
+                                    if is_greater {
+                                        *cur = val.clone();
+                                    }
+                                })
+                                .or_insert_with(|| val.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut col_stats = HashMap::new();
+        let mut out_rows = Vec::new();
+        for f in &meta.schema {
+            let ndv = distinct_sets.get(&f.name).map(|s| s.len() as u64).unwrap_or(0);
+            let nc = *null_counts.get(&f.name).unwrap_or(&0);
+            let mn = min_vals.get(&f.name).map(|v| v.to_display_string());
+            let mx = max_vals.get(&f.name).map(|v| v.to_display_string());
+            col_stats.insert(
+                f.name.clone(),
+                rustlakedb_catalog::ColumnStats {
+                    ndv,
+                    null_count: nc,
+                    min_value: mn.clone(),
+                    max_value: mx.clone(),
+                    total_rows,
+                },
+            );
+            out_rows.push(BTreeMap::from([
+                ("column_name".into(), ScalarValue::Utf8(f.name.clone())),
+                ("ndv".into(), ScalarValue::Int64(ndv as i64)),
+                ("null_count".into(), ScalarValue::Int64(nc as i64)),
+                (
+                    "min_value".into(),
+                    mn.map(ScalarValue::Utf8).unwrap_or(ScalarValue::Null),
+                ),
+                (
+                    "max_value".into(),
+                    mx.map(ScalarValue::Utf8).unwrap_or(ScalarValue::Null),
+                ),
+                ("total_rows".into(), ScalarValue::Int64(total_rows as i64)),
+            ]));
+        }
+        self.catalog.set_column_stats(&table_name, col_stats).await?;
+        let updated = self.catalog.get_table(&table_name).await?;
+        self.store.write_iceberg_metadata(&updated, branch).await?;
+        self.governance
+            .record_audit(&session.user, "ANALYZE TABLE", &table_name, "OK");
+        Ok(QueryExecutionResult {
+            command_tag: format!("ANALYZE {table_name} ({total_rows} rows)"),
+            dag: None,
+            batch: RowBatch::new(
+                vec![
+                    "column_name".into(),
+                    "ndv".into(),
+                    "null_count".into(),
+                    "min_value".into(),
+                    "max_value".into(),
+                    "total_rows".into(),
+                ],
+                out_rows,
+            ),
+            stats: QueryExecutionStats::default(),
+        })
+    }
+
+    async fn exec_copy_to(
+        &self,
+        query_sql: String,
+        target_path: String,
+        format: CopyFormat,
+        branch: &str,
+        session: &SessionContext,
+    ) -> Result<QueryExecutionResult> {
+        let res = Box::pin(self.execute_sql_inner(&query_sql, branch, session)).await?;
+        let row_count = res.batch.num_rows();
+        let payload: Vec<u8> = match format {
+            CopyFormat::Csv => {
+                let mut out = String::new();
+                out.push_str(&res.batch.columns.join(","));
+                out.push('\n');
+                for r in &res.batch.rows {
+                    let vals: Vec<String> = res
+                        .batch
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            r.get(c)
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    out.push_str(&vals.join(","));
+                    out.push('\n');
+                }
+                out.into_bytes()
+            }
+            CopyFormat::Json => {
+                let mut out = String::new();
+                for r in &res.batch.rows {
+                    let mut obj = serde_json::Map::new();
+                    for c in &res.batch.columns {
+                        let jv = match r.get(c) {
+                            Some(ScalarValue::Int64(v)) => serde_json::json!(v),
+                            Some(ScalarValue::Float64(v)) => serde_json::json!(v),
+                            Some(ScalarValue::Bool(v)) => serde_json::json!(v),
+                            Some(ScalarValue::Utf8(v)) => serde_json::json!(v),
+                            Some(ScalarValue::Json(v)) => v.clone(),
+                            None | Some(ScalarValue::Null) => serde_json::Value::Null,
+                            Some(other) => serde_json::json!(other.to_display_string()),
+                        };
+                        obj.insert(c.clone(), jv);
+                    }
+                    out.push_str(&serde_json::Value::Object(obj).to_string());
+                    out.push('\n');
+                }
+                out.into_bytes()
+            }
+            CopyFormat::Parquet => {
+                let tmp_dir = std::env::temp_dir().join(format!("rldb-copyto-{}", Uuid::new_v4()));
+                let tmp_store = IcebergObjectStore::local_fs(&tmp_dir)?;
+                let inferred_schema: Vec<FieldSchema> = res
+                    .batch
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| {
+                        let dt = res
+                            .batch
+                            .rows
+                            .iter()
+                            .find_map(|r| match r.get(col) {
+                                Some(ScalarValue::Int64(_)) => Some(ColumnType::Int64),
+                                Some(ScalarValue::Float64(_)) => Some(ColumnType::Float64),
+                                Some(ScalarValue::Bool(_)) => Some(ColumnType::Bool),
+                                Some(ScalarValue::Date(_)) => Some(ColumnType::Date),
+                                Some(ScalarValue::Decimal(_, scale)) => Some(ColumnType::Decimal {
+                                    precision: 18,
+                                    scale: *scale,
+                                }),
+                                Some(ScalarValue::Json(_)) => Some(ColumnType::Variant),
+                                Some(ScalarValue::Utf8(_)) => Some(ColumnType::Utf8),
+                                _ => None,
+                            })
+                            .unwrap_or(ColumnType::Utf8);
+                        FieldSchema {
+                            field_id: (idx + 1) as i32,
+                            name: col.clone(),
+                            data_type: dt,
+                            nullable: true,
+                        }
+                    })
+                    .collect();
+                let _ = tmp_store
+                    .write_data_file("out.parquet", &inferred_schema, &res.batch)
+                    .await?;
+                let bytes = std::fs::read(tmp_dir.join("out.parquet")).map_err(|e| {
+                    RustLakeError::Execution(format!("COPY TO parquet read tmp: {e}"))
+                })?;
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                bytes
+            }
+        };
+        if target_path.starts_with("s3://")
+            || target_path.starts_with("gs://")
+            || target_path.starts_with("az://")
+        {
+            let (scheme_bucket, obj_key) = split_cloud_uri(&target_path)?;
+            let cloud_store = IcebergObjectStore::from_uri(&scheme_bucket)?;
+            cloud_store.put_raw_bytes(&obj_key, payload).await?;
+        } else {
+            let clean = target_path.strip_prefix("file://").unwrap_or(&target_path);
+            if let Some(parent) = std::path::Path::new(clean).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(clean, &payload)
+                .map_err(|e| RustLakeError::Execution(format!("COPY TO write '{clean}': {e}")))?;
+        }
+        if let Some(src) = extract_primary_from_table(&query_sql) {
+            self.governance
+                .record_lineage(&src, &target_path, "COPY TO", &session.user);
+        }
+        self.governance
+            .record_audit(&session.user, "COPY TO", &target_path, "OK");
+        Ok(QueryExecutionResult {
+            command_tag: format!("COPY {row_count}"),
+            dag: None,
+            batch: RowBatch::default(),
+            stats: QueryExecutionStats::default(),
+        })
+    }
+}
+
+/// Splits `s3://bucket/path/to/file.parquet` -> `("s3://bucket", "path/to/file.parquet")`.
+fn split_cloud_uri(uri: &str) -> Result<(String, String)> {
+    let scheme_end = uri
+        .find("://")
+        .ok_or_else(|| RustLakeError::Execution(format!("invalid cloud URI: '{uri}'")))?;
+    let rest = &uri[scheme_end + 3..];
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        RustLakeError::Execution(format!("cloud URI missing object key path: '{uri}'"))
+    })?;
+    Ok((format!("{}{bucket}", &uri[..scheme_end + 3]), key.to_string()))
+}
+
+/// Parses a SQL `DEFAULT` literal string according to the target Iceberg column type (Wave 24).
+fn parse_default_scalar(raw: &str, dt: &ColumnType) -> ScalarValue {
+    let clean = raw.trim().trim_matches('\'').trim_matches('"');
+    if clean.eq_ignore_ascii_case("NULL") {
+        return ScalarValue::Null;
+    }
+    match dt {
+        ColumnType::Int64 => clean
+            .parse::<i64>()
+            .map(ScalarValue::Int64)
+            .unwrap_or(ScalarValue::Null),
+        ColumnType::Float64 => clean
+            .parse::<f64>()
+            .map(ScalarValue::Float64)
+            .unwrap_or(ScalarValue::Null),
+        ColumnType::Bool => ScalarValue::Bool(
+            clean.eq_ignore_ascii_case("true") || clean == "1" || clean.eq_ignore_ascii_case("t"),
+        ),
+        ColumnType::Date => rustlakedb_protocol::parse_iso_date_days(clean)
+            .map(ScalarValue::Date)
+            .unwrap_or_else(|| ScalarValue::Utf8(clean.to_string())),
+        _ => ScalarValue::Utf8(clean.to_string()),
+    }
+}
+
+/// Evaluates a simple SQL `CHECK (...)` constraint expression against a single row (Wave 24).
+fn eval_check_constraint(row: &BTreeMap<String, ScalarValue>, expr_str: &str) -> bool {
+    let trimmed = expr_str.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    // Handle top-level AND
+    let upper = trimmed.to_uppercase();
+    if let Some(pos) = upper.find(" AND ") {
+        return eval_check_constraint(row, &trimmed[..pos])
+            && eval_check_constraint(row, &trimmed[pos + 5..]);
+    }
+    if let Some(pos) = upper.find(" OR ") {
+        return eval_check_constraint(row, &trimmed[..pos])
+            || eval_check_constraint(row, &trimmed[pos + 4..]);
+    }
+    if let Some(pos) = upper.find(" IN ") {
+        let col = trimmed[..pos].trim().trim_matches('"');
+        let rhs = trimmed[pos + 4..].trim().trim_start_matches('(').trim_end_matches(')');
+        let Some(val) = row.get(col) else {
+            return true;
+        };
+        if matches!(val, ScalarValue::Null) {
+            return true;
+        }
+        let val_s = val.to_display_string();
+        return rhs
+            .split(',')
+            .any(|item| item.trim().trim_matches('\'').trim_matches('"') == val_s);
+    }
+    for (op, kind) in [
+        (">=", "ge"),
+        ("<=", "le"),
+        ("!=", "ne"),
+        ("<>", "ne"),
+        (">", "gt"),
+        ("<", "lt"),
+        ("=", "eq"),
+    ] {
+        if let Some((lhs, rhs)) = trimmed.split_once(op) {
+            let col = lhs.trim().trim_matches('"');
+            let rhs_clean = rhs.trim().trim_matches('\'').trim_matches('"');
+            let Some(val) = row.get(col) else {
+                return true;
+            };
+            if matches!(val, ScalarValue::Null) {
+                return true;
+            }
+            if let Some(lv) = val.as_f64()
+                && let Ok(rv) = rhs_clean.parse::<f64>()
+            {
+                return match kind {
+                    "ge" => lv >= rv,
+                    "le" => lv <= rv,
+                    "ne" => (lv - rv).abs() > f64::EPSILON,
+                    "gt" => lv > rv,
+                    "lt" => lv < rv,
+                    "eq" => (lv - rv).abs() <= f64::EPSILON,
+                    _ => true,
+                };
+            }
+            let ls = val.to_display_string();
+            return match kind {
+                "ge" => ls.as_str() >= rhs_clean,
+                "le" => ls.as_str() <= rhs_clean,
+                "ne" => ls != rhs_clean,
+                "gt" => ls.as_str() > rhs_clean,
+                "lt" => ls.as_str() < rhs_clean,
+                "eq" => ls == rhs_clean,
+                _ => true,
+            };
+        }
+    }
+    true
+}
+
+/// Strict write-time Schema Enforcement: applies column `DEFAULT` values, rejects unknown columns,
+/// enforces `NOT NULL` (`23502`), and validates all `CHECK (...)` constraints (`23514`) (Wave 24).
+fn enforce_table_schema(meta: &IcebergTableMetadata, batch: &mut RowBatch) -> Result<()> {
+    let valid_cols: std::collections::HashSet<&str> =
+        meta.schema.iter().map(|f| f.name.as_str()).collect();
+    for row in &mut batch.rows {
+        for k in row.keys() {
+            if !k.starts_with("__shred_") && !valid_cols.contains(k.as_str()) {
+                return Err(RustLakeError::Execution(format!(
+                    "schema enforcement error: unknown column '{k}' for table '{}'",
+                    meta.table_name
+                )));
+            }
+        }
+        for field in &meta.schema {
+            let missing_or_null = matches!(row.get(&field.name), None | Some(ScalarValue::Null));
+            if missing_or_null
+                && let Some(def_raw) = meta.column_defaults.get(&field.name)
+            {
+                let def_val = parse_default_scalar(def_raw, &field.data_type);
+                row.insert(field.name.clone(), def_val);
+            }
+            if !field.nullable && matches!(row.get(&field.name), None | Some(ScalarValue::Null)) {
+                return Err(RustLakeError::Execution(format!(
+                    "23502: null value in column '{}' violates NOT NULL constraint on '{}'",
+                    field.name, meta.table_name
+                )));
+            }
+        }
+        for check in &meta.check_constraints {
+            if !eval_check_constraint(row, check) {
+                return Err(RustLakeError::Execution(format!(
+                    "23514: new row violates CHECK constraint '{check}' on '{}'",
+                    meta.table_name
+                )));
+            }
+        }
+    }
+    for field in &meta.schema {
+        if !batch.columns.contains(&field.name) {
+            batch.columns.push(field.name.clone());
+        }
+    }
+    Ok(())
 }

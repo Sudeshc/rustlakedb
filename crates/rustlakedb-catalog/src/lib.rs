@@ -202,6 +202,16 @@ pub fn partition_spec_source_col(spec_expr: &str) -> String {
     eval_partition_transform(spec_expr, "").0
 }
 
+/// Column-level data distribution statistics stored by `ANALYZE TABLE` (Wave 24/26).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ColumnStats {
+    pub ndv: u64,
+    pub null_count: u64,
+    pub min_value: Option<String>,
+    pub max_value: Option<String>,
+    pub total_rows: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IcebergTableMetadata {
     pub table_name: String,
@@ -222,6 +232,18 @@ pub struct IcebergTableMetadata {
     /// Zero-rewrite Iceberg field-ID rename history: `current_col_name -> [historical_parquet_names]` (Wave 22).
     #[serde(default)]
     pub column_aliases: HashMap<String, Vec<String>>,
+    /// Per-column SQL `DEFAULT` literal values enforced on write (Wave 24).
+    #[serde(default)]
+    pub column_defaults: HashMap<String, String>,
+    /// Table-level and column-level SQL `CHECK (...)` expressions enforced on write (Wave 24).
+    #[serde(default)]
+    pub check_constraints: Vec<String>,
+    /// Centralized catalog governance tags (`pii=true`, `domain=finance`, `owner=data-eng`, Wave 24).
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    /// Column-level statistics persisted by `ANALYZE TABLE` for real CBO selectivity (Wave 26).
+    #[serde(default)]
+    pub column_stats: HashMap<String, ColumnStats>,
 }
 
 impl IcebergTableMetadata {
@@ -249,6 +271,10 @@ impl IcebergTableMetadata {
             cluster_by: Vec::new(),
             partition_by: Vec::new(),
             column_aliases: HashMap::new(),
+            column_defaults: HashMap::new(),
+            check_constraints: Vec::new(),
+            tags: BTreeMap::new(),
+            column_stats: HashMap::new(),
         }
     }
 
@@ -268,6 +294,20 @@ impl IcebergTableMetadata {
             .ok_or_else(|| RustLakeError::Catalog(format!("snapshot version {version} not found")))
     }
 
+    /// Resolves the latest Iceberg snapshot committed at or before `ts_ms` (epoch milliseconds, Wave 24).
+    pub fn snapshot_at_timestamp(&self, ts_ms: u64) -> Result<&IcebergSnapshot> {
+        self.snapshots
+            .values()
+            .filter(|s| s.timestamp_ms <= ts_ms)
+            .max_by_key(|s| (s.timestamp_ms, s.snapshot_id))
+            .ok_or_else(|| {
+                RustLakeError::Catalog(format!(
+                    "no snapshot found at or before timestamp {ts_ms} ms on '{}'",
+                    self.table_name
+                ))
+            })
+    }
+
     pub fn splits(&self, branch: &str) -> Result<Vec<IcebergSplit>> {
         let snap = self.current_snapshot(branch)?;
         Ok(Self::splits_from_snapshot(&self.table_name, snap))
@@ -275,6 +315,11 @@ impl IcebergTableMetadata {
 
     pub fn splits_at_version(&self, version: u64) -> Result<Vec<IcebergSplit>> {
         let snap = self.snapshot_at_version(version)?;
+        Ok(Self::splits_from_snapshot(&self.table_name, snap))
+    }
+
+    pub fn splits_at_timestamp(&self, ts_ms: u64) -> Result<Vec<IcebergSplit>> {
+        let snap = self.snapshot_at_timestamp(ts_ms)?;
         Ok(Self::splits_from_snapshot(&self.table_name, snap))
     }
 
@@ -352,6 +397,14 @@ pub trait Catalog: Send + Sync {
     async fn drop_column(&self, table_name: &str, col_name: &str, if_exists: bool) -> Result<()>;
     /// Zero-rewrite Iceberg column type widening (`ALTER TABLE t ALTER COLUMN c TYPE ...`, Wave 22).
     async fn widen_column(&self, table_name: &str, col_name: &str, new_type: ColumnType) -> Result<()>;
+    /// Atomic Iceberg Time Travel rollback (`RESTORE TABLE t TO VERSION <snap_id>`, Wave 24).
+    async fn restore_table(&self, table_name: &str, branch: &str, target_snapshot_id: u64) -> Result<u64>;
+    /// Sets governance tags on a table (`ALTER TABLE t SET TAG ('k'='v', ...)`, Wave 24).
+    async fn set_table_tags(&self, table_name: &str, tags: BTreeMap<String, String>) -> Result<()>;
+    /// Sets a column `DEFAULT` value on a table (Wave 24).
+    async fn set_column_default(&self, table_name: &str, col_name: &str, default_val: String) -> Result<()>;
+    /// Persists `ANALYZE TABLE` column-level statistics into catalog metadata (Wave 26).
+    async fn set_column_stats(&self, table_name: &str, stats: HashMap<String, ColumnStats>) -> Result<()>;
 }
 
 /// Embedded Iceberg v3 catalog modeling the `openraft` state machine (RFC-002).
@@ -836,6 +889,100 @@ impl Catalog for InMemoryRaftCatalog {
                 RustLakeError::Catalog(format!("column '{col_name}' not found in '{table_name}'"))
             })?;
         field.data_type = new_type;
+        self.persist_locked(&guard)?;
+        Ok(())
+    }
+
+    async fn restore_table(
+        &self,
+        table_name: &str,
+        branch: &str,
+        target_snapshot_id: u64,
+    ) -> Result<u64> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        let target_files = table
+            .snapshots
+            .get(&target_snapshot_id)
+            .ok_or_else(|| {
+                RustLakeError::Catalog(format!(
+                    "snapshot version {target_snapshot_id} not found on '{table_name}'"
+                ))
+            })?
+            .data_files
+            .clone();
+        let parent_id = table.refs.get(branch).copied();
+        let new_id = table.next_snapshot_id;
+        table.next_snapshot_id += 1;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut summary = HashMap::new();
+        summary.insert("operation".into(), "restore".into());
+        summary.insert("restored_from_snapshot_id".into(), target_snapshot_id.to_string());
+        table.snapshots.insert(
+            new_id,
+            IcebergSnapshot {
+                snapshot_id: new_id,
+                parent_snapshot_id: parent_id,
+                timestamp_ms: now_ms,
+                data_files: target_files,
+                summary,
+            },
+        );
+        table.refs.insert(branch.to_string(), new_id);
+        self.persist_locked(&guard)?;
+        Ok(new_id)
+    }
+
+    async fn set_table_tags(
+        &self,
+        table_name: &str,
+        tags: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        for (k, v) in tags {
+            table.tags.insert(k, v);
+        }
+        self.persist_locked(&guard)?;
+        Ok(())
+    }
+
+    async fn set_column_default(
+        &self,
+        table_name: &str,
+        col_name: &str,
+        default_val: String,
+    ) -> Result<()> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        table.column_defaults.insert(col_name.to_string(), default_val);
+        self.persist_locked(&guard)?;
+        Ok(())
+    }
+
+    async fn set_column_stats(
+        &self,
+        table_name: &str,
+        stats: HashMap<String, ColumnStats>,
+    ) -> Result<()> {
+        let key = normalize_table_name(table_name);
+        let mut guard = self.tables.write();
+        let table = guard
+            .get_mut(&key)
+            .ok_or_else(|| RustLakeError::Catalog(format!("table '{table_name}' not found")))?;
+        table.column_stats = stats;
         self.persist_locked(&guard)?;
         Ok(())
     }

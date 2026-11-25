@@ -328,7 +328,12 @@ fn parse_iceberg_rest_type(v: &Value) -> ColumnType {
 
 fn build_load_table_response(namespace: &str, meta: &IcebergTableMetadata) -> Value {
     let current_snap = meta.refs.get("main").copied().unwrap_or(1);
-    let warehouse = std::env::var("RUSTLAKEDB_WAREHOUSE").unwrap_or_else(|_| "/warehouse".into());
+    let warehouse_raw = std::env::var("RUSTLAKEDB_WAREHOUSE").unwrap_or_else(|_| "/warehouse".into());
+    let warehouse = if warehouse_raw.contains("://") {
+        warehouse_raw
+    } else {
+        format!("file://{}", warehouse_raw)
+    };
     let location = format!("{}/{}", warehouse.trim_end_matches('/'), meta.table_name);
     let last_col_id = meta.schema.iter().map(|f| f.field_id).max().unwrap_or(0);
     let last_updated_ms = meta
@@ -405,7 +410,7 @@ fn build_load_table_response(namespace: &str, meta: &IcebergTableMetadata) -> Va
     uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
     let table_uuid = uuid::Uuid::from_bytes(uuid_bytes).to_string();
     json!({
-        "metadata-location": format!("{}/metadata/v{}.metadata.json", meta.table_name, current_snap),
+        "metadata-location": format!("{location}/metadata/v{current_snap}.metadata.json"),
         "metadata": {
             "format-version": meta.format_version,
             "table-uuid": table_uuid,
@@ -444,7 +449,7 @@ fn build_load_table_response(namespace: &str, meta: &IcebergTableMetadata) -> Va
                 "parent-snapshot-id": s.parent_snapshot_id,
                 "sequence-number": s.snapshot_id,
                 "timestamp-ms": s.timestamp_ms,
-                "manifest-list": format!("{}/metadata/snap-{}.avro", meta.table_name, s.snapshot_id),
+                "manifest-list": format!("{location}/metadata/snap-{}.avro", s.snapshot_id),
                 "summary": {
                     "operation": "append",
                     "total-data-files": s.data_files.len().to_string(),

@@ -206,6 +206,19 @@ impl ScalarValue {
             ScalarValue::Json(v) => Some(v.to_string()),
         }
     }
+
+    pub fn to_display_string(&self) -> String {
+        match self {
+            ScalarValue::Null => String::new(),
+            ScalarValue::Bool(b) => b.to_string(),
+            ScalarValue::Int64(i) => i.to_string(),
+            ScalarValue::Float64(f) => f.to_string(),
+            ScalarValue::Date(d) => format_iso_date_days(*d),
+            ScalarValue::Decimal(v, s) => format_decimal_i128(*v, *s),
+            ScalarValue::Utf8(s) => s.clone(),
+            ScalarValue::Json(v) => v.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

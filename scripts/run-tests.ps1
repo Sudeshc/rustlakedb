@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Unified Release QA test runner for RustLakeDB v6.0.0.
+  Unified Release QA test runner for RustLakeDB v7.0.0.
 .EXAMPLE
   .\scripts\run-tests.ps1
   .\scripts\run-tests.ps1 -Suite live
@@ -8,7 +8,7 @@
   .\scripts\run-tests.ps1 -StartMinio
 #>
 param(
-    [ValidateSet("all", "unit", "sql", "chaos", "acid", "pgwire", "dbeaver", "network", "persistence", "production", "wave1", "wave2", "wave3", "wave4", "wave5", "wave6", "wave7", "wave8", "wave9", "wave10", "wave11", "wave12", "wave13", "wave14", "wave15", "wave16", "wave17", "wave18", "wave19", "wave20", "wave21", "wave22", "wave23", "tpch", "live", "bench")]
+    [ValidateSet("all", "unit", "sql", "chaos", "acid", "pgwire", "dbeaver", "network", "persistence", "production", "wave1", "wave2", "wave3", "wave4", "wave5", "wave6", "wave7", "wave8", "wave9", "wave10", "wave11", "wave12", "wave13", "wave14", "wave15", "wave16", "wave17", "wave18", "wave19", "wave20", "wave21", "wave22", "wave23", "wave24", "wave25", "wave26", "wave28", "tpch", "live", "bench")]
     [string]$Suite = "all",
     [switch]$Offline,
     [switch]$StartMinio
@@ -66,6 +66,10 @@ switch ($Suite) {
     "wave21"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave21_oidc_jwks_cancel_and_helm -- --nocapture }
     "wave22"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave22_field_id_evolution_cancel_oidc_arrow -- --nocapture }
     "wave23"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave23_jepsen_raft_occ_storm_and_chaos -- --nocapture }
+    "wave24"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave24_schema_enforcement_time_travel_governance -- --nocapture }
+    "wave25"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave25_vectorized_boost_aliasing_and_dpp -- --nocapture }
+    "wave26"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave26_copy_analyze_and_memory_spill -- --nocapture }
+    "wave28"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave28_rolling_upgrade_chaos_and_prod_stack -- --nocapture }
     "tpch"        { & cargo @CommonArgs -p rustlakedb-testkit --test wave19_tpch_22_and_cbo -- --nocapture }
     "live"        { & cargo @CommonArgs -p rustlakedb-testkit --test live_multiprocess }
     "bench"       { & cargo @CommonArgs -p rustlakedb-testkit --test benchmarks -- --nocapture }

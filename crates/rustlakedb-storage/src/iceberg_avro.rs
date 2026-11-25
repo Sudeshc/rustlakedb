@@ -26,6 +26,7 @@ const ICEBERG_V3_MANIFEST_ENTRY_SCHEMA: &str = r#"{
         {"name": "content", "type": "int", "field-id": 134},
         {"name": "file_path", "type": "string", "field-id": 100},
         {"name": "file_format", "type": "string", "field-id": 101},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": []}, "field-id": 102},
         {"name": "record_count", "type": "long", "field-id": 103},
         {"name": "file_size_in_bytes", "type": "long", "field-id": 104}
       ]
@@ -58,6 +59,16 @@ pub fn encode_iceberg_v3_manifest(
     meta: &IcebergTableMetadata,
     snap: &IcebergSnapshot,
 ) -> Vec<u8> {
+    encode_iceberg_v3_manifest_with_base(meta, snap, None)
+}
+
+/// Encodes an Iceberg v3 Avro Manifest file with an optional storage URI prefix (e.g. `s3://bucket`
+/// or `file:///warehouse`) so PyIceberg/Spark/DuckDB `table.scan().to_arrow()` can read data files directly (Wave 27).
+pub fn encode_iceberg_v3_manifest_with_base(
+    meta: &IcebergTableMetadata,
+    snap: &IcebergSnapshot,
+    base_uri: Option<&str>,
+) -> Vec<u8> {
     let mut header_meta = BTreeMap::new();
     header_meta.insert(
         "avro.schema".to_string(),
@@ -66,6 +77,38 @@ pub fn encode_iceberg_v3_manifest(
     header_meta.insert("avro.codec".to_string(), b"null".to_vec());
     header_meta.insert("format-version".to_string(), b"3".to_vec());
     header_meta.insert("content".to_string(), b"data".to_vec());
+    header_meta.insert("partition-spec".to_string(), b"[]".to_vec());
+    header_meta.insert("partition-spec-id".to_string(), b"0".to_vec());
+    let schema_fields: Vec<serde_json::Value> = meta
+        .schema
+        .iter()
+        .map(|f| {
+            let t = match f.data_type {
+                rustlakedb_catalog::ColumnType::Int64 => "long".to_string(),
+                rustlakedb_catalog::ColumnType::Float64 => "double".to_string(),
+                rustlakedb_catalog::ColumnType::Bool => "boolean".to_string(),
+                rustlakedb_catalog::ColumnType::Date => "date".to_string(),
+                rustlakedb_catalog::ColumnType::TimestampTz => "timestamptz".to_string(),
+                rustlakedb_catalog::ColumnType::Decimal { precision, scale } => {
+                    format!("decimal({precision},{scale})")
+                }
+                _ => "string".to_string(),
+            };
+            serde_json::json!({
+                "id": f.field_id,
+                "name": f.name,
+                "required": !f.nullable,
+                "type": t
+            })
+        })
+        .collect();
+    let schema_json = serde_json::json!({
+        "type": "struct",
+        "schema-id": 0,
+        "fields": schema_fields
+    })
+    .to_string();
+    header_meta.insert("schema".to_string(), schema_json.into_bytes());
     header_meta.insert("table-name".to_string(), meta.table_name.as_bytes().to_vec());
     header_meta.insert(
         "snapshot-id".to_string(),
@@ -74,7 +117,7 @@ pub fn encode_iceberg_v3_manifest(
 
     let mut records_buf = Vec::new();
     for df in &snap.data_files {
-        encode_manifest_entry_record(&mut records_buf, snap.snapshot_id as i64, df);
+        encode_manifest_entry_record(&mut records_buf, snap.snapshot_id as i64, df, base_uri);
     }
 
     build_avro_ocf(&header_meta, snap.data_files.len() as i64, &records_buf)
@@ -126,7 +169,12 @@ pub fn encode_iceberg_v3_manifest_list(
     build_avro_ocf(&header_meta, 1, &record)
 }
 
-fn encode_manifest_entry_record(buf: &mut Vec<u8>, snap_id: i64, df: &DataFileEntry) {
+fn encode_manifest_entry_record(
+    buf: &mut Vec<u8>,
+    snap_id: i64,
+    df: &DataFileEntry,
+    base_uri: Option<&str>,
+) {
     write_avro_int(buf, 1); // status: 1 = ADDED
     // union ["null", "long"] -> index 1 + long
     write_avro_long(buf, 1);
@@ -139,8 +187,15 @@ fn encode_manifest_entry_record(buf: &mut Vec<u8>, snap_id: i64, df: &DataFileEn
     write_avro_long(buf, snap_id);
     // data_file struct
     write_avro_int(buf, 0); // content = 0 (DATA)
-    write_avro_string(buf, &df.file_path);
+    let full_path = match base_uri {
+        Some(base) if !df.file_path.contains("://") => {
+            format!("{}/{}", base.trim_end_matches('/'), df.file_path.trim_start_matches('/'))
+        }
+        _ => df.file_path.clone(),
+    };
+    write_avro_string(buf, &full_path);
     write_avro_string(buf, "PARQUET");
+    // `partition` (record `r102` with 0 fields) encodes as 0 bytes in Avro!
     write_avro_long(buf, df.row_count as i64);
     write_avro_long(buf, df.byte_size as i64);
 }

@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-catalog"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-cli"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-common"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-coordinator"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "arrow-ipc",
  "async-trait",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-gateway"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "arrow-array",
  "arrow-flight",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-planner"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "rustlakedb-catalog",
  "rustlakedb-common",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-protocol"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "rustlakedb-common",
  "serde",
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-shuffle"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2100,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-storage"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-testkit"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "arrow-array",
  "arrow-flight",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "rustlakedb-worker"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",

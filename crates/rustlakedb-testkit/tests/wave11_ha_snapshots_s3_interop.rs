@@ -227,8 +227,24 @@ async fn wave11_iceberg_v3_external_avro_manifest_and_parquet_interop() {
     assert_eq!(ml_entries[0].added_files_count, 1);
     assert_eq!(ml_entries[0].added_rows_count, 3);
 
+    // Helper to resolve both Iceberg absolute `file://` URIs (Wave 27) and relative paths on Windows/Linux
+    let resolve_path = |p: &str| -> std::path::PathBuf {
+        if let Some(rest) = p.strip_prefix("file:///") {
+            // On Windows `file:///C:/...` -> `C:/...`; on Unix `file:///tmp/...` -> `/tmp/...`
+            if rest.as_bytes().get(1) == Some(&b':') {
+                std::path::PathBuf::from(rest)
+            } else {
+                std::path::PathBuf::from(format!("/{rest}"))
+            }
+        } else if let Some(rest) = p.strip_prefix("file://") {
+            std::path::PathBuf::from(rest)
+        } else {
+            wh_root.join(p)
+        }
+    };
+
     // 3. Follow `manifest_path` and independently decode the Avro OCF Manifest (`*-m0.avro`)
-    let m_bytes = std::fs::read(wh_root.join(&ml_entries[0].manifest_path)).unwrap();
+    let m_bytes = std::fs::read(resolve_path(&ml_entries[0].manifest_path)).unwrap();
     let m_entries = decode_iceberg_v3_manifest_entries(&m_bytes).unwrap();
     assert_eq!(m_entries.len(), 1);
     assert_eq!(m_entries[0].file_format, "PARQUET");
@@ -236,7 +252,7 @@ async fn wave11_iceberg_v3_external_avro_manifest_and_parquet_interop() {
     assert!(m_entries[0].file_size_in_bytes > 0);
 
     // 4. Read the referenced Zstd Parquet data file directly with Apache Arrow/Parquet reader!
-    let pq_bytes = Bytes::from(std::fs::read(wh_root.join(&m_entries[0].file_path)).unwrap());
+    let pq_bytes = Bytes::from(std::fs::read(resolve_path(&m_entries[0].file_path)).unwrap());
     let reader = ParquetRecordBatchReaderBuilder::try_new(pq_bytes)
         .unwrap()
         .build()

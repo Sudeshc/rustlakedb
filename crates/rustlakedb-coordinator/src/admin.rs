@@ -62,6 +62,10 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
         .route("/v1/ingest/{table}", post(ingest_ndjson_http))
         .route("/v1/cdc/{table}", post(ingest_cdc_http))
         .route("/v1/traces", get(get_traces_http))
+        .route("/v1/governance/lineage", get(get_lineage_http))
+        .route("/v1/governance/tags", get(get_tags_http))
+        .route("/v1/governance/audit", get(get_audit_http))
+        .route("/v1/tables/{table}/snapshots", get(get_table_snapshots_http))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(coord)
         .merge(iceberg_rest)
@@ -425,6 +429,65 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
         body,
     )
         .into_response()
+}
+
+async fn get_lineage_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    let edges = coord.governance.lineage_snapshot();
+    Json(json!({ "count": edges.len(), "lineage": edges }))
+}
+
+async fn get_tags_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    let tables = coord.catalog.list_tables().await.unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    for t in tables {
+        if let Ok(meta) = coord.catalog.get_table(&t).await
+            && !meta.tags.is_empty()
+        {
+            out.insert(meta.table_name, json!(meta.tags));
+        }
+    }
+    Json(json!({ "tags": out }))
+}
+
+async fn get_audit_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    let entries = coord.governance.audit_log_snapshot();
+    Json(json!({ "count": entries.len(), "audit_log": entries }))
+}
+
+async fn get_table_snapshots_http(
+    State(coord): State<Arc<Coordinator>>,
+    Path(table): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    match coord.catalog.get_table(&table).await {
+        Ok(meta) => {
+            let snaps: Vec<Value> = meta
+                .snapshots
+                .values()
+                .map(|s| {
+                    json!({
+                        "snapshot_id": s.snapshot_id,
+                        "parent_snapshot_id": s.parent_snapshot_id,
+                        "timestamp_ms": s.timestamp_ms,
+                        "file_count": s.data_files.len(),
+                        "row_count": s.data_files.iter().map(|f| f.row_count).sum::<u64>(),
+                        "summary": s.summary,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "table": meta.table_name,
+                    "refs": meta.refs,
+                    "snapshots": snaps,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
 }
 
 async fn web_ui() -> Html<&'static str> {

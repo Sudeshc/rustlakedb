@@ -82,6 +82,16 @@ pub struct AuditLogEntry {
     pub outcome: String,
 }
 
+/// Centralized data lineage graph edge captured automatically on CTAS / INSERT SELECT / VIEW / COPY (Wave 24).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageEdge {
+    pub source_table: String,
+    pub target_table: String,
+    pub operation: String,
+    pub user: String,
+    pub timestamp_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveQueryInfo {
     pub query_id: String,
@@ -124,6 +134,8 @@ pub struct GovernanceState {
     query_history: RwLock<VecDeque<QueryHistoryEntry>>,
     /// Ring buffer for `system.audit_log`
     audit_log: RwLock<VecDeque<AuditLogEntry>>,
+    /// Automatic table-level data lineage graph for `system.lineage` (Wave 24)
+    lineage: RwLock<VecDeque<LineageEdge>>,
     /// Active queries for WLM & `SHOW QUERIES`
     active_queries: RwLock<HashMap<String, ActiveQueryInfo>>,
     /// Query IDs explicitly cancelled via `CANCEL QUERY` or `POST /v1/queries/{id}/cancel` (Wave 21)
@@ -163,6 +175,7 @@ impl Default for GovernanceState {
             masking_policies: RwLock::new(HashMap::new()),
             query_history: RwLock::new(VecDeque::with_capacity(512)),
             audit_log: RwLock::new(VecDeque::with_capacity(512)),
+            lineage: RwLock::new(VecDeque::with_capacity(512)),
             active_queries: RwLock::new(HashMap::new()),
             cancelled_queries: RwLock::new(HashSet::new()),
             hot_json_paths: RwLock::new(HashMap::new()),
@@ -337,6 +350,30 @@ impl GovernanceState {
 
     pub fn query_history_snapshot(&self) -> Vec<QueryHistoryEntry> {
         self.query_history.read().iter().cloned().collect()
+    }
+
+    pub fn record_lineage(
+        &self,
+        source_table: &str,
+        target_table: &str,
+        operation: &str,
+        user: &str,
+    ) {
+        let mut guard = self.lineage.write();
+        if guard.len() >= 1000 {
+            guard.pop_front();
+        }
+        guard.push_back(LineageEdge {
+            source_table: source_table.to_string(),
+            target_table: target_table.to_string(),
+            operation: operation.to_string(),
+            user: user.to_string(),
+            timestamp_ms: epoch_ms(),
+        });
+    }
+
+    pub fn lineage_snapshot(&self) -> Vec<LineageEdge> {
+        self.lineage.read().iter().cloned().collect()
     }
 
     /// Loads RFC 7517 OIDC JWKS RSA public keys (`{"keys":[{"kty":"RSA","kid":"...","n":"...","e":"..."}]}`) (Wave 21).

@@ -39,6 +39,8 @@ pub struct WorkerNode {
     fail_once: AtomicBool,
     pub tasks_executed: AtomicU64,
     pub vectorized_rows_processed: AtomicU64,
+    /// Parquet splits skipped before reading via Dynamic Partition Pruning / Semi-Join Min-Max pushdown (Wave 25).
+    pub files_pruned_by_dpp: AtomicU64,
     /// Cooperatively cancelled query IDs checked between split/batch reads (Wave 22).
     pub cancelled_queries: std::sync::RwLock<HashSet<String>>,
 }
@@ -74,6 +76,7 @@ impl WorkerNode {
             fail_once: AtomicBool::new(false),
             tasks_executed: AtomicU64::new(0),
             vectorized_rows_processed: AtomicU64::new(0),
+            files_pruned_by_dpp: AtomicU64::new(0),
             cancelled_queries: std::sync::RwLock::new(HashSet::new()),
         }
     }
@@ -456,11 +459,18 @@ impl WorkerNode {
                 } => {
                     if *is_partial {
                         if let PhysicalNode::IcebergScan {
-                            pushed_filter: None,
+                            table_name,
+                            pushed_filter,
                             ..
                         } = input.as_ref()
                             && let Some(vec_batch) = self
-                                .try_eval_vectorized_scan_partial_agg(group_by, aggs, task)
+                                .try_eval_vectorized_scan_partial_agg(
+                                    table_name,
+                                    pushed_filter.as_ref(),
+                                    group_by,
+                                    aggs,
+                                    task,
+                                )
                                 .await?
                         {
                             return Ok(vec_batch);
@@ -2304,9 +2314,13 @@ impl WorkerNode {
     /// Wave 1 Vectorized Arrow Partial-Aggregate & Shredded-JSON Zero-Parse Fast Path:
     /// Scans Parquet splits directly as columnar Arrow `RecordBatch`es with `ProjectionMask`,
     /// resolves `JsonPath` expressions directly to shredded `__shred_<col>_<path>` columns
-    /// (zero JSON parsing!), and aggregates in-place without allocating per-row `BTreeMap`s.
+    /// AND Iceberg `field_id` column aliases zero-copy, evaluates pushed `FilterExpr` via
+    /// vectorized `BooleanArray` masks + Zone-Map/Partition split pruning, and aggregates
+    /// in-place without allocating per-row `BTreeMap`s (Waves 12–25).
     async fn try_eval_vectorized_scan_partial_agg(
         &self,
+        table_name: &str,
+        pushed_filter: Option<&FilterExpr>,
         group_by: &[ColumnExpr],
         aggs: &[AggExpr],
         task: &TaskSpec,
@@ -2315,17 +2329,61 @@ impl WorkerNode {
             return Ok(None);
         }
 
+        // Validate that any pushed filter only references simple Arrow-evaluable columns.
+        let mut filter_logical_cols = HashSet::new();
+        if let Some(pred) = pushed_filter
+            && !collect_simple_arrow_filter_cols(pred, &mut filter_logical_cols)
+        {
+            return Ok(None);
+        }
+
+        let meta_opt = self.catalog.get_table(table_name).await.ok();
+        let empty_aliases = HashMap::new();
+        let aliases = meta_opt
+            .as_ref()
+            .map(|m| &m.column_aliases)
+            .unwrap_or(&empty_aliases);
+        let file_stats: HashMap<String, rustlakedb_catalog::DataFileEntry> = meta_opt
+            .as_ref()
+            .map(|m| {
+                m.snapshots
+                    .values()
+                    .flat_map(|s| s.data_files.iter())
+                    .map(|df| (df.file_path.clone(), df.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         struct SplitAggPlan {
             file_path: String,
             phys_group_cols: Vec<String>,
             phys_agg_cols: Vec<Option<String>>,
+            phys_filter: Option<FilterExpr>,
             proj: Vec<String>,
         }
 
-        // Resolve physical Parquet column names per split from cached Parquet footers.
+        // Resolve physical Parquet column names per split from cached Parquet footers (zero-copy Field-ID aliasing!).
         let mut split_plans: Vec<SplitAggPlan> = Vec::with_capacity(task.assigned_splits.len());
 
         for split in &task.assigned_splits {
+            // Check Layer 0 Hidden Partition + Layer 1 Zone-Map pruning BEFORE touching Parquet!
+            if let Some(pred) = pushed_filter
+                && let Some(df) = file_stats.get(&split.file_path)
+            {
+                if partition_can_skip_file(pred, &df.partition_values) {
+                    self.store
+                        .files_pruned_by_partition
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if zonemap_can_skip_file(pred, &df.column_min, &df.column_max) {
+                    self.store
+                        .files_pruned_by_zonemap
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
             let file_cols = self.store.parquet_column_names(&split.file_path).await?;
             let col_set: HashSet<&str> = file_cols.iter().map(|s| s.as_str()).collect();
 
@@ -2335,11 +2393,11 @@ impl WorkerNode {
             for g in group_by {
                 match g {
                     ColumnExpr::Column(c) => {
-                        if !col_set.contains(c.as_str()) {
+                        let Some(phys) = resolve_physical_col(c, &col_set, aliases) else {
                             return Ok(None);
-                        }
-                        phys_group_cols.push(c.clone());
-                        needed.insert(c.clone());
+                        };
+                        phys_group_cols.push(phys.clone());
+                        needed.insert(phys);
                     }
                     ColumnExpr::JsonPath { column, path, .. } => {
                         let shred = format!("__shred_{column}_{path}");
@@ -2362,14 +2420,26 @@ impl WorkerNode {
                     | AggFunc::Avg(c)
                     | AggFunc::Min(c)
                     | AggFunc::Max(c) => {
-                        if !col_set.contains(c.as_str()) {
+                        let Some(phys) = resolve_physical_col(c, &col_set, aliases) else {
                             return Ok(None);
-                        }
-                        phys_agg_cols.push(Some(c.clone()));
-                        needed.insert(c.clone());
+                        };
+                        phys_agg_cols.push(Some(phys.clone()));
+                        needed.insert(phys);
                     }
                 }
             }
+
+            let phys_filter = match pushed_filter {
+                Some(pred) => {
+                    let Some(rewritten) =
+                        rewrite_filter_for_physical_cols(pred, &col_set, aliases, &mut needed)
+                    else {
+                        return Ok(None);
+                    };
+                    Some(rewritten)
+                }
+                None => None,
+            };
 
             let mut proj: Vec<String> = needed.into_iter().collect();
             proj.sort();
@@ -2377,6 +2447,7 @@ impl WorkerNode {
                 file_path: split.file_path.clone(),
                 phys_group_cols,
                 phys_agg_cols,
+                phys_filter,
                 proj,
             });
         }
@@ -2534,6 +2605,7 @@ impl WorkerNode {
             file_path,
             phys_group_cols,
             phys_agg_cols,
+            phys_filter,
             proj,
         } in split_plans
         {
@@ -2546,6 +2618,9 @@ impl WorkerNode {
 
             for rb in &batches {
                 let n = rb.num_rows();
+                let filter_mask: Option<BooleanArray> = phys_filter
+                    .as_ref()
+                    .and_then(|pf| columnar::eval_columnar_filter(rb, pf));
                 let group_cols: Vec<ColRef<'_>> = phys_group_cols
                     .iter()
                     .map(|c| resolve_col(rb, c))
@@ -2568,6 +2643,15 @@ impl WorkerNode {
                         global_row_id += 1;
                         if has_dv && dv.contains(cur_id) {
                             self.store.rows_skipped_by_dv.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if let Some(ref mask) = filter_mask {
+                            if mask.is_null(row) || !mask.value(row) {
+                                continue;
+                            }
+                        } else if let Some(ref pf) = phys_filter
+                            && !eval_arrow_filter_row(rb, row, pf)
+                        {
                             continue;
                         }
                         total_rows_processed += 1;
@@ -2603,6 +2687,15 @@ impl WorkerNode {
                         global_row_id += 1;
                         if has_dv && dv.contains(cur_id) {
                             self.store.rows_skipped_by_dv.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if let Some(ref mask) = filter_mask {
+                            if mask.is_null(row) || !mask.value(row) {
+                                continue;
+                            }
+                        } else if let Some(ref pf) = phys_filter
+                            && !eval_arrow_filter_row(rb, row, pf)
+                        {
                             continue;
                         }
                         total_rows_processed += 1;
@@ -2746,6 +2839,7 @@ impl WorkerNode {
         };
 
         let PhysicalNode::IcebergScan {
+            table_name: left_table_name,
             pushed_filter: scan_filter,
             ..
         } = left_scan
@@ -2854,8 +2948,62 @@ impl WorkerNode {
         let mut proj: Vec<String> = probe_needed.into_iter().collect();
         proj.sort();
 
+        // Wave 25 Dynamic Partition Pruning (DPP) / Semi-Join Min-Max Pushdown:
+        // Compute build-side join-key [min, max] bounds and skip fact-table Parquet splits
+        // whose zone-map range cannot overlap any dimension join key BEFORE opening them!
+        let build_key_bounds: Option<(i64, i64)> = if int_build_map.is_empty() {
+            None
+        } else {
+            let mut mn = i64::MAX;
+            let mut mx = i64::MIN;
+            for &k in int_build_map.keys() {
+                if k < mn {
+                    mn = k;
+                }
+                if k > mx {
+                    mx = k;
+                }
+            }
+            Some((mn, mx))
+        };
+        let left_file_stats: HashMap<String, rustlakedb_catalog::DataFileEntry> = self
+            .catalog
+            .get_table(left_table_name)
+            .await
+            .ok()
+            .map(|m| {
+                m.snapshots
+                    .values()
+                    .flat_map(|s| s.data_files.iter())
+                    .map(|df| (df.file_path.clone(), df.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut rows_scanned = 0u64;
         for split in &task.assigned_splits {
+            if int_build_map.is_empty() {
+                self.files_pruned_by_dpp.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if let Some((b_min, b_max)) = build_key_bounds
+                && let Some(df) = left_file_stats.get(&split.file_path)
+            {
+                let f_min = df
+                    .column_min
+                    .get(left_key)
+                    .and_then(|s| s.parse::<i64>().ok());
+                let f_max = df
+                    .column_max
+                    .get(left_key)
+                    .and_then(|s| s.parse::<i64>().ok());
+                if let (Some(fmin), Some(fmax)) = (f_min, f_max)
+                    && (fmax < b_min || fmin > b_max)
+                {
+                    self.files_pruned_by_dpp.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
             let (batches, dv) = self
                 .store
                 .read_arrow_batches(&split.file_path, Some(&proj))
@@ -3246,6 +3394,89 @@ fn extract_arrow_cell(
         return ScalarValue::Utf8(s.to_string());
     }
     ScalarValue::Null
+}
+
+/// Resolves a logical Iceberg column name to its physical Parquet column name in a specific file
+/// (zero-copy Field-ID schema evolution alias resolution, Wave 25).
+fn resolve_physical_col(
+    logical: &str,
+    col_set: &HashSet<&str>,
+    aliases: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    if col_set.contains(logical) {
+        return Some(logical.to_string());
+    }
+    if let Some(hist) = aliases.get(logical) {
+        for old in hist.iter().rev() {
+            if col_set.contains(old.as_str()) {
+                return Some(old.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Rewrites a simple `FilterExpr` to reference physical Parquet column names for zero-copy
+/// post-evolution Arrow scanning (Wave 25).
+fn rewrite_filter_for_physical_cols(
+    expr: &FilterExpr,
+    col_set: &HashSet<&str>,
+    aliases: &HashMap<String, Vec<String>>,
+    needed: &mut HashSet<String>,
+) -> Option<FilterExpr> {
+    let mut map_col = |c: &str| -> Option<String> {
+        let phys = resolve_physical_col(c, col_set, aliases)?;
+        needed.insert(phys.clone());
+        Some(phys)
+    };
+    match expr {
+        FilterExpr::Eq { column, value } => Some(FilterExpr::Eq {
+            column: map_col(column)?,
+            value: value.clone(),
+        }),
+        FilterExpr::NotEq { column, value } => Some(FilterExpr::NotEq {
+            column: map_col(column)?,
+            value: value.clone(),
+        }),
+        FilterExpr::Gt { column, value } => Some(FilterExpr::Gt {
+            column: map_col(column)?,
+            value: value.clone(),
+        }),
+        FilterExpr::GtEq { column, value } => Some(FilterExpr::GtEq {
+            column: map_col(column)?,
+            value: value.clone(),
+        }),
+        FilterExpr::Lt { column, value } => Some(FilterExpr::Lt {
+            column: map_col(column)?,
+            value: value.clone(),
+        }),
+        FilterExpr::LtEq { column, value } => Some(FilterExpr::LtEq {
+            column: map_col(column)?,
+            value: value.clone(),
+        }),
+        FilterExpr::InList { column, values } => Some(FilterExpr::InList {
+            column: map_col(column)?,
+            values: values.clone(),
+        }),
+        FilterExpr::IsNull { column } => Some(FilterExpr::IsNull {
+            column: map_col(column)?,
+        }),
+        FilterExpr::IsNotNull { column } => Some(FilterExpr::IsNotNull {
+            column: map_col(column)?,
+        }),
+        FilterExpr::And(a, b) => Some(FilterExpr::And(
+            Box::new(rewrite_filter_for_physical_cols(a, col_set, aliases, needed)?),
+            Box::new(rewrite_filter_for_physical_cols(b, col_set, aliases, needed)?),
+        )),
+        FilterExpr::Or(a, b) => Some(FilterExpr::Or(
+            Box::new(rewrite_filter_for_physical_cols(a, col_set, aliases, needed)?),
+            Box::new(rewrite_filter_for_physical_cols(b, col_set, aliases, needed)?),
+        )),
+        FilterExpr::Not(inner) => Some(FilterExpr::Not(Box::new(
+            rewrite_filter_for_physical_cols(inner, col_set, aliases, needed)?,
+        ))),
+        _ => None,
+    }
 }
 
 fn collect_simple_arrow_filter_cols(expr: &FilterExpr, out: &mut HashSet<String>) -> bool {

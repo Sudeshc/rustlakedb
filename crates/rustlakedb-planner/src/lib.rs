@@ -48,6 +48,12 @@ pub enum CopyFormat {
     Parquet,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeTravelSpec {
+    Version(u64),
+    TimestampMs(u64),
+}
+
 #[derive(Debug, Clone)]
 pub enum PlannedCommand {
     Query(StageDag),
@@ -58,6 +64,8 @@ pub enum PlannedCommand {
         schema: Vec<FieldSchema>,
         if_not_exists: bool,
         partition_by: Vec<String>,
+        column_defaults: HashMap<String, String>,
+        check_constraints: Vec<String>,
     },
     CreateTableAs {
         table_name: String,
@@ -95,6 +103,7 @@ pub enum PlannedCommand {
         table_name: String,
         column_name: String,
         data_type: ColumnType,
+        default_value: Option<String>,
     },
     AlterRenameColumn {
         table_name: String,
@@ -215,6 +224,29 @@ pub enum PlannedCommand {
         source_branch: String,
         target_branch: String,
     },
+    RestoreTable {
+        table_name: String,
+        snapshot_id: Option<u64>,
+        timestamp_ms: Option<u64>,
+    },
+    ShowSnapshots {
+        table_name: String,
+    },
+    AlterSetTags {
+        table_name: String,
+        tags: BTreeMap<String, String>,
+    },
+    ShowTags {
+        table_name: Option<String>,
+    },
+    AnalyzeTable {
+        table_name: String,
+    },
+    CopyTo {
+        query_sql: String,
+        target_path: String,
+        format: CopyFormat,
+    },
     ServerVersion,
     NoOp(String),
 }
@@ -301,6 +333,53 @@ impl DistributedPlanner {
         }
         if upper.starts_with("ALTER TABLE ") && upper.contains(" CLUSTER BY ") {
             return parse_alter_cluster_by(trimmed);
+        }
+        if upper.starts_with("ALTER TABLE ") && upper.contains(" SET TAG") {
+            return parse_alter_set_tags(trimmed);
+        }
+        if upper.starts_with("RESTORE TABLE ") {
+            return parse_restore_table(trimmed);
+        }
+        if upper.starts_with("SHOW SNAPSHOTS") {
+            let rest = trimmed["SHOW SNAPSHOTS".len()..].trim();
+            let rest = if rest.to_uppercase().starts_with("ON ") {
+                rest["ON ".len()..].trim()
+            } else if rest.to_uppercase().starts_with("FOR ") {
+                rest["FOR ".len()..].trim()
+            } else {
+                rest
+            };
+            return Ok(PlannedCommand::ShowSnapshots {
+                table_name: normalize_table_name(rest),
+            });
+        }
+        if upper == "SHOW TAGS" || upper.starts_with("SHOW TAGS ") {
+            let rest = trimmed["SHOW TAGS".len()..].trim();
+            let rest = if rest.to_uppercase().starts_with("ON ") {
+                rest["ON ".len()..].trim()
+            } else {
+                rest
+            };
+            let table_name = if rest.is_empty() {
+                None
+            } else {
+                Some(normalize_table_name(rest))
+            };
+            return Ok(PlannedCommand::ShowTags { table_name });
+        }
+        if upper.starts_with("ANALYZE ") {
+            let rest = trimmed["ANALYZE ".len()..].trim();
+            let rest = if rest.to_uppercase().starts_with("TABLE ") {
+                rest["TABLE ".len()..].trim()
+            } else {
+                rest
+            };
+            return Ok(PlannedCommand::AnalyzeTable {
+                table_name: normalize_table_name(rest),
+            });
+        }
+        if upper.starts_with("COPY ") && upper.contains(" TO ") {
+            return parse_copy_to(trimmed);
         }
         if upper.starts_with("ALTER TABLE ") && upper.contains(" RENAME TO ") {
             return parse_alter_rename_table(trimmed);
@@ -499,20 +578,45 @@ impl DistributedPlanner {
                     });
                 }
                 let mut schema = Vec::new();
+                let mut column_defaults: HashMap<String, String> = HashMap::new();
+                let mut check_constraints: Vec<String> = Vec::new();
                 for (idx, col) in ct.columns.into_iter().enumerate() {
                     let dt = map_sql_data_type(&col.data_type)?;
+                    let mut nullable = true;
+                    for opt_def in &col.options {
+                        match &opt_def.option {
+                            sqlparser::ast::ColumnOption::NotNull => nullable = false,
+                            sqlparser::ast::ColumnOption::Unique { is_primary: true, .. } => {
+                                nullable = false;
+                            }
+                            sqlparser::ast::ColumnOption::Default(expr) => {
+                                column_defaults.insert(col.name.value.clone(), expr.to_string());
+                            }
+                            sqlparser::ast::ColumnOption::Check(expr) => {
+                                check_constraints.push(expr.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
                     schema.push(FieldSchema {
                         field_id: (idx + 1) as i32,
                         name: col.name.value,
                         data_type: dt,
-                        nullable: true,
+                        nullable,
                     });
+                }
+                for tc in &ct.constraints {
+                    if let sqlparser::ast::TableConstraint::Check { expr, .. } = tc {
+                        check_constraints.push(expr.to_string());
+                    }
                 }
                 Ok(PlannedCommand::CreateTable {
                     table_name,
                     schema,
                     if_not_exists: ct.if_not_exists,
                     partition_by: table_partition_by,
+                    column_defaults,
+                    check_constraints,
                 })
             }
             Statement::Drop {
@@ -538,10 +642,15 @@ impl DistributedPlanner {
                 match operations.into_iter().next() {
                     Some(AlterTableOperation::AddColumn { column_def, .. }) => {
                         let data_type = map_sql_data_type(&column_def.data_type)?;
+                        let default_value = column_def.options.iter().find_map(|o| match &o.option {
+                            sqlparser::ast::ColumnOption::Default(expr) => Some(expr.to_string()),
+                            _ => None,
+                        });
                         Ok(PlannedCommand::AlterAddColumn {
                             table_name,
                             column_name: column_def.name.value,
                             data_type,
+                            default_value,
                         })
                     }
                     Some(AlterTableOperation::RenameColumn {
@@ -801,7 +910,7 @@ impl DistributedPlanner {
         &'a self,
         query: sqlparser::ast::Query,
         branch: &'a str,
-        time_travel_version: Option<u64>,
+        time_travel_version: Option<TimeTravelSpec>,
         catalog: &'a dyn Catalog,
     ) -> PlanQueryFuture<'a> {
         Box::pin(async move {
@@ -961,20 +1070,27 @@ impl DistributedPlanner {
             } else {
                 let left_meta = catalog.get_table(&left_table_name).await?;
                 let left_splits = match time_travel_version {
-                    Some(v) => left_meta.splits_at_version(v)?,
+                    Some(TimeTravelSpec::Version(v)) => left_meta.splits_at_version(v)?,
+                    Some(TimeTravelSpec::TimestampMs(ts)) => left_meta.splits_at_timestamp(ts)?,
                     None => left_meta.splits(branch)?,
                 };
                 if let Ok(snap) = left_meta.current_snapshot(branch) {
                     let est_rows: u64 = snap.data_files.iter().map(|f| f.row_count).sum();
-                    let ndv_cols: usize = snap
-                        .data_files
-                        .iter()
-                        .flat_map(|f| f.ndv_estimates.keys())
-                        .collect::<HashSet<_>>()
-                        .len();
-                    if est_rows > 0 && (ndv_cols > 0 || !left_meta.partition_by.is_empty()) {
+                    let analyzed_cols = left_meta.column_stats.len();
+                    let ndv_cols: usize = if analyzed_cols > 0 {
+                        analyzed_cols
+                    } else {
+                        snap.data_files
+                            .iter()
+                            .flat_map(|f| f.ndv_estimates.keys())
+                            .collect::<HashSet<_>>()
+                            .len()
+                    };
+                    if est_rows > 0
+                        && (ndv_cols > 0 || !left_meta.partition_by.is_empty() || analyzed_cols > 0)
+                    {
                         cbo_notes.push(format!(
-                            "CBO: stats({left_table_name} rows={est_rows}, ndv_cols={ndv_cols}, partition_by={:?})",
+                            "CBO: stats({left_table_name} rows={est_rows}, ndv_cols={ndv_cols}, analyzed={analyzed_cols}, partition_by={:?})",
                             left_meta.partition_by
                         ));
                     }
@@ -2033,23 +2149,179 @@ fn extract_create_table_partition_by(sql: &str) -> (String, Vec<String>) {
     (before, parts)
 }
 
-fn extract_time_travel_clause(sql: &str) -> Result<(String, Option<u64>)> {
-    let upper = sql.to_uppercase();
-    if let Some(pos) = upper.find(" AT VERSION ") {
-        let before = &sql[..pos];
-        let after = sql[pos + " AT VERSION ".len()..].trim_start();
-        let ver_end = after
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after.len());
-        let ver_str = &after[..ver_end];
-        let version = ver_str.parse::<u64>().map_err(|_| {
-            RustLakeError::SqlParse(format!("invalid AT VERSION snapshot id: '{ver_str}'"))
-        })?;
-        let remainder = &after[ver_end..];
-        Ok((format!("{before}{remainder}"), Some(version)))
-    } else {
-        Ok((sql.to_string(), None))
+fn parse_iso_or_epoch_ms(raw: &str) -> Result<u64> {
+    let s = raw.trim().trim_matches('\'').trim_matches('"').trim();
+    if let Ok(ms) = s.parse::<u64>() {
+        return Ok(ms);
     }
+    // Parse ISO-8601 `YYYY-MM-DD[T| HH:MM:SS[.mmm][Z]]` to epoch ms cleanly with zero extra deps.
+    let clean = s.trim_end_matches('Z').trim_end_matches('z');
+    let (date_part, time_part) = if let Some((d, t)) = clean.split_once('T') {
+        (d, Some(t))
+    } else if let Some((d, t)) = clean.split_once(' ') {
+        (d, Some(t))
+    } else {
+        (clean, None)
+    };
+    let days = rustlakedb_protocol::parse_iso_date_days(date_part).ok_or_else(|| {
+        RustLakeError::SqlParse(format!("invalid timestamp literal: '{raw}'"))
+    })?;
+    let mut secs: i64 = (days as i64) * 86_400;
+    let mut millis: i64 = 0;
+    if let Some(tp) = time_part {
+        let (hms, frac) = match tp.split_once('.') {
+            Some((a, b)) => (a, Some(b)),
+            None => (tp, None),
+        };
+        let mut it = hms.split(':');
+        let h: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let m: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let sc: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        secs += h * 3600 + m * 60 + sc;
+        if let Some(f) = frac {
+            let digits: String = f.chars().take(3).collect();
+            let padded = format!("{digits:0<3}");
+            millis = padded.parse::<i64>().unwrap_or(0);
+        }
+    }
+    Ok((secs.max(0) as u64) * 1000 + (millis.max(0) as u64))
+}
+
+fn extract_time_travel_clause(sql: &str) -> Result<(String, Option<TimeTravelSpec>)> {
+    let upper = sql.to_uppercase();
+    for marker in [
+        " FOR SYSTEM_TIME AS OF TIMESTAMP ",
+        " AT TIMESTAMP ",
+        " TIMESTAMP AS OF ",
+    ] {
+        if let Some(pos) = upper.find(marker) {
+            let before = &sql[..pos];
+            let after = sql[pos + marker.len()..].trim_start();
+            let (ts_tok, rem) = if let Some(rest) = after.strip_prefix('\'') {
+                let end = rest.find('\'').ok_or_else(|| {
+                    RustLakeError::SqlParse("unterminated timestamp literal".into())
+                })?;
+                (&rest[..end], &rest[end + 1..])
+            } else {
+                let end = after
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(after.len());
+                (&after[..end], &after[end..])
+            };
+            let ts_ms = parse_iso_or_epoch_ms(ts_tok)?;
+            return Ok((format!("{before}{rem}"), Some(TimeTravelSpec::TimestampMs(ts_ms))));
+        }
+    }
+    for marker in [" FOR SYSTEM_TIME AS OF ", " AT VERSION ", " VERSION AS OF "] {
+        if let Some(pos) = upper.find(marker) {
+            let before = &sql[..pos];
+            let after = sql[pos + marker.len()..].trim_start();
+            let ver_end = after
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after.len());
+            let ver_str = &after[..ver_end];
+            let version = ver_str.parse::<u64>().map_err(|_| {
+                RustLakeError::SqlParse(format!("invalid time-travel snapshot id: '{ver_str}'"))
+            })?;
+            let remainder = &after[ver_end..];
+            return Ok((format!("{before}{remainder}"), Some(TimeTravelSpec::Version(version))));
+        }
+    }
+    Ok((sql.to_string(), None))
+}
+
+fn parse_restore_table(sql: &str) -> Result<PlannedCommand> {
+    let rest = sql["RESTORE TABLE ".len()..].trim();
+    let upper = rest.to_uppercase();
+    if let Some(idx) = upper.find(" TO VERSION ") {
+        let tbl = normalize_table_name(rest[..idx].trim());
+        let ver_str = rest[idx + " TO VERSION ".len()..].trim();
+        let snap = ver_str.parse::<u64>().map_err(|_| {
+            RustLakeError::SqlParse(format!("invalid RESTORE version: '{ver_str}'"))
+        })?;
+        return Ok(PlannedCommand::RestoreTable {
+            table_name: tbl,
+            snapshot_id: Some(snap),
+            timestamp_ms: None,
+        });
+    }
+    if let Some(idx) = upper.find(" TO TIMESTAMP ") {
+        let tbl = normalize_table_name(rest[..idx].trim());
+        let ts_str = rest[idx + " TO TIMESTAMP ".len()..].trim();
+        let ts_ms = parse_iso_or_epoch_ms(ts_str)?;
+        return Ok(PlannedCommand::RestoreTable {
+            table_name: tbl,
+            snapshot_id: None,
+            timestamp_ms: Some(ts_ms),
+        });
+    }
+    Err(RustLakeError::SqlParse(
+        "expected: RESTORE TABLE <table> TO VERSION <id> | TO TIMESTAMP '<ts>'".into(),
+    ))
+}
+
+fn parse_alter_set_tags(sql: &str) -> Result<PlannedCommand> {
+    let rest = sql["ALTER TABLE ".len()..].trim();
+    let upper = rest.to_uppercase();
+    let idx = upper.find(" SET TAG").ok_or_else(|| {
+        RustLakeError::SqlParse("expected: ALTER TABLE <table> SET TAG ('k'='v', ...)".into())
+    })?;
+    let table_name = normalize_table_name(rest[..idx].trim());
+    let after = rest[idx + " SET TAG".len()..].trim();
+    let after = after.strip_prefix('S').or_else(|| after.strip_prefix('s')).unwrap_or(after).trim();
+    let inner = after.trim_start_matches('(').trim_end_matches(')').trim();
+    let mut tags = BTreeMap::new();
+    for pair in inner.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').ok_or_else(|| {
+            RustLakeError::SqlParse(format!("invalid tag assignment '{pair}', expected 'k'='v'"))
+        })?;
+        tags.insert(
+            k.trim().trim_matches('\'').trim_matches('"').to_string(),
+            v.trim().trim_matches('\'').trim_matches('"').to_string(),
+        );
+    }
+    Ok(PlannedCommand::AlterSetTags { table_name, tags })
+}
+
+fn parse_copy_to(sql: &str) -> Result<PlannedCommand> {
+    let rest = sql["COPY ".len()..].trim();
+    let upper = rest.to_uppercase();
+    let to_idx = upper.rfind(" TO ").ok_or_else(|| {
+        RustLakeError::SqlParse("expected: COPY (<query>) TO '<path>' [WITH (FORMAT PARQUET|CSV|JSON)]".into())
+    })?;
+    let lhs = rest[..to_idx].trim();
+    let query_sql = if lhs.starts_with('(') && lhs.ends_with(')') {
+        lhs[1..lhs.len() - 1].trim().to_string()
+    } else {
+        format!("SELECT * FROM {}", normalize_table_name(lhs))
+    };
+    let rhs = rest[to_idx + " TO ".len()..].trim();
+    let (path_raw, opts) = if let Some(after_q) = rhs.strip_prefix('\'') {
+        let end_q = after_q.find('\'').ok_or_else(|| {
+            RustLakeError::SqlParse("unterminated target path string in COPY TO".into())
+        })?;
+        (&after_q[..end_q], after_q[end_q + 1..].trim())
+    } else {
+        let sp = rhs.find(char::is_whitespace).unwrap_or(rhs.len());
+        (&rhs[..sp], rhs[sp..].trim())
+    };
+    let opts_upper = opts.to_uppercase();
+    let format = if opts_upper.contains("CSV") || path_raw.to_lowercase().ends_with(".csv") {
+        CopyFormat::Csv
+    } else if opts_upper.contains("JSON") || path_raw.to_lowercase().ends_with(".json") || path_raw.to_lowercase().ends_with(".ndjson") {
+        CopyFormat::Json
+    } else {
+        CopyFormat::Parquet
+    };
+    Ok(PlannedCommand::CopyTo {
+        query_sql,
+        target_path: path_raw.to_string(),
+        format,
+    })
 }
 
 fn parse_col_expr(expr: &Expr, alias: Option<String>) -> Result<ColumnExpr> {
