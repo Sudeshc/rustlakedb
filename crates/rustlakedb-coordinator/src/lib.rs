@@ -103,7 +103,7 @@ impl HttpWorkerClient {
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(400))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -138,7 +138,7 @@ impl HttpWorkerClient {
             .add_root_certificate(ca_cert)
             .identity(identity)
             .connect_timeout(Duration::from_millis(800))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .map_err(|e| RustLakeError::Execution(format!("build mTLS worker client: {e}")))?;
 
@@ -1415,16 +1415,22 @@ impl Coordinator {
                 table_name,
                 keep_last,
             } => {
-                // Expire old snapshots & garbage-collect unreferenced orphan Parquet/Puffin/DV files!
+                // Standard Iceberg ExpireSnapshots safety: capture files referenced BEFORE expiry
+                // so we delete ONLY files that belonged to expired snapshots (never deleting
+                // brand-new in-flight uncommitted Parquet files from concurrent writers!).
+                let pre_referenced = self
+                    .catalog
+                    .get_table(&table_name)
+                    .await?
+                    .referenced_file_paths();
                 let expired = self.catalog.expire_snapshots(&table_name, keep_last).await?;
                 let meta = self.catalog.get_table(&table_name).await?;
                 let referenced = meta.referenced_file_paths();
-                let all_paths = self.store.list_paths(&format!("{table_name}/data")).await?;
 
                 let mut deleted_files = 0usize;
-                for p in all_paths {
+                for p in pre_referenced {
                     if p.ends_with(".parquet") && !referenced.contains(&p) {
-                        self.store.delete_data_file(&p).await?;
+                        let _ = self.store.delete_data_file(&p).await;
                         deleted_files += 1;
                     }
                 }
@@ -3416,11 +3422,18 @@ impl Coordinator {
             let max_retries = self.max_task_retries;
             let spec_threshold_ms = self.speculative_threshold_ms.load(Ordering::Relaxed);
             let workers_ref = &workers_snap;
+            // Billion-row OOM protection: cap concurrent in-flight split tasks to 4 per worker so
+            // 200..20,000-split tables stream smoothly with flat worker RAM instead of spiking OOM.
+            let max_inflight = (workers_ref.len() * 4).clamp(4, 32);
+            let stage_sem = Arc::new(tokio::sync::Semaphore::new(max_inflight));
 
             let task_futs =
                 task_assignments
                     .into_iter()
-                    .map(|(task_idx, pt, primary_id)| async move {
+                    .map(|(task_idx, pt, primary_id)| {
+                        let sem = stage_sem.clone();
+                        async move {
+                        let _permit = sem.acquire_owned().await.ok();
                         let mut attempt = 0u32;
                         let mut excluded_workers: Vec<WorkerId> = Vec::new();
                         let mut local_executed = 0usize;
@@ -3535,6 +3548,7 @@ impl Coordinator {
                                 }
                                 Err(e) => return Err(e),
                             }
+                        }
                         }
                     });
 

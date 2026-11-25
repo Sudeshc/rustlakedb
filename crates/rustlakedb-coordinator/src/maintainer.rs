@@ -68,7 +68,17 @@ impl AutonomousMaintainer {
                 }
             }
 
-            if snap.data_files.len() >= self.config.min_files_to_compact || has_dvs {
+            // Only auto-compact small fragmented files (<16 MiB) on tables within in-memory compaction budget,
+            // never pulling billion-row optimal Parquet tables into maintainer RAM!
+            let small_files = snap
+                .data_files
+                .iter()
+                .filter(|df| df.byte_size < 16 * 1024 * 1024)
+                .count();
+            let total_rows: u64 = snap.data_files.iter().map(|df| df.row_count).sum();
+            let within_budget = total_rows <= 2_000_000;
+
+            if within_budget && (small_files >= self.config.min_files_to_compact || has_dvs) {
                 tracing::info!(
                     table = %table_name,
                     files = snap.data_files.len(),

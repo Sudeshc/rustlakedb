@@ -2946,6 +2946,10 @@ impl WorkerNode {
         let mut str_groups: HashMap<String, Vec<VecAggAcc>> = HashMap::new();
         let mut null_str_group: Option<Vec<VecAggAcc>> = None;
         let mut used_str_fast_path = false;
+        // Multi-column all-UTF-8 zero-allocation composite key fast map (for 1B-row medallion GROUP BY!).
+        let mut multi_str_groups: HashMap<String, (Vec<Option<String>>, Vec<VecAggAcc>)> =
+            HashMap::new();
+        let mut used_multi_str_fast_path = false;
         // General multi-key / typed-key map.
         let mut gen_groups: HashMap<Vec<VecGroupKey>, Vec<VecAggAcc>> = HashMap::new();
         let mut total_rows_processed = 0u64;
@@ -3019,8 +3023,69 @@ impl WorkerNode {
                             }
                         }
                     }
+                } else if group_cols.len() > 1
+                    && group_cols.iter().all(|c| matches!(c, ColRef::Utf8(_)))
+                    && gen_groups.is_empty()
+                {
+                    // Zero-allocation multi-UTF-8 GROUP BY fast path: reuses a single composite
+                    // String buffer per row (0 heap allocations on cache hits across 1B+ rows!).
+                    used_multi_str_fast_path = true;
+                    let str_arrays: Vec<&StringArray> = group_cols
+                        .iter()
+                        .map(|c| match c {
+                            ColRef::Utf8(a) => *a,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let mut key_buf = String::with_capacity(64);
+                    for row in 0..n {
+                        let cur_id = global_row_id;
+                        global_row_id += 1;
+                        if has_dv && dv.contains(cur_id) {
+                            self.store.rows_skipped_by_dv.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if let Some(ref mask) = filter_mask {
+                            if mask.is_null(row) || !mask.value(row) {
+                                continue;
+                            }
+                        } else if let Some(ref pf) = phys_filter
+                            && !eval_arrow_filter_row(rb, row, pf)
+                        {
+                            continue;
+                        }
+                        total_rows_processed += 1;
+                        key_buf.clear();
+                        for (idx, sa) in str_arrays.iter().enumerate() {
+                            if idx > 0 {
+                                key_buf.push('\x1f');
+                            }
+                            if sa.is_null(row) {
+                                key_buf.push('\x00');
+                            } else {
+                                key_buf.push_str(sa.value(row));
+                            }
+                        }
+                        if let Some((_, accs)) = multi_str_groups.get_mut(key_buf.as_str()) {
+                            update_accs(accs, aggs, &agg_cols, row);
+                        } else {
+                            let mut accs = vec![VecAggAcc::default(); aggs.len()];
+                            update_accs(&mut accs, aggs, &agg_cols, row);
+                            let parts: Vec<Option<String>> = str_arrays
+                                .iter()
+                                .map(|sa| {
+                                    if sa.is_null(row) {
+                                        None
+                                    } else {
+                                        Some(sa.value(row).to_string())
+                                    }
+                                })
+                                .collect();
+                            multi_str_groups.insert(key_buf.clone(), (parts, accs));
+                        }
+                    }
                 } else {
-                    // Promote any earlier str_groups if schemas varied across splits.
+                    // Promote any earlier fast-path maps if schemas varied across splits.
                     if used_str_fast_path {
                         for (k, v) in str_groups.drain() {
                             gen_groups.insert(vec![VecGroupKey::Str(k)], v);
@@ -3029,6 +3094,16 @@ impl WorkerNode {
                             gen_groups.insert(vec![VecGroupKey::Null], v);
                         }
                         used_str_fast_path = false;
+                    }
+                    if used_multi_str_fast_path {
+                        for (_, (parts, v)) in multi_str_groups.drain() {
+                            let gk = parts
+                                .into_iter()
+                                .map(|p| p.map(VecGroupKey::Str).unwrap_or(VecGroupKey::Null))
+                                .collect();
+                            gen_groups.insert(gk, v);
+                        }
+                        used_multi_str_fast_path = false;
                     }
                     let mut key_buf = Vec::with_capacity(group_cols.len());
                     for row in 0..n {
@@ -3127,6 +3202,20 @@ impl WorkerNode {
             }
             if let Some(accs) = null_str_group {
                 out_rows.push(build_row(vec![(gname, ScalarValue::Null)], accs));
+            }
+        } else if used_multi_str_fast_path {
+            for (_, (parts, accs)) in multi_str_groups {
+                let gvals: Vec<(String, ScalarValue)> = group_names
+                    .iter()
+                    .zip(parts)
+                    .map(|(n, p)| {
+                        (
+                            n.clone(),
+                            p.map(ScalarValue::Utf8).unwrap_or(ScalarValue::Null),
+                        )
+                    })
+                    .collect();
+                out_rows.push(build_row(gvals, accs));
             }
         } else {
             for (keys, accs) in gen_groups {

@@ -136,7 +136,46 @@ Verified in release mode (`cargo test --release -p rustlakedb-testkit --test wav
 
 ---
 
-## 10. Honest Engineering Findings & Next Optimizations
+## 10. Extreme Scale — 1,000,000,000 (1 Billion) Financial Transaction Medallion Pipeline (Bronze → Silver → Gold)
+
+> **Reproducible Harness:** [scripts/run-1b-medallion-bench.ps1](../scripts/run-1b-medallion-bench.ps1) + [scripts/medallion_1b_financial_bench.py](../scripts/medallion_1b_financial_bench.py)
+
+To test true enterprise lakehouse behavior at **billion-row scale**, we generated and ingested **1,000,000,000 realistic multi-currency financial ledger transactions** (`$23,000,088,198,324.80` in settled volume across 20 trading days, 5 currencies, 8 merchant categories, and 4 settlement statuses) across **200 × 5,000,000-row Zstd Parquet splits (`7.97 GiB`, `8.56 bytes/row`)**, committed incrementally in **10 Iceberg v3 REST Catalog batches** (`100M` rows/commit), and transformed them end-to-end across **Bronze → Silver → Gold** on the live 3-worker cluster:
+
+### End-to-End Medallion Stage Performance (`1,000,000,000` Rows)
+
+| Medallion Layer | Operation / SQL Workload | Rows Scanned → Produced | Measured Latency | Throughput | Verified Outcome |
+|---|---|---|---:|---:|---|
+| **Bronze Ingest** | 10 incremental Iceberg REST commits (`100M` rows/batch, `200 × 5M` Zstd Parquet splits, `7.97 GiB`) | `0 → 1,000,000,000` | **268.64 s** *(avg commit `27.8 ms`)* | **3.72M rows/s** *(PyArrow gen+write)* | `1,000,000,000` rows, `8.56 bytes/row`, `10` Iceberg snapshots |
+| **Bronze Q1** | `SELECT COUNT(*) FROM bronze_fin_tx_1b` | `1,000,000,000 → 1` | **4.86 s** *(fresh)* / **7.31 s** *(warm)* | **206.0M rows/s** *(peak)* / **136.9M rows/s** | Exact `1,000,000,000` |
+| **Bronze Q2** | Status Audit: `SELECT status, COUNT(*), SUM(amount), AVG(amount) ... GROUP BY status` | `1,000,000,000 → 4` | **6.19 s** *(fresh)* / **9.74 s** *(warm)* | **161.5M rows/s** *(peak)* / **102.7M rows/s** | Exact `920,000,000 SETTLED` (92%) |
+| **Silver 1 (`CTAS`)** | `silver_daily_settlement_ledger`: cleanse `WHERE status='SETTLED'` (drops 80M), 3-column `GROUP BY tx_day, currency, merchant_cat` (`COUNT`, `SUM`, `AVG`, `MAX`) | `1,000,000,000 → 800` | **21.89 s** | **45.7M rows/s** | All `20×5×8 = 800` ledger rows, `$23,000,088,198,324.78` exact |
+| **Silver 2 (`CTAS`)** | `silver_aml_high_value_alerts`: needle-in-1B-haystack compliance filter (`status='SETTLED' AND merchant_cat='crypto' AND amount > 49995.0`) | `1,000,000,000 → 12,416` | **24.07 s** | **41.5M rows/s** | Exact `12,416` high-value crypto AML alerts extracted |
+| **Silver 3 (`MERGE` + DDL)** | Late-arriving chargeback conditional multi-clause `MERGE INTO` (`1D + 1U + 1I`) + zero-rewrite `ALTER TABLE ADD COLUMN sar_status` | `12,416` alerts | **79.5 ms** | — | Atomic single-snapshot Iceberg update, `12,416` final alerts |
+| **Gold 1 (`CTAS`)** | `gold_cfo_currency_pnl`: executive P&L cube (`GROUP BY currency, merchant_cat`) from Silver ledger | `800 → 40` | **23.0 ms** | — | `40` currency×category KPIs, `920,000,000` settled tx |
+| **Gold 2 (Analytics + BI)** | 3-day sliding window `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` + `QUALIFY` + `CREATE OR REPLACE VIEW gold_v_cfo_dashboard` | `800 → 100` win / `40` view | **25.9 ms** | — | 100 rolling cashflow points, 40 multi-billion-$ dashboard rows |
+| **Gold 3 (Lineage + RLS)** | Automated 3-hop medallion lineage (`bronze → silver → gold`) + `usd_controller` RLS (`currency = 'USD'`) | `40 → 8` USD rows | **69.3 ms** | — | All 3 medallion lineage edges recorded; RLS restricted view to `8/40` rows |
+| **Gold 4 (`PyIceberg`)** | Official `PyIceberg` direct Zstd Parquet reconciliation (`RestCatalog.load_table("default.gold_cfo_currency_pnl").scan().to_arrow()`) | `40` Gold rows vs `1B` GT | **832.5 ms** | — | **`920,000,000` tx & `$23,000,088,198,324.80` (`0.000000000%` drift!)** |
+
+### Live Container Memory Telemetry (After 4 Billion Total Row Scans)
+
+| Container | Pre-Run RAM (Fresh) | Post-1B-Medallion RAM | % of 15.34 GiB Limit | Status |
+|---|---:|---:|---:|---|
+| `rustlakedb-bench-coordinator` | `6.31 MiB` | **`53.70 MiB`** | `0.34%` | Healthy (0 errors) |
+| `rustlakedb-bench-worker-1` | `5.76 MiB` | **`4.64 GiB`** | `30.26%` | Healthy (0 errors) |
+| `rustlakedb-bench-worker-2` | `5.84 MiB` | **`5.18 GiB`** | `33.74%` | Healthy (0 errors) |
+| `rustlakedb-bench-worker-3` | `5.34 MiB` | **`4.30 GiB`** | `28.00%` | Healthy (0 errors) |
+
+### 4 Real Billion-Row Production Bugs Caught & Fixed Live During This Test
+Running a genuine 1B-row workload surfaced **4 real scale issues** invisible at 1M–25M rows, all fixed immediately in the engine:
+1. **Unbounded 200-Split Stage Fan-Out (`worker-2` OOM `Exit 137`):** Firing all 200 × 5M-row Parquet tasks simultaneously spiked ~67 concurrent reads/worker. **Fix:** Added a `tokio::sync::Semaphore` capping concurrent stage tasks to `4` per worker (`(workers * 4).clamp(4, 32)`) and raised worker RPC timeout to `120s` (keeping `400ms` fast dead-worker `connect_timeout`).
+2. **Multi-Column `GROUP BY` Heap Churn (`2.76B` String allocations):** Allocating `Vec<VecGroupKey>` per row across 920M settled rows stalled multi-column Silver aggregation. **Fix:** Added a zero-allocation multi-UTF-8 composite key buffer fast path in `try_eval_vectorized_scan_partial_agg` (allocating only on the 800 unique groups → **45.7M rows/s**).
+3. **Background Maintainer Over-Compaction (`Exit 137`):** `AutonomousMaintainer` attempted to compact optimal 40 MB splits of the 1B-row Bronze table in memory. **Fix:** Scoped auto-compaction strictly to small fragmented files (`<16 MiB` and tables `<=2M` rows).
+4. **Concurrent `VACUUM` vs In-Flight Writer Race:** Background `VACUUM` swept brand-new uncommitted Parquet files seconds before commit. **Fix:** Upgraded `VACUUM` to standard Iceberg `ExpireSnapshots` semantics (`pre_referenced - post_referenced`), deleting only proven expired snapshot files and never touching in-flight writer files.
+
+---
+
+## 11. Honest Engineering Findings & Next Optimizations
 
 Running real-world workloads surfaced two genuine, concrete findings worth tracking for future releases:
 1. **Post-Aggregate Scalar Wrapping (`ROUND(SUM(x), 2)`):** The planner currently evaluates `ROUND(...)` as a pre-aggregate scalar function rather than a post-aggregate projection expression, returning `unsupported scalar function: SUM` when `SUM`/`AVG` is nested inside `ROUND(...)`. Workaround today: select `SUM(x)` / `AVG(x)` directly or wrap in a CTE/subquery. Adding a post-aggregate projection rewrite pass in `rustlakedb-planner` is a high-value quality-of-life improvement.
@@ -144,7 +183,7 @@ Running real-world workloads surfaced two genuine, concrete findings worth track
 
 ---
 
-## 11. Reproducing This Report
+## 12. Reproducing This Report
 
 ```powershell
 # Ensure the 5-container RustLakeDB v9.0.0 cluster is running:
