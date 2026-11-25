@@ -283,6 +283,16 @@ impl Coordinator {
         branch: &str,
         session: &SessionContext,
     ) -> Result<QueryExecutionResult> {
+        self.execute_sql_traced(sql, branch, session, None).await
+    }
+
+    pub async fn execute_sql_traced(
+        &self,
+        sql: &str,
+        branch: &str,
+        session: &SessionContext,
+        trace_id: Option<&str>,
+    ) -> Result<QueryExecutionResult> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let lower = trimmed.to_lowercase();
 
@@ -351,12 +361,38 @@ impl Coordinator {
         }
 
         let qid = Uuid::new_v4().to_string();
+        let tid = trace_id
+            .map(String::from)
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let span_id = Uuid::new_v4().simple().to_string()[..16].to_string();
+        let start_ms = security::epoch_ms();
         self.governance
             .register_active_query(&qid, &session.user, trimmed)?;
         let t0 = std::time::Instant::now();
         let res = self.execute_sql_inner(trimmed, branch, session).await;
         self.governance.finish_active_query(&qid);
         let elapsed_ms = t0.elapsed().as_millis() as u64;
+
+        let mut attrs = BTreeMap::from([
+            ("db.system".into(), "rustlakedb".into()),
+            ("db.user".into(), session.user.clone()),
+            ("db.statement".into(), trimmed.chars().take(160).collect()),
+        ]);
+        if let Ok(ref ok) = res {
+            attrs.insert("db.rows_returned".into(), ok.batch.num_rows().to_string());
+            attrs.insert("db.stages".into(), ok.stats.stages_executed.to_string());
+            attrs.insert("db.tasks".into(), ok.stats.tasks_executed.to_string());
+        }
+        self.governance.record_span(security::TraceSpan {
+            trace_id: tid,
+            span_id,
+            parent_span_id: None,
+            name: "coordinator.execute_sql".into(),
+            service: "rustlakedb-coordinator".into(),
+            start_ms,
+            duration_ms: elapsed_ms,
+            attributes: attrs,
+        });
 
         match &res {
             Ok(ok) => {
@@ -502,6 +538,7 @@ impl Coordinator {
                 table_name,
                 schema,
                 if_not_exists,
+                partition_by,
             } => {
                 if if_not_exists && self.catalog.get_table(&table_name).await.is_ok() {
                     return Ok(QueryExecutionResult {
@@ -511,7 +548,8 @@ impl Coordinator {
                         stats: QueryExecutionStats::default(),
                     });
                 }
-                let meta = IcebergTableMetadata::new(&table_name, schema);
+                let mut meta = IcebergTableMetadata::new(&table_name, schema);
+                meta.partition_by = partition_by;
                 self.catalog.create_table(meta.clone()).await?;
                 self.store.write_iceberg_metadata(&meta, "main").await?;
                 Ok(QueryExecutionResult {
@@ -1828,7 +1866,7 @@ impl Coordinator {
     ) -> Result<String> {
         let mut current = sql.to_string();
 
-        // 1a. Handle `NOT EXISTS (SELECT ...)` first so it is not matched as `EXISTS`
+        // 1a. Handle `NOT EXISTS (SELECT ...)` first (including correlated `WHERE inner.k = outer.k`)
         loop {
             let upper = current.to_uppercase();
             let Some(ex_pos) = upper.find("NOT EXISTS (SELECT ") else {
@@ -1839,11 +1877,17 @@ impl Coordinator {
                 break;
             };
             let sub_sql = current[open_paren + 1..close_paren].trim().to_string();
-            let sub_res = Box::pin(self.execute_sql_inner(&sub_sql, branch, session)).await?;
-            let replacement = if sub_res.batch.num_rows() == 0 {
-                "1 = 1"
+            let replacement = if let Some((outer_col, inner_in_sql)) =
+                try_decorrelate_exists(&current[..ex_pos], &sub_sql)
+            {
+                format!("{outer_col} NOT IN ({inner_in_sql})")
             } else {
-                "1 = 0"
+                let sub_res = Box::pin(self.execute_sql_inner(&sub_sql, branch, session)).await?;
+                if sub_res.batch.num_rows() == 0 {
+                    "1 = 1".to_string()
+                } else {
+                    "1 = 0".to_string()
+                }
             };
             current = format!(
                 "{}{}{}",
@@ -1853,7 +1897,7 @@ impl Coordinator {
             );
         }
 
-        // 1b. Handle `EXISTS (SELECT ...)`
+        // 1b. Handle `EXISTS (SELECT ...)` (including correlated `WHERE inner.k = outer.k`)
         loop {
             let upper = current.to_uppercase();
             let Some(ex_pos) = upper.find("EXISTS (SELECT ") else {
@@ -1864,11 +1908,17 @@ impl Coordinator {
                 break;
             };
             let sub_sql = current[open_paren + 1..close_paren].trim().to_string();
-            let sub_res = Box::pin(self.execute_sql_inner(&sub_sql, branch, session)).await?;
-            let replacement = if sub_res.batch.num_rows() > 0 {
-                "1 = 1"
+            let replacement = if let Some((outer_col, inner_in_sql)) =
+                try_decorrelate_exists(&current[..ex_pos], &sub_sql)
+            {
+                format!("{outer_col} IN ({inner_in_sql})")
             } else {
-                "1 = 0"
+                let sub_res = Box::pin(self.execute_sql_inner(&sub_sql, branch, session)).await?;
+                if sub_res.batch.num_rows() > 0 {
+                    "1 = 1".to_string()
+                } else {
+                    "1 = 0".to_string()
+                }
             };
             current = format!(
                 "{}{}{}",
@@ -2176,6 +2226,183 @@ impl Coordinator {
         }
 
         Ok((loaded, dlq_count))
+    }
+
+    /// Wave 13 Debezium-Compatible Streaming CDC Ingestion with Exactly-Once Offset Watermarks:
+    /// Processes `{"op": "c"|"u"|"d", "offset": N, "key_col": "id", "before": {...}, "after": {...}}`
+    /// envelopes, skips duplicate offsets (`offset <= watermark`), applies deletes/updates atomically
+    /// via Iceberg v3 Deletion Vectors, and commits new row versions in a single OCC transaction!
+    pub async fn ingest_cdc_events(
+        &self,
+        table_name: &str,
+        branch: &str,
+        stream_id: &str,
+        events: &[serde_json::Value],
+    ) -> Result<serde_json::Value> {
+        let meta = self.catalog.get_table(table_name).await?;
+        let snap = meta.current_snapshot(branch)?;
+        let watermark = self.governance.get_cdc_offset(table_name, stream_id);
+        let default_key = meta
+            .schema
+            .first()
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| "id".into());
+
+        let mut max_offset = watermark;
+        let mut skipped_duplicates = 0usize;
+        let mut applied = 0usize;
+        let mut deletes = 0usize;
+        let mut upserts = 0usize;
+        let mut keys_to_delete: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        let mut latest_upserts: BTreeMap<String, BTreeMap<String, ScalarValue>> = BTreeMap::new();
+        let mut key_order_fallback: Vec<BTreeMap<String, ScalarValue>> = Vec::new();
+
+        for ev in events {
+            let offset = ev.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            if offset > 0 && offset <= watermark {
+                skipped_duplicates += 1;
+                continue;
+            }
+            if offset > max_offset {
+                max_offset = offset;
+            }
+            let op = ev.get("op").and_then(|v| v.as_str()).unwrap_or("c");
+            let key_col = ev
+                .get("key_col")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&default_key)
+                .to_string();
+
+            let parse_obj = |obj: &serde_json::Map<String, serde_json::Value>| {
+                let mut row = BTreeMap::new();
+                for col in &meta.schema {
+                    match obj.get(&col.name) {
+                        None | Some(serde_json::Value::Null) => {
+                            row.insert(col.name.clone(), ScalarValue::Null);
+                        }
+                        Some(v) => {
+                            let sv = coerce_json_value(v, &col.data_type)
+                                .unwrap_or(ScalarValue::Null);
+                            row.insert(col.name.clone(), sv);
+                        }
+                    }
+                }
+                row
+            };
+
+            match op {
+                "d" | "D" => {
+                    let src = ev
+                        .get("before")
+                        .or_else(|| ev.get("after"))
+                        .and_then(|v| v.as_object());
+                    if let Some(obj) = src {
+                        let row = parse_obj(obj);
+                        if let Some(k) = row.get(&key_col).and_then(|v| v.to_pg_text()) {
+                            keys_to_delete.entry(key_col).or_default().insert(k.clone());
+                            latest_upserts.remove(&k);
+                            deletes += 1;
+                            applied += 1;
+                        }
+                    }
+                }
+                "u" | "U" => {
+                    if let Some(obj) = ev.get("after").and_then(|v| v.as_object()) {
+                        let row = parse_obj(obj);
+                        if let Some(k) = row.get(&key_col).and_then(|v| v.to_pg_text()) {
+                            keys_to_delete.entry(key_col).or_default().insert(k.clone());
+                            latest_upserts.insert(k, row);
+                            upserts += 1;
+                            applied += 1;
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(obj) = ev.get("after").and_then(|v| v.as_object()) {
+                        let row = parse_obj(obj);
+                        if let Some(k) = row.get(&key_col).and_then(|v| v.to_pg_text()) {
+                            latest_upserts.insert(k, row);
+                        } else {
+                            key_order_fallback.push(row);
+                        }
+                        upserts += 1;
+                        applied += 1;
+                    }
+                }
+            }
+        }
+
+        // Apply Iceberg v3 Deletion Vectors for updated/deleted keys in existing Parquet files
+        if !keys_to_delete.is_empty() {
+            for df in &snap.data_files {
+                let mut dv = self.store.read_deletion_vector(&df.file_path).await?;
+                let file_batch = self
+                    .store
+                    .read_data_file(&df.file_path, &meta.schema, None)
+                    .await?;
+                let mut phys_idx: u32 = 0;
+                let mut changed = false;
+                for row in &file_batch.rows {
+                    while dv.contains(phys_idx) {
+                        phys_idx += 1;
+                    }
+                    let should_del = keys_to_delete.iter().any(|(kcol, kset)| {
+                        row.get(kcol)
+                            .and_then(|v| v.to_pg_text())
+                            .is_some_and(|kv| kset.contains(&kv))
+                    });
+                    if should_del {
+                        dv.insert(phys_idx);
+                        changed = true;
+                    }
+                    phys_idx += 1;
+                }
+                if changed {
+                    self.store.write_deletion_vector(&df.file_path, &dv).await?;
+                }
+            }
+        }
+
+        let mut rows_to_write: Vec<BTreeMap<String, ScalarValue>> =
+            latest_upserts.into_values().collect();
+        rows_to_write.extend(key_order_fallback);
+
+        if !rows_to_write.is_empty() {
+            let cols: Vec<String> = meta.schema.iter().map(|f| f.name.clone()).collect();
+            let batch = RowBatch::new(cols, rows_to_write);
+            let path = format!("{table_name}/data/cdc-{}.parquet", Uuid::new_v4());
+            let entry = self
+                .store
+                .write_data_file(&path, &meta.schema, &batch)
+                .await?;
+            self.catalog
+                .commit_table(TableCommitProposal {
+                    table_name: table_name.to_string(),
+                    branch: branch.to_string(),
+                    expected_snapshot_id: snap.snapshot_id,
+                    added_files: vec![entry],
+                    removed_files: vec![],
+                    is_append_only: keys_to_delete.is_empty(),
+                })
+                .await?;
+            let updated = self.catalog.get_table(table_name).await?;
+            self.store.write_iceberg_metadata(&updated, branch).await?;
+        }
+
+        if max_offset > watermark {
+            self.governance
+                .set_cdc_offset(table_name, stream_id, max_offset);
+        }
+
+        Ok(serde_json::json!({
+            "table": table_name,
+            "stream_id": stream_id,
+            "applied": applied,
+            "upserts": upserts,
+            "deletes": deletes,
+            "skipped_duplicates": skipped_duplicates,
+            "last_offset": max_offset
+        }))
     }
 
     async fn ingest_csv(
@@ -2648,6 +2875,9 @@ fn contains_hash_join(node: &PhysicalNode) -> bool {
         | PhysicalNode::Window { input, .. }
         | PhysicalNode::Exchange { input, .. } => contains_hash_join(input),
         PhysicalNode::UnionAll { inputs, .. } => inputs.iter().any(contains_hash_join),
+        PhysicalNode::SetOp { left, right, .. } => {
+            contains_hash_join(left) || contains_hash_join(right)
+        }
         _ => false,
     }
 }
@@ -2664,7 +2894,8 @@ fn collect_leaf_splits(node: &PhysicalNode) -> Vec<IcebergSplit> {
         | PhysicalNode::HashAggregate { input, .. }
         | PhysicalNode::Window { input, .. }
         | PhysicalNode::Exchange { input, .. } => collect_leaf_splits(input),
-        PhysicalNode::HashJoin { left, right, .. } => {
+        PhysicalNode::HashJoin { left, right, .. }
+        | PhysicalNode::SetOp { left, right, .. } => {
             let mut s = collect_leaf_splits(left);
             s.extend(collect_leaf_splits(right));
             s
@@ -2693,7 +2924,8 @@ fn collect_dag_tables(dag: &StageDag) -> Vec<String> {
             | PhysicalNode::HashAggregate { input, .. }
             | PhysicalNode::Window { input, .. }
             | PhysicalNode::Exchange { input, .. } => walk(input, out),
-            PhysicalNode::HashJoin { left, right, .. } => {
+            PhysicalNode::HashJoin { left, right, .. }
+            | PhysicalNode::SetOp { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);
             }
@@ -2744,7 +2976,8 @@ fn inject_rls_into_dag(dag: &mut StageDag, session: &SessionContext, gov: &Gover
             | PhysicalNode::HashAggregate { input, .. }
             | PhysicalNode::Window { input, .. }
             | PhysicalNode::Exchange { input, .. } => walk(input, session, gov),
-            PhysicalNode::HashJoin { left, right, .. } => {
+            PhysicalNode::HashJoin { left, right, .. }
+            | PhysicalNode::SetOp { left, right, .. } => {
                 walk(left, session, gov);
                 walk(right, session, gov);
             }
@@ -2847,7 +3080,8 @@ fn track_hot_json_paths_in_dag(dag: &StageDag, gov: &GovernanceState) {
             | PhysicalNode::TopN { input, .. }
             | PhysicalNode::Window { input, .. }
             | PhysicalNode::Exchange { input, .. } => walk_node(input, table, gov),
-            PhysicalNode::HashJoin { left, right, .. } => {
+            PhysicalNode::HashJoin { left, right, .. }
+            | PhysicalNode::SetOp { left, right, .. } => {
                 walk_node(left, table, gov);
                 walk_node(right, table, gov);
             }
@@ -2953,6 +3187,80 @@ fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Wave 12 Correlated `EXISTS` / `NOT EXISTS` Decorrelator:
+/// Rewrites `EXISTS (SELECT 1 FROM inner i WHERE i.fk = outer.pk [AND extra])` into
+/// `(outer.pk, "SELECT i.fk FROM inner i [WHERE extra]")` so it executes via distributed semi-join!
+fn try_decorrelate_exists(outer_prefix: &str, sub_sql: &str) -> Option<(String, String)> {
+    let outer_upper = outer_prefix.to_uppercase();
+    let from_pos = outer_upper.rfind(" FROM ")?;
+    let after_from = outer_prefix[from_pos + 6..].trim();
+    let outer_tokens: Vec<&str> = after_from.split_whitespace().collect();
+    if outer_tokens.is_empty() {
+        return None;
+    }
+    let outer_table = outer_tokens[0].trim_matches('"');
+    let outer_alias = if outer_tokens.len() >= 3 && outer_tokens[1].eq_ignore_ascii_case("AS") {
+        outer_tokens[2].trim_matches('"')
+    } else if outer_tokens.len() >= 2
+        && !outer_tokens[1].eq_ignore_ascii_case("WHERE")
+        && !outer_tokens[1].eq_ignore_ascii_case("JOIN")
+    {
+        outer_tokens[1].trim_matches('"')
+    } else {
+        outer_table
+    };
+
+    let sub_upper = sub_sql.to_uppercase();
+    let sub_from_pos = sub_upper.find(" FROM ")?;
+    let sub_where_pos = sub_upper.find(" WHERE ")?;
+    let from_clause = sub_sql[sub_from_pos + 6..sub_where_pos].trim();
+    let where_clause = sub_sql[sub_where_pos + 7..].trim();
+
+    let outer_dot = format!("{outer_alias}.");
+    let outer_tbl_dot = format!("{outer_table}.");
+    if !where_clause.contains(&outer_dot) && !where_clause.contains(&outer_tbl_dot) {
+        return None;
+    }
+
+    // Split top-level AND conjuncts inside the correlated WHERE clause
+    let conjuncts: Vec<&str> = where_clause.split(" AND ").collect();
+    let mut corr_outer_col: Option<String> = None;
+    let mut corr_inner_col: Option<String> = None;
+    let mut remaining = Vec::new();
+    for part in conjuncts {
+        let trimmed = part.trim();
+        if corr_outer_col.is_none()
+            && let Some((lhs, rhs)) = trimmed.split_once('=')
+        {
+            let l = lhs.trim();
+            let r = rhs.trim();
+            if l.starts_with(&outer_dot) || l.starts_with(&outer_tbl_dot) {
+                corr_outer_col = Some(l.to_string());
+                corr_inner_col = Some(r.to_string());
+                continue;
+            }
+            if r.starts_with(&outer_dot) || r.starts_with(&outer_tbl_dot) {
+                corr_outer_col = Some(r.to_string());
+                corr_inner_col = Some(l.to_string());
+                continue;
+            }
+        }
+        remaining.push(trimmed);
+    }
+
+    let outer_col = corr_outer_col?;
+    let inner_col = corr_inner_col?;
+    let rebuilt = if remaining.is_empty() {
+        format!("SELECT {inner_col} FROM {from_clause}")
+    } else {
+        format!(
+            "SELECT {inner_col} FROM {from_clause} WHERE {}",
+            remaining.join(" AND ")
+        )
+    };
+    Some((outer_col, rebuilt))
 }
 
 fn extract_primary_from_table(sql: &str) -> Option<String> {

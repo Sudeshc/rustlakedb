@@ -58,6 +58,8 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
         .route("/v1/sql", post(sql_json))
         .route("/v1/sql/arrow", post(sql_arrow))
         .route("/v1/ingest/{table}", post(ingest_ndjson_http))
+        .route("/v1/cdc/{table}", post(ingest_cdc_http))
+        .route("/v1/traces", get(get_traces_http))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(coord)
         .merge(iceberg_rest)
@@ -127,6 +129,61 @@ fn resolve_http_session(
     Ok(SessionContext::for_user(fallback_user))
 }
 
+#[derive(Deserialize)]
+struct CdcQuery {
+    #[serde(default = "default_branch")]
+    branch: String,
+    #[serde(default = "default_stream")]
+    stream_id: String,
+}
+
+fn default_stream() -> String {
+    "default".into()
+}
+
+async fn ingest_cdc_http(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Path(table): Path<String>,
+    Query(q): Query<CdcQuery>,
+    Json(payload): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(e) = resolve_http_session(&coord, &headers, "postgres") {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e })));
+    }
+    let events: Vec<Value> = match payload {
+        Value::Array(arr) => arr,
+        Value::Object(ref map) if map.contains_key("events") => map["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        single => vec![single],
+    };
+    match coord
+        .ingest_cdc_events(&table, &q.branch, &q.stream_id, &events)
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn get_traces_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    let spans = coord.governance.traces_snapshot();
+    Json(json!({
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [{ "key": "service.name", "value": { "stringValue": "rustlakedb" } }]
+            },
+            "scopeSpans": [{ "spans": spans }]
+        }],
+        "spans": spans
+    }))
+}
+
 async fn sql_json(
     State(coord): State<Arc<Coordinator>>,
     headers: HeaderMap,
@@ -136,9 +193,15 @@ async fn sql_json(
         Ok(s) => s,
         Err(e) => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))),
     };
+    let trace_id = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|tp| tp.split('-').nth(1))
+        .filter(|s| s.len() >= 16)
+        .map(String::from);
     let t0 = std::time::Instant::now();
     match coord
-        .execute_sql_with_session(&req.sql, &req.branch, &session)
+        .execute_sql_traced(&req.sql, &req.branch, &session, trace_id.as_deref())
         .await
     {
         Ok(res) => {

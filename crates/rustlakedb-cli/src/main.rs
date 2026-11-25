@@ -42,9 +42,13 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     workers: usize,
 
-    /// Persistent root directory for Iceberg v3 Parquet, Puffin indexes, and crash-safe Catalog.
+    /// Persistent root directory for local Raft WAL, catalog metadata, and NVMe shuffle scratch.
     #[arg(long, default_value = "./rustlakedb_data")]
     data_dir: PathBuf,
+
+    /// Optional cloud/object-store URI for Iceberg v3 Parquet/Puffin/Avro files (`s3://bucket`, `gs://bucket`, `az://container`, `file:///path`). Defaults to `--data-dir`.
+    #[arg(long)]
+    storage_uri: Option<String>,
 
     /// Shared directory for staged shuffle exchange files (or local NVMe scratch).
     #[arg(long)]
@@ -69,6 +73,10 @@ struct Args {
     /// Optional Coordinator Control Plane URL for dynamic worker self-registration (`--mode worker`).
     #[arg(long)]
     coordinator_url: Option<String>,
+
+    /// Comma-separated Coordinator Control Plane URLs for zero-touch HA failover (`--mode worker`, e.g. `http://coord-1:8181,http://coord-2:8181,http://coord-3:8181`).
+    #[arg(long)]
+    coordinator_urls: Option<String>,
 
     /// Optional Raft node ID (`1`, `2`, `3`) to join a Multi-Node HA Coordinator Raft Quorum.
     #[arg(long)]
@@ -139,7 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Arc::new(InMemoryRaftCatalog::open(&args.data_dir)?)
     };
-    let store = Arc::new(IcebergObjectStore::from_uri(&args.data_dir.to_string_lossy())?);
+    let storage_uri = args
+        .storage_uri
+        .clone()
+        .unwrap_or_else(|| args.data_dir.to_string_lossy().to_string());
+    let store = Arc::new(IcebergObjectStore::from_uri(&storage_uri)?);
     let shuffle_dir = args
         .shuffle_dir
         .clone()
@@ -183,20 +195,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .clone()
                 .unwrap_or_else(|| format!("http://{bound}"));
             shuffle_mgr.set_advertise_url(&adv);
-            // Optional Wave 7 dynamic worker self-registration + periodic heartbeat loop!
-            if let Some(ref coord_url) = args.coordinator_url {
-                let reg_url = format!("{}/v1/workers/register", coord_url.trim_end_matches('/'));
+            // Wave 7 + Wave 11 zero-touch HA multi-coordinator worker self-registration & heartbeat broadcast!
+            let mut coord_targets: Vec<String> = Vec::new();
+            if let Some(ref single) = args.coordinator_url {
+                for u in single.split(',').filter(|s| !s.trim().is_empty()) {
+                    coord_targets.push(u.trim().trim_end_matches('/').to_string());
+                }
+            }
+            if let Some(ref multi) = args.coordinator_urls {
+                for u in multi.split(',').filter(|s| !s.trim().is_empty()) {
+                    let clean = u.trim().trim_end_matches('/').to_string();
+                    if !coord_targets.contains(&clean) {
+                        coord_targets.push(clean);
+                    }
+                }
+            }
+            if !coord_targets.is_empty() {
                 let wid = args.worker_id.clone();
                 let adv_clone = adv.clone();
                 tokio::spawn(async move {
-                    let client = reqwest::Client::new();
+                    let client = reqwest::Client::builder()
+                        .connect_timeout(std::time::Duration::from_millis(500))
+                        .timeout(std::time::Duration::from_secs(2))
+                        .build()
+                        .unwrap_or_else(|_| reqwest::Client::new());
                     loop {
-                        let _ = client
-                            .post(&reg_url)
-                            .json(&serde_json::json!({ "worker_id": wid, "url": adv_clone }))
-                            .send()
-                            .await;
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        for base in &coord_targets {
+                            let reg_url = format!("{base}/v1/workers/register");
+                            let _ = client
+                                .post(&reg_url)
+                                .json(&serde_json::json!({ "worker_id": wid, "url": adv_clone }))
+                                .send()
+                                .await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 });
             }

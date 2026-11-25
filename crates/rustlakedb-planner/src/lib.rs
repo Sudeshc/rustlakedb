@@ -7,14 +7,14 @@ use rustlakedb_catalog::{
 use rustlakedb_common::{QueryId, Result, RustLakeError};
 use rustlakedb_protocol::{
     AggExpr, AggFunc, ArithOp, ColumnExpr, Distribution, FilterExpr, JoinType, MathFunc,
-    Partitioning, PhysicalNode, QueryStage, RowBatch, ScalarValue, ShuffleMode, SortKey, StageDag,
-    StringFunc, VectorMetric, WindowFunc, WindowSpec,
+    Partitioning, PhysicalNode, QueryStage, RowBatch, ScalarValue, SetOpKind, ShuffleMode, SortKey,
+    StageDag, StringFunc, VectorMetric, WindowFunc, WindowSpec,
 };
 use sqlparser::ast::{
-    AlterTableOperation, BinaryOperator, DataType as SqlDataType, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, ObjectType, OrderByExpr,
-    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, UnaryOperator, Value,
-    WindowType,
+    AlterTableOperation, BinaryOperator, DataType as SqlDataType, DuplicateTreatment, Expr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, ObjectType,
+    OrderByExpr, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    UnaryOperator, Value, WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -57,6 +57,7 @@ pub enum PlannedCommand {
         table_name: String,
         schema: Vec<FieldSchema>,
         if_not_exists: bool,
+        partition_by: Vec<String>,
     },
     CreateTableAs {
         table_name: String,
@@ -427,8 +428,11 @@ impl DistributedPlanner {
             ));
         }
 
+        // Support Iceberg Hidden Partitioning syntax (`CREATE TABLE t (...) PARTITION BY (region, days(ts))`, Wave 12).
+        let (sql_no_part, table_partition_by) = extract_create_table_partition_by(trimmed);
+
         // Support `SELECT ... FROM <table> AT VERSION <snap_id> ...` Iceberg Time Travel syntax!
-        let (normalized_sql, time_travel_version) = extract_time_travel_clause(trimmed)?;
+        let (normalized_sql, time_travel_version) = extract_time_travel_clause(&sql_no_part)?;
 
         let dialect = PostgreSqlDialect {};
         let stmts = Parser::parse_sql(&dialect, &normalized_sql)
@@ -493,6 +497,7 @@ impl DistributedPlanner {
                     table_name,
                     schema,
                     if_not_exists: ct.if_not_exists,
+                    partition_by: table_partition_by,
                 })
             }
             Statement::Drop {
@@ -770,11 +775,14 @@ impl DistributedPlanner {
             let select = match *query.body {
                 SetExpr::Select(s) => *s,
                 SetExpr::SetOperation {
-                    op: SetOperator::Union,
+                    op,
                     set_quantifier,
                     left,
                     right,
-                } => {
+                } if matches!(
+                    op,
+                    SetOperator::Union | SetOperator::Intersect | SetOperator::Except
+                ) => {
                     let distinct = !matches!(set_quantifier, SetQuantifier::All);
                     let left_q = sqlparser::ast::Query {
                         with: None,
@@ -810,9 +818,23 @@ impl DistributedPlanner {
                         .await?;
                     cbo_notes.extend(lnotes);
                     cbo_notes.extend(rnotes);
-                    let mut node = PhysicalNode::UnionAll {
-                        inputs: vec![lnode, rnode],
-                        distinct,
+                    let mut node = match op {
+                        SetOperator::Union => PhysicalNode::UnionAll {
+                            inputs: vec![lnode, rnode],
+                            distinct,
+                        },
+                        SetOperator::Intersect => PhysicalNode::SetOp {
+                            op: SetOpKind::Intersect,
+                            left: Box::new(lnode),
+                            right: Box::new(rnode),
+                            distinct,
+                        },
+                        SetOperator::Except => PhysicalNode::SetOp {
+                            op: SetOpKind::Except,
+                            left: Box::new(lnode),
+                            right: Box::new(rnode),
+                            distinct,
+                        },
                     };
                     if !order_keys.is_empty() {
                         node = PhysicalNode::Sort {
@@ -831,7 +853,7 @@ impl DistributedPlanner {
                 }
                 _ => {
                     return Err(RustLakeError::Plan(
-                        "only SELECT and UNION/UNION ALL query bodies supported".into(),
+                        "only SELECT, UNION, INTERSECT, and EXCEPT query bodies supported".into(),
                     ))
                 }
             };
@@ -857,6 +879,21 @@ impl DistributedPlanner {
                     Some(v) => left_meta.splits_at_version(v)?,
                     None => left_meta.splits(branch)?,
                 };
+                if let Ok(snap) = left_meta.current_snapshot(branch) {
+                    let est_rows: u64 = snap.data_files.iter().map(|f| f.row_count).sum();
+                    let ndv_cols: usize = snap
+                        .data_files
+                        .iter()
+                        .flat_map(|f| f.ndv_estimates.keys())
+                        .collect::<HashSet<_>>()
+                        .len();
+                    if est_rows > 0 && (ndv_cols > 0 || !left_meta.partition_by.is_empty()) {
+                        cbo_notes.push(format!(
+                            "CBO: stats({left_table_name} rows={est_rows}, ndv_cols={ndv_cols}, partition_by={:?})",
+                            left_meta.partition_by
+                        ));
+                    }
+                }
                 let bytes: u64 = left_splits.iter().map(|s| s.estimated_bytes).sum();
                 let scan = PhysicalNode::IcebergScan {
                     table_name: left_table_name.clone(),
@@ -1393,6 +1430,39 @@ impl DistributedPlanner {
                     distinct,
                 }
             }
+            PhysicalNode::SetOp {
+                op,
+                left,
+                right,
+                distinct,
+            } => {
+                let lc = self.ensure_requirements(*left);
+                let rc = self.ensure_requirements(*right);
+                let al = if Distribution::SinglePartition.satisfied_by(&lc.output_partitioning()) {
+                    lc
+                } else {
+                    PhysicalNode::Exchange {
+                        input: Box::new(lc),
+                        target_partitioning: Partitioning::Single,
+                        mode: self.config.shuffle_mode,
+                    }
+                };
+                let ar = if Distribution::SinglePartition.satisfied_by(&rc.output_partitioning()) {
+                    rc
+                } else {
+                    PhysicalNode::Exchange {
+                        input: Box::new(rc),
+                        target_partitioning: Partitioning::Single,
+                        mode: self.config.shuffle_mode,
+                    }
+                };
+                PhysicalNode::SetOp {
+                    op,
+                    left: Box::new(al),
+                    right: Box::new(ar),
+                    distinct,
+                }
+            }
             PhysicalNode::Exchange {
                 input,
                 target_partitioning,
@@ -1674,6 +1744,25 @@ impl DistributedPlanner {
                         all_deps,
                     )
                 }
+                PhysicalNode::SetOp {
+                    op,
+                    left,
+                    right,
+                    distinct,
+                } => {
+                    let (lp, mut ldeps) = cut_rec(*left, stages, next_stage_id);
+                    let (rp, rdeps) = cut_rec(*right, stages, next_stage_id);
+                    ldeps.extend(rdeps);
+                    (
+                        PhysicalNode::SetOp {
+                            op,
+                            left: Box::new(lp),
+                            right: Box::new(rp),
+                            distinct,
+                        },
+                        ldeps,
+                    )
+                }
                 leaf => (leaf, vec![]),
             }
         }
@@ -1700,6 +1789,27 @@ impl DistributedPlanner {
 }
 
 /// Extracts optional `AT VERSION <snapshot_id>` Iceberg Time Travel clause from a SQL query.
+fn extract_create_table_partition_by(sql: &str) -> (String, Vec<String>) {
+    let upper = sql.to_uppercase();
+    if !upper.starts_with("CREATE TABLE ") {
+        return (sql.to_string(), vec![]);
+    }
+    let Some(pos) = upper.rfind(" PARTITION BY ") else {
+        return (sql.to_string(), vec![]);
+    };
+    let before = sql[..pos].trim().to_string();
+    let tail = sql[pos + " PARTITION BY ".len()..]
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    let parts: Vec<String> = tail
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (before, parts)
+}
+
 fn extract_time_travel_clause(sql: &str) -> Result<(String, Option<u64>)> {
     let upper = sql.to_uppercase();
     if let Some(pos) = upper.find(" AT VERSION ") {
@@ -2253,15 +2363,28 @@ fn try_parse_agg(expr: &Expr, alias: Option<String>) -> Result<Option<AggExpr>> 
         return Ok(None);
     }
     let name = func.name.to_string().to_uppercase();
-    let args = match &func.args {
-        FunctionArguments::List(list) => &list.args,
+    let (args, is_distinct) = match &func.args {
+        FunctionArguments::List(list) => (
+            &list.args,
+            matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)),
+        ),
         _ => return Ok(None),
     };
     match name.as_str() {
-        "COUNT" => Ok(Some(AggExpr {
-            func: AggFunc::Count,
-            alias: alias.unwrap_or_else(|| "count".into()),
-        })),
+        "COUNT" => {
+            if is_distinct {
+                let col = extract_fn_arg_ident(args.first())?;
+                Ok(Some(AggExpr {
+                    func: AggFunc::CountDistinct(col.clone()),
+                    alias: alias.unwrap_or_else(|| format!("count_distinct_{col}")),
+                }))
+            } else {
+                Ok(Some(AggExpr {
+                    func: AggFunc::Count,
+                    alias: alias.unwrap_or_else(|| "count".into()),
+                }))
+            }
+        }
         "SUM" => {
             let col = extract_fn_arg_ident(args.first())?;
             Ok(Some(AggExpr {
@@ -2365,7 +2488,8 @@ fn push_projections_to_scans(
                 for a in &aggs {
                     match &a.func {
                         AggFunc::Count => {}
-                        AggFunc::Sum(c)
+                        AggFunc::CountDistinct(c)
+                        | AggFunc::Sum(c)
                         | AggFunc::Avg(c)
                         | AggFunc::Min(c)
                         | AggFunc::Max(c) => {
@@ -2517,6 +2641,17 @@ fn push_projections_to_scans(
                 .into_iter()
                 .map(|inp| push_projections_to_scans(inp, required.clone()))
                 .collect(),
+            distinct,
+        },
+        PhysicalNode::SetOp {
+            op,
+            left,
+            right,
+            distinct,
+        } => PhysicalNode::SetOp {
+            op,
+            left: Box::new(push_projections_to_scans(*left, required.clone())),
+            right: Box::new(push_projections_to_scans(*right, required)),
             distinct,
         },
         other @ PhysicalNode::ShuffleRead { .. } => other,

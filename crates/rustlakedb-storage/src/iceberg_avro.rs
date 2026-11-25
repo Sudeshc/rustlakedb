@@ -247,6 +247,135 @@ pub fn parse_and_verify_avro_ocf(bytes: &[u8]) -> Result<AvroOcfSummary> {
     })
 }
 
+/// Decoded Iceberg v3 Avro `manifest_entry` record for independent interop verification (Wave 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedManifestEntry {
+    pub status: i32,
+    pub snapshot_id: Option<i64>,
+    pub file_path: String,
+    pub file_format: String,
+    pub record_count: i64,
+    pub file_size_in_bytes: i64,
+}
+
+/// Decoded Iceberg v3 Avro `manifest_file` record from a Manifest List (`snap-*.avro`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedManifestListEntry {
+    pub manifest_path: String,
+    pub manifest_length: i64,
+    pub added_snapshot_id: i64,
+    pub added_files_count: i32,
+    pub added_rows_count: i64,
+}
+
+fn avro_ocf_block_slice(bytes: &[u8]) -> Result<(i64, &[u8])> {
+    if bytes.len() < 4 || &bytes[..4] != AVRO_MAGIC {
+        return Err(RustLakeError::Execution("missing Avro OCF magic".into()));
+    }
+    let mut pos = 4usize;
+    loop {
+        let count = read_avro_long(bytes, &mut pos)?;
+        if count == 0 {
+            break;
+        }
+        let entries = if count < 0 {
+            let _ = read_avro_long(bytes, &mut pos)?;
+            -count
+        } else {
+            count
+        };
+        for _ in 0..entries {
+            let _ = read_avro_string(bytes, &mut pos)?;
+            let _ = read_avro_bytes(bytes, &mut pos)?;
+        }
+    }
+    if pos + 16 > bytes.len() {
+        return Err(RustLakeError::Execution("truncated Avro sync marker".into()));
+    }
+    let sync = &bytes[pos..pos + 16];
+    pos += 16;
+    if pos >= bytes.len() {
+        return Ok((0, &[]));
+    }
+    let rc = read_avro_long(bytes, &mut pos)?;
+    let bl = read_avro_long(bytes, &mut pos)? as usize;
+    let end = pos + bl;
+    if end + 16 > bytes.len() || &bytes[end..end + 16] != sync {
+        return Err(RustLakeError::Execution("Avro trailing sync mismatch".into()));
+    }
+    Ok((rc, &bytes[pos..end]))
+}
+
+/// Fully decodes all `manifest_entry` records from an Apache Iceberg v3 Avro Manifest OCF file.
+pub fn decode_iceberg_v3_manifest_entries(bytes: &[u8]) -> Result<Vec<DecodedManifestEntry>> {
+    let (rc, block) = avro_ocf_block_slice(bytes)?;
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(rc as usize);
+    for _ in 0..rc {
+        let status = read_avro_long(block, &mut pos)? as i32;
+        let snap_tag = read_avro_long(block, &mut pos)?;
+        let snapshot_id = if snap_tag == 1 {
+            Some(read_avro_long(block, &mut pos)?)
+        } else {
+            None
+        };
+        let seq_tag = read_avro_long(block, &mut pos)?;
+        if seq_tag == 1 {
+            let _ = read_avro_long(block, &mut pos)?;
+        }
+        let fseq_tag = read_avro_long(block, &mut pos)?;
+        if fseq_tag == 1 {
+            let _ = read_avro_long(block, &mut pos)?;
+        }
+        let _content = read_avro_long(block, &mut pos)?;
+        let file_path = read_avro_string(block, &mut pos)?;
+        let file_format = read_avro_string(block, &mut pos)?;
+        let record_count = read_avro_long(block, &mut pos)?;
+        let file_size_in_bytes = read_avro_long(block, &mut pos)?;
+        out.push(DecodedManifestEntry {
+            status,
+            snapshot_id,
+            file_path,
+            file_format,
+            record_count,
+            file_size_in_bytes,
+        });
+    }
+    Ok(out)
+}
+
+/// Fully decodes all `manifest_file` records from an Apache Iceberg v3 Avro Manifest List OCF file.
+pub fn decode_iceberg_v3_manifest_list_entries(
+    bytes: &[u8],
+) -> Result<Vec<DecodedManifestListEntry>> {
+    let (rc, block) = avro_ocf_block_slice(bytes)?;
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(rc as usize);
+    for _ in 0..rc {
+        let manifest_path = read_avro_string(block, &mut pos)?;
+        let manifest_length = read_avro_long(block, &mut pos)?;
+        let _partition_spec_id = read_avro_long(block, &mut pos)?;
+        let _content = read_avro_long(block, &mut pos)?;
+        let _seq = read_avro_long(block, &mut pos)?;
+        let _min_seq = read_avro_long(block, &mut pos)?;
+        let added_snapshot_id = read_avro_long(block, &mut pos)?;
+        let added_files_count = read_avro_long(block, &mut pos)? as i32;
+        let _existing_files = read_avro_long(block, &mut pos)?;
+        let _deleted_files = read_avro_long(block, &mut pos)?;
+        let added_rows_count = read_avro_long(block, &mut pos)?;
+        let _existing_rows = read_avro_long(block, &mut pos)?;
+        let _deleted_rows = read_avro_long(block, &mut pos)?;
+        out.push(DecodedManifestListEntry {
+            manifest_path,
+            manifest_length,
+            added_snapshot_id,
+            added_files_count,
+            added_rows_count,
+        });
+    }
+    Ok(out)
+}
+
 fn write_avro_int(buf: &mut Vec<u8>, v: i32) {
     write_avro_long(buf, v as i64);
 }

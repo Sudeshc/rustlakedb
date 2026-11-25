@@ -11,7 +11,7 @@ env:
 
 jobs:
   lint-and-test:
-    name: Clippy + Full Regression Suite (Waves 1-10)
+    name: Clippy + Full Regression Suite (Waves 1-13 & TPC-H)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +21,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Strict Clippy Check (-D warnings)
         run: cargo clippy --all-targets -- -D warnings
-      - name: Build CLI binary
+      - name: Build CLI binary (with Cloud S3/GCS/Azure support)
         run: cargo build --bin rustlakedb
-      - name: Run Full Automated Regression Suite (55+ tests)
+      - name: Run Full Automated Regression Suite (63 tests + TPC-H)
         run: cargo test --workspace
       - name: Verify Cloud Object-Store Feature Flag (S3/GCS/Azure)
         run: cargo check -p rustlakedb-storage --features cloud
@@ -34,5 +34,5 @@ jobs:
     needs: lint-and-test
     steps:
       - uses: actions/checkout@v4
-      - name: Build RustLakeDB v2.0.0 Docker Image
-        run: docker build -t rustlakedb:2.0.0 .
+      - name: Build RustLakeDB v3.0.0 Docker Image
+        run: docker build -t rustlakedb:3.0.0 .

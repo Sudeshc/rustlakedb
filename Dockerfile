@@ -1,4 +1,4 @@
-# Multi-stage cloud-anywhere build for RustLakeDB v2.0.0 (AWS / GCP / Azure / On-Prem)
+# Multi-stage cloud-anywhere build for RustLakeDB v3.0.0 (AWS S3 / GCP GCS / Azure / On-Prem)
 FROM rust:1-bookworm AS builder
 WORKDIR /usr/src/rustlakedb
 COPY Cargo.toml Cargo.lock README.md ./

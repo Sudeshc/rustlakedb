@@ -318,10 +318,18 @@ pub enum FilterExpr {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggFunc {
     Count,
+    CountDistinct(String),
     Sum(String),
     Avg(String),
     Min(String),
     Max(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +415,12 @@ pub enum PhysicalNode {
         inputs: Vec<PhysicalNode>,
         distinct: bool,
     },
+    SetOp {
+        op: SetOpKind,
+        left: Box<PhysicalNode>,
+        right: Box<PhysicalNode>,
+        distinct: bool,
+    },
     Exchange {
         input: Box<PhysicalNode>,
         target_partitioning: Partitioning,
@@ -432,7 +446,8 @@ impl PhysicalNode {
             | PhysicalNode::Sort { .. }
             | PhysicalNode::Limit { .. }
             | PhysicalNode::Window { .. }
-            | PhysicalNode::UnionAll { .. } => Partitioning::Single,
+            | PhysicalNode::UnionAll { .. }
+            | PhysicalNode::SetOp { .. } => Partitioning::Single,
             PhysicalNode::TopN {
                 input, is_partial, ..
             } => {

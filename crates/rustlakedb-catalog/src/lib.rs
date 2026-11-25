@@ -165,6 +165,9 @@ pub struct IcebergTableMetadata {
     /// Liquid / Hilbert multi-column clustering keys (`ALTER TABLE ... CLUSTER BY`, Wave 4).
     #[serde(default)]
     pub cluster_by: Vec<String>,
+    /// Iceberg Hidden Partitioning spec expressions (`CREATE TABLE ... PARTITION BY (...)`, Wave 12).
+    #[serde(default)]
+    pub partition_by: Vec<String>,
 }
 
 impl IcebergTableMetadata {
@@ -189,6 +192,7 @@ impl IcebergTableMetadata {
             refs,
             next_snapshot_id: 2,
             cluster_by: Vec::new(),
+            partition_by: Vec::new(),
         }
     }
 

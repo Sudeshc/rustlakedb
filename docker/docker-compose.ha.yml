@@ -79,8 +79,8 @@ services:
       - "0.0.0.0:7001"
       - "--advertise-url"
       - "http://worker-auto-1:7001"
-      - "--coordinator-url"
-      - "http://coord-1:8181"
+      - "--coordinator-urls"
+      - "http://coord-1:8181,http://coord-2:8181,http://coord-3:8181"
       - "--data-dir"
       - "/warehouse"
     volumes:
@@ -98,8 +98,8 @@ services:
       - "0.0.0.0:7002"
       - "--advertise-url"
       - "http://worker-auto-2:7002"
-      - "--coordinator-url"
-      - "http://coord-1:8181"
+      - "--coordinator-urls"
+      - "http://coord-1:8181,http://coord-2:8181,http://coord-3:8181"
       - "--data-dir"
       - "/warehouse"
     volumes:

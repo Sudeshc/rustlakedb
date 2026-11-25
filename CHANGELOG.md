@@ -2,6 +2,24 @@
 
 All notable changes to **RustLakeDB** are documented in this file.
 
+## [3.0.0] - 2026-11-24 — Hyperscale Cloud, Vectorized Spill, Streaming CDC & TPC-H Release (Waves 11–13)
+
+### Wave 13 — Debezium CDC Streaming, OpenTelemetry Tracing & TPC-H Analytical Suite
+- **Debezium-Compatible Streaming CDC (`POST /v1/cdc/{table}`):** Processes `op: "c" | "u" | "d"` event batches with **exactly-once offset watermarks**, atomic Iceberg v3 Deletion Vectors for updates/deletes, and single-snapshot OCC commits.
+- **OpenTelemetry-Compatible Distributed Tracing (`GET /v1/traces`):** Propagates W3C `traceparent` headers through Coordinator execution and exports structured OTLP-compatible spans.
+- **Automated TPC-H Analytical Benchmark Suite:** Executes canonical TPC-H multi-table queries (Q1, Q3, Q5, Q6, Q10, Q12) over distributed Zstd Parquet splits (`.\scripts\run-tests.ps1 -Suite tpch`).
+
+### Wave 12 — Deep Vectorized Arrow Engine, External NVMe Spilling & Rich Analytics SQL
+- **Vectorized Arrow Filtered Scan & Multi-Column Vectorized Top-N:** Evaluates predicates and arbitrary multi-key `ORDER BY k1, k2, ... LIMIT N` directly over columnar Arrow slices without materializing rejected rows.
+- **MemoryPool-Governed External NVMe Spill for Sort & Hash-Aggregate:** Extends Grace Hash Join spilling with Zstd-compressed External Merge-Sort and External Hash-Aggregate spilling under tight RAM budgets.
+- **Rich SQL & Iceberg Partitioning:** Added distributed `COUNT(DISTINCT col)`, `INTERSECT` & `EXCEPT`, correlated `EXISTS`/`NOT EXISTS` decorrelation, `CREATE TABLE ... PARTITION BY (...)`, statistics-driven NDV CBO notes, and PGWire `$1`/`$2` bind parameter verification.
+
+### Wave 11 — Zero-Touch HA Failover, Raft WAL Snapshotting, Cloud S3 CLI & Iceberg v3 Interop
+- **Zero-Touch Multi-Coordinator HA Failover (`--coordinator-urls`):** Workers broadcast heartbeats concurrently to all HA coordinators so killing the active Raft Leader requires zero manual worker re-registration.
+- **Automatic Raft WAL Log Compaction & Snapshotting:** Compacts applied WAL entries (`snapshot_index`/`snapshot_term`) automatically and recovers cleanly across cold restarts.
+- **Cloud S3/GCS/Azure Built Into CLI (`--storage-uri`):** Enables `rustlakedb-storage/cloud` natively in the `rustlakedb` binary for live `s3://` (AWS/MinIO), `gs://`, and `az://` warehouses.
+- **Independent Iceberg v3 Avro + Parquet Interop Decoder:** Full binary Avro OCF record decoders verifying `metadata.json` -> Manifest List -> Manifest -> Zstd Parquet round-trips.
+
 ## [2.0.0] - 2026-11-24 — Enterprise Lakehouse Platform Release (Waves 1–10)
 
 ### Wave 10 — Security, Cloud Credential Vending, SQL UDFs & Release Engineering

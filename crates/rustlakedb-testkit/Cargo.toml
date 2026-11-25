@@ -8,6 +8,7 @@ license.workspace = true
 arrow-ipc.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+parquet.workspace = true
 reqwest.workspace = true
 roaring.workspace = true
 rustls.workspace = true

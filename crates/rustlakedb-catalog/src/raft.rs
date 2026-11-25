@@ -126,6 +126,7 @@ pub struct RaftStatus {
     pub leader_id: Option<u64>,
     pub commit_index: u64,
     pub log_len: usize,
+    pub snapshot_index: u64,
 }
 
 struct RaftCore {
@@ -136,6 +137,8 @@ struct RaftCore {
     log: Vec<RaftLogEntry>,
     commit_index: u64,
     last_applied: u64,
+    snapshot_index: u64,
+    snapshot_term: u64,
     last_heartbeat: Instant,
 }
 
@@ -145,15 +148,20 @@ struct PersistedRaftWal {
     voted_for: Option<u64>,
     log: Vec<RaftLogEntry>,
     commit_index: u64,
+    #[serde(default)]
+    snapshot_index: u64,
+    #[serde(default)]
+    snapshot_term: u64,
 }
 
-/// Multi-Node Raft HA Catalog Node implementing `Catalog` with optional crash-safe WAL persistence.
+/// Multi-Node Raft HA Catalog Node implementing `Catalog` with crash-safe WAL persistence & log snapshotting (Wave 11).
 pub struct RaftCatalogNode {
     pub node_id: u64,
     peers: RwLock<HashMap<u64, String>>,
     core: RwLock<RaftCore>,
     state_machine: Arc<InMemoryRaftCatalog>,
     wal_path: Option<PathBuf>,
+    snapshot_threshold: std::sync::atomic::AtomicUsize,
     http: reqwest::Client,
     shutdown: AtomicBool,
 }
@@ -201,10 +209,18 @@ impl RaftCatalogNode {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok());
 
-        let (current_term, voted_for, log, commit_index) = match persisted {
-            Some(w) => (w.current_term, w.voted_for, w.log, w.commit_index),
-            None => (0, None, Vec::new(), 0),
-        };
+        let (current_term, voted_for, log, commit_index, snapshot_index, snapshot_term) =
+            match persisted {
+                Some(w) => (
+                    w.current_term,
+                    w.voted_for,
+                    w.log,
+                    w.commit_index,
+                    w.snapshot_index,
+                    w.snapshot_term,
+                ),
+                None => (0, None, Vec::new(), 0, 0, 0),
+            };
 
         Arc::new(Self {
             node_id,
@@ -217,13 +233,50 @@ impl RaftCatalogNode {
                 log,
                 commit_index,
                 last_applied: commit_index,
+                snapshot_index,
+                snapshot_term,
                 last_heartbeat: Instant::now(),
             }),
             state_machine,
             wal_path,
+            snapshot_threshold: std::sync::atomic::AtomicUsize::new(64),
             http,
             shutdown: AtomicBool::new(false),
         })
+    }
+
+    pub fn set_snapshot_threshold(&self, threshold: usize) {
+        self.snapshot_threshold
+            .store(threshold.max(1), Ordering::Relaxed);
+    }
+
+    /// Compacts applied Raft WAL entries up to `commit_index` into a durable snapshot marker (Wave 11).
+    /// Returns the number of WAL log entries reclaimed.
+    pub fn compact_wal_snapshot(&self) -> usize {
+        let mut c = self.core.write();
+        self.compact_wal_locked(&mut c)
+    }
+
+    fn compact_wal_locked(&self, c: &mut RaftCore) -> usize {
+        let compact_upto = c.commit_index.min(c.last_applied);
+        if compact_upto <= c.snapshot_index || c.log.is_empty() {
+            return 0;
+        }
+        let mut snap_term = c.snapshot_term;
+        for e in &c.log {
+            if e.index <= compact_upto {
+                snap_term = e.term;
+            }
+        }
+        let before = c.log.len();
+        c.log.retain(|e| e.index > compact_upto);
+        let removed = before.saturating_sub(c.log.len());
+        if removed > 0 {
+            c.snapshot_index = compact_upto;
+            c.snapshot_term = snap_term;
+            self.persist_wal_locked(c);
+        }
+        removed
     }
 
     fn persist_wal_locked(&self, c: &RaftCore) {
@@ -233,6 +286,8 @@ impl RaftCatalogNode {
                 voted_for: c.voted_for,
                 log: c.log.clone(),
                 commit_index: c.commit_index,
+                snapshot_index: c.snapshot_index,
+                snapshot_term: c.snapshot_term,
             };
             if let Ok(bytes) = serde_json::to_vec(&snap) {
                 let tmp = p.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -264,6 +319,7 @@ impl RaftCatalogNode {
             leader_id: c.leader_id,
             commit_index: c.commit_index,
             log_len: c.log.len(),
+            snapshot_index: c.snapshot_index,
         }
     }
 
@@ -326,8 +382,8 @@ impl RaftCatalogNode {
             c.voted_for = Some(self.node_id);
             c.leader_id = None;
             c.last_heartbeat = Instant::now();
-            let last_log_index = c.log.last().map(|e| e.index).unwrap_or(0);
-            let last_log_term = c.log.last().map(|e| e.term).unwrap_or(0);
+            let last_log_index = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index);
+            let last_log_term = c.log.last().map(|e| e.term).unwrap_or(c.snapshot_term);
             let peers = self.peers.read();
             let urls: Vec<String> = peers
                 .iter()
@@ -418,8 +474,8 @@ impl RaftCatalogNode {
                 AppendEntriesReq {
                     term: c.current_term,
                     leader_id: self.node_id,
-                    prev_log_index: 0,
-                    prev_log_term: 0,
+                    prev_log_index: c.snapshot_index,
+                    prev_log_term: c.snapshot_term,
                     entries: c.log.clone(),
                     leader_commit: c.commit_index,
                 },
@@ -476,8 +532,8 @@ impl RaftCatalogNode {
             c.role = RaftRole::Follower;
             c.leader_id = None;
         }
-        let my_last_idx = c.log.last().map(|e| e.index).unwrap_or(0);
-        let my_last_term = c.log.last().map(|e| e.term).unwrap_or(0);
+        let my_last_idx = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index);
+        let my_last_term = c.log.last().map(|e| e.term).unwrap_or(c.snapshot_term);
         let up_to_date = req.last_log_term > my_last_term
             || (req.last_log_term == my_last_term && req.last_log_index >= my_last_idx);
         let can_vote = c.voted_for.is_none() || c.voted_for == Some(req.candidate_id);
@@ -512,11 +568,21 @@ impl RaftCatalogNode {
             c.leader_id = Some(req.leader_id);
             c.last_heartbeat = Instant::now();
 
-            // Replace suffix from leader's authoritative log snapshot
-            if req.entries.len() >= c.log.len() {
+            // Replace/merge suffix from leader's authoritative log window
+            let leader_last = req
+                .entries
+                .last()
+                .map(|e| e.index)
+                .unwrap_or(req.prev_log_index);
+            let my_last = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index);
+            if leader_last >= my_last {
+                if req.prev_log_index > c.snapshot_index {
+                    c.snapshot_index = req.prev_log_index;
+                    c.snapshot_term = req.prev_log_term;
+                }
                 c.log = req.entries;
             }
-            let max_idx = c.log.last().map(|e| e.index).unwrap_or(0);
+            let max_idx = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index);
             if req.leader_commit > c.commit_index {
                 c.commit_index = req.leader_commit.min(max_idx);
             }
@@ -529,7 +595,11 @@ impl RaftCatalogNode {
                 c.last_applied = next;
             }
             if !cmds.is_empty() {
-                self.persist_wal_locked(&c);
+                if c.log.len() >= self.snapshot_threshold.load(Ordering::Relaxed) {
+                    self.compact_wal_locked(&mut c);
+                } else {
+                    self.persist_wal_locked(&c);
+                }
             }
             (
                 AppendEntriesResp {
@@ -586,7 +656,7 @@ impl RaftCatalogNode {
         // Leader appends entry to log and replicates to majority quorum!
         let (entry_index, majority) = {
             let mut c = self.core.write();
-            let idx = c.log.last().map(|e| e.index).unwrap_or(0) + 1;
+            let idx = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index) + 1;
             let term = c.current_term;
             c.log.push(RaftLogEntry {
                 index: idx,
@@ -614,7 +684,15 @@ impl RaftCatalogNode {
         }
         // Broadcast updated commit_index to followers so they apply immediately
         let _ = self.replicate_to_peers().await;
-        self.apply_command_locally(cmd).await
+        let out = self.apply_command_locally(cmd).await;
+        // Auto-compact WAL into a snapshot once threshold is reached!
+        {
+            let mut c = self.core.write();
+            if c.log.len() >= self.snapshot_threshold.load(Ordering::Relaxed) {
+                self.compact_wal_locked(&mut c);
+            }
+        }
+        out
     }
 
     async fn apply_command_locally(&self, cmd: CatalogCommand) -> Result<Value> {

@@ -9,9 +9,9 @@ use rustlakedb_catalog::{Catalog, FilePuffinIndex};
 use rustlakedb_common::{MemoryPool, Result, RustLakeError, WorkerId};
 use rustlakedb_protocol::{
     AggExpr, AggFunc, ArithOp, ColumnExpr, FilterExpr, JoinType, MathFunc, PartitionMetrics,
-    Partitioning, PhysicalNode, RowBatch, ScalarValue, ShuffleBlockLocation, ShuffleMode,
-    ShufflePartitionKey, SortKey, StringFunc, TaskCompletionReport, TaskSpec, VectorMetric,
-    WindowFunc, WindowSpec,
+    Partitioning, PhysicalNode, RowBatch, ScalarValue, SetOpKind, ShuffleBlockLocation,
+    ShuffleMode, ShufflePartitionKey, SortKey, StringFunc, TaskCompletionReport, TaskSpec,
+    VectorMetric, WindowFunc, WindowSpec,
 };
 use rustlakedb_shuffle::ShuffleTransport;
 use rustlakedb_storage::IcebergObjectStore;
@@ -208,6 +208,23 @@ impl WorkerNode {
                             None => None,
                         };
 
+                        // Wave 12 Vectorized Arrow Filtered Scan: evaluate simple column predicates
+                        // directly over Arrow RecordBatches and materialize ONLY matching rows!
+                        if candidate_rows.is_none()
+                            && let Some(pred) = pushed_filter
+                            && let Some(vec_rows) = self
+                                .try_eval_vectorized_filtered_scan(
+                                    &split.file_path,
+                                    &meta.schema,
+                                    projection,
+                                    pred,
+                                )
+                                .await?
+                        {
+                            out_rows.extend(vec_rows);
+                            continue;
+                        }
+
                         let proj_opt = if projection.is_empty() {
                             None
                         } else {
@@ -286,9 +303,8 @@ impl WorkerNode {
                     Ok(RowBatch::new(batch.columns, out))
                 }
                 PhysicalNode::Sort { input, keys } => {
-                    let mut batch = self.eval_node(input, task).await?;
-                    sort_rows(&mut batch.rows, keys);
-                    Ok(batch)
+                    let batch = self.eval_node(input, task).await?;
+                    self.eval_sort_with_spill(batch, keys).await
                 }
                 PhysicalNode::Limit {
                     input,
@@ -403,7 +419,8 @@ impl WorkerNode {
                         }
                     }
                     let batch = self.eval_node(input, task).await?;
-                    Ok(eval_hash_aggregate(&batch, group_by, aggs, *is_partial))
+                    self.eval_hash_aggregate_with_spill(&batch, group_by, aggs, *is_partial)
+                        .await
                 }
                 PhysicalNode::HashJoin {
                     left,
@@ -445,6 +462,82 @@ impl WorkerNode {
                                 }
                             }
                             out_rows.push(r);
+                        }
+                    }
+                    Ok(RowBatch::new(cols, out_rows))
+                }
+                PhysicalNode::SetOp {
+                    op,
+                    left,
+                    right,
+                    distinct,
+                } => {
+                    let lb = self.eval_node(left, task).await?;
+                    let rb = self.eval_node(right, task).await?;
+                    let cols = if lb.columns.is_empty() {
+                        rb.columns.clone()
+                    } else {
+                        lb.columns.clone()
+                    };
+                    // Compare rows positionally so column alias differences between branches work like PostgreSQL!
+                    let row_sig = |r: &BTreeMap<String, ScalarValue>, branch_cols: &[String]| -> String {
+                        let vals: Vec<ScalarValue> = branch_cols
+                            .iter()
+                            .map(|c| r.get(c).cloned().unwrap_or(ScalarValue::Null))
+                            .collect();
+                        serde_json::to_string(&vals).unwrap_or_default()
+                    };
+                    let mut right_counts: HashMap<String, usize> = HashMap::new();
+                    for r in &rb.rows {
+                        *right_counts.entry(row_sig(r, &rb.columns)).or_insert(0) += 1;
+                    }
+                    let mut out_rows = Vec::new();
+                    let mut emitted = HashSet::new();
+                    match op {
+                        SetOpKind::Union => {
+                            for (b_rows, b_cols) in [(&lb.rows, &lb.columns), (&rb.rows, &rb.columns)] {
+                                for r in b_rows {
+                                    let sig = row_sig(r, b_cols);
+                                    if *distinct && !emitted.insert(sig) {
+                                        continue;
+                                    }
+                                    out_rows.push(r.clone());
+                                }
+                            }
+                        }
+                        SetOpKind::Intersect => {
+                            for r in &lb.rows {
+                                let sig = row_sig(r, &lb.columns);
+                                if let Some(cnt) = right_counts.get_mut(&sig)
+                                    && *cnt > 0
+                                {
+                                    if *distinct {
+                                        if emitted.insert(sig) {
+                                            out_rows.push(r.clone());
+                                        }
+                                    } else {
+                                        *cnt -= 1;
+                                        out_rows.push(r.clone());
+                                    }
+                                }
+                            }
+                        }
+                        SetOpKind::Except => {
+                            for r in &lb.rows {
+                                let sig = row_sig(r, &lb.columns);
+                                if let Some(cnt) = right_counts.get_mut(&sig)
+                                    && *cnt > 0
+                                {
+                                    if !*distinct {
+                                        *cnt -= 1;
+                                    }
+                                    continue;
+                                }
+                                if *distinct && !emitted.insert(sig) {
+                                    continue;
+                                }
+                                out_rows.push(r.clone());
+                            }
                         }
                     }
                     Ok(RowBatch::new(cols, out_rows))
@@ -1116,6 +1209,7 @@ fn eval_hash_aggregate(
     struct Acc {
         group_vals: Vec<(String, ScalarValue)>,
         count: i64,
+        distinct_sets: HashMap<String, HashSet<String>>,
         sums: HashMap<String, f64>,
         counts_for_avg: HashMap<String, i64>,
         mins: HashMap<String, ScalarValue>,
@@ -1143,6 +1237,28 @@ fn eval_hash_aggregate(
                         acc.count += *c;
                     } else {
                         acc.count += 1;
+                    }
+                }
+                AggFunc::CountDistinct(col) => {
+                    let set = acc.distinct_sets.entry(agg.alias.clone()).or_default();
+                    if is_partial {
+                        if let Some(v) = row.get(col)
+                            && !matches!(v, ScalarValue::Null)
+                        {
+                            set.insert(serde_json::to_string(v).unwrap_or_default());
+                        }
+                    } else if let Some(ScalarValue::Json(serde_json::Value::Array(arr))) =
+                        row.get(&agg.alias)
+                    {
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                set.insert(s.to_string());
+                            }
+                        }
+                    } else if let Some(v) = row.get(col)
+                        && !matches!(v, ScalarValue::Null)
+                    {
+                        set.insert(serde_json::to_string(v).unwrap_or_default());
                     }
                 }
                 AggFunc::Sum(col) => {
@@ -1227,6 +1343,26 @@ fn eval_hash_aggregate(
             match &agg.func {
                 AggFunc::Count => {
                     row.insert(agg.alias.clone(), ScalarValue::Int64(acc.count));
+                }
+                AggFunc::CountDistinct(_) => {
+                    if is_partial {
+                        let vals: Vec<serde_json::Value> = acc
+                            .distinct_sets
+                            .get(&agg.alias)
+                            .map(|s| s.iter().cloned().map(serde_json::Value::String).collect())
+                            .unwrap_or_default();
+                        row.insert(
+                            agg.alias.clone(),
+                            ScalarValue::Json(serde_json::Value::Array(vals)),
+                        );
+                    } else {
+                        let n = acc
+                            .distinct_sets
+                            .get(&agg.alias)
+                            .map(|s| s.len() as i64)
+                            .unwrap_or(0);
+                        row.insert(agg.alias.clone(), ScalarValue::Int64(n));
+                    }
                 }
                 AggFunc::Sum(_) => {
                     let s = acc.sums.get(&agg.alias).copied().unwrap_or(0.0);
@@ -1565,6 +1701,233 @@ impl WorkerNode {
         Ok(RowBatch::new(cols, out_rows))
     }
 
+    /// Wave 12 MemoryPool-governed External Merge-Sort with NVMe Zstd run spilling!
+    async fn eval_sort_with_spill(
+        &self,
+        mut batch: RowBatch,
+        keys: &[SortKey],
+    ) -> Result<RowBatch> {
+        let est = batch.estimated_bytes();
+        if let Ok(_reservation) = self.memory_pool.try_reserve(est) {
+            sort_rows(&mut batch.rows, keys);
+            return Ok(batch);
+        }
+
+        // Exceeded worker memory budget -> spill sorted Zstd chunks to NVMe and k-way merge!
+        self.memory_pool.record_spill();
+        let run_id = uuid::Uuid::new_v4();
+        let chunk_size = std::cmp::max(1, batch.rows.len() / 4);
+        let mut run_paths = Vec::new();
+        let cols = batch.columns.clone();
+
+        for (idx, chunk) in batch.rows.chunks(chunk_size).enumerate() {
+            let mut run_rows = chunk.to_vec();
+            sort_rows(&mut run_rows, keys);
+            let p = self.spill_dir.join(format!("sort_{run_id}_{idx}.zst"));
+            let comp = zstd::bulk::compress(&serde_json::to_vec(&run_rows)?, 1)
+                .map_err(|e| RustLakeError::Execution(format!("sort spill compress: {e}")))?;
+            tokio::fs::write(&p, comp).await?;
+            run_paths.push(p);
+        }
+
+        let mut merged_runs: Vec<std::collections::VecDeque<BTreeMap<String, ScalarValue>>> =
+            Vec::with_capacity(run_paths.len());
+        for p in run_paths {
+            let raw = zstd::stream::decode_all(&tokio::fs::read(&p).await?[..])
+                .map_err(|e| RustLakeError::Execution(format!("sort spill read: {e}")))?;
+            let rows: Vec<BTreeMap<String, ScalarValue>> = serde_json::from_slice(&raw)?;
+            merged_runs.push(rows.into());
+            let _ = tokio::fs::remove_file(p).await;
+        }
+
+        // K-way merge over sorted runs
+        let mut out_rows = Vec::with_capacity(batch.rows.len());
+        loop {
+            let mut best_run: Option<usize> = None;
+            for (ri, q) in merged_runs.iter().enumerate() {
+                let Some(cand) = q.front() else {
+                    continue;
+                };
+                match best_run {
+                    None => best_run = Some(ri),
+                    Some(cur_best) => {
+                        let cur_row = merged_runs[cur_best].front().unwrap();
+                        let mut ord = CmpOrdering::Equal;
+                        for k in keys {
+                            let va = cand.get(&k.column).unwrap_or(&ScalarValue::Null);
+                            let vb = cur_row.get(&k.column).unwrap_or(&ScalarValue::Null);
+                            let c = compare_scalar(va, vb);
+                            if c != CmpOrdering::Equal {
+                                ord = if k.descending { c.reverse() } else { c };
+                                break;
+                            }
+                        }
+                        if ord == CmpOrdering::Less {
+                            best_run = Some(ri);
+                        }
+                    }
+                }
+            }
+            match best_run {
+                Some(ri) => {
+                    if let Some(row) = merged_runs[ri].pop_front() {
+                        out_rows.push(row);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(RowBatch::new(cols, out_rows))
+    }
+
+    /// Wave 12 MemoryPool-governed External Hash Aggregate with NVMe Zstd partition spilling!
+    async fn eval_hash_aggregate_with_spill(
+        &self,
+        batch: &RowBatch,
+        group_by: &[ColumnExpr],
+        aggs: &[AggExpr],
+        is_partial: bool,
+    ) -> Result<RowBatch> {
+        let est = batch.estimated_bytes();
+        if group_by.is_empty() || self.memory_pool.try_reserve(est).is_ok() {
+            return Ok(eval_hash_aggregate(batch, group_by, aggs, is_partial));
+        }
+
+        // Exceeded memory budget -> hash-partition into NVMe Zstd buckets and aggregate bucket-by-bucket!
+        self.memory_pool.record_spill();
+        const NUM_BUCKETS: usize = 8;
+        let run_id = uuid::Uuid::new_v4();
+        let g_cols: Vec<String> = group_by.iter().map(|g| g.output_name()).collect();
+        let buckets = partition_batch(
+            batch,
+            &Partitioning::Hash {
+                columns: g_cols,
+                partitions: NUM_BUCKETS,
+            },
+        );
+
+        let mut paths = Vec::with_capacity(NUM_BUCKETS);
+        for (idx, b) in buckets.into_iter().enumerate() {
+            let p = self.spill_dir.join(format!("agg_{run_id}_{idx}.zst"));
+            let comp = zstd::bulk::compress(&serde_json::to_vec(&b)?, 1)
+                .map_err(|e| RustLakeError::Execution(format!("agg spill compress: {e}")))?;
+            tokio::fs::write(&p, comp).await?;
+            paths.push(p);
+        }
+
+        let mut out_cols = Vec::new();
+        let mut out_rows = Vec::new();
+        for p in paths {
+            let raw = zstd::stream::decode_all(&tokio::fs::read(&p).await?[..])
+                .map_err(|e| RustLakeError::Execution(format!("agg spill read: {e}")))?;
+            let b: RowBatch = serde_json::from_slice(&raw)?;
+            if b.num_rows() > 0 {
+                let agg_b = eval_hash_aggregate(&b, group_by, aggs, is_partial);
+                if out_cols.is_empty() {
+                    out_cols = agg_b.columns;
+                }
+                out_rows.extend(agg_b.rows);
+            }
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        Ok(RowBatch::new(out_cols, out_rows))
+    }
+
+    /// Wave 12 Vectorized Arrow Filtered Scan: evaluates simple column predicates directly over
+    /// Arrow `RecordBatch` slices with `ProjectionMask` and materializes ONLY matching rows!
+    async fn try_eval_vectorized_filtered_scan(
+        &self,
+        file_path: &str,
+        schema: &[rustlakedb_catalog::FieldSchema],
+        projection: &[String],
+        pred: &FilterExpr,
+    ) -> Result<Option<Vec<BTreeMap<String, ScalarValue>>>> {
+        let mut filter_cols = HashSet::new();
+        if !collect_simple_arrow_filter_cols(pred, &mut filter_cols) {
+            return Ok(None);
+        }
+        let schema_types: HashMap<&str, &rustlakedb_catalog::ColumnType> = schema
+            .iter()
+            .map(|f| (f.name.as_str(), &f.data_type))
+            .collect();
+        let mut proj_cols: Vec<String> = if projection.is_empty() {
+            schema.iter().map(|f| f.name.clone()).collect()
+        } else {
+            projection
+                .iter()
+                .filter(|c| schema_types.contains_key(c.as_str()))
+                .cloned()
+                .collect()
+        };
+        for fc in &filter_cols {
+            if !schema_types.contains_key(fc.as_str()) {
+                return Ok(None);
+            }
+            if !proj_cols.contains(fc) {
+                proj_cols.push(fc.clone());
+            }
+        }
+
+        let (batches, dv) = self
+            .store
+            .read_arrow_batches(file_path, Some(&proj_cols))
+            .await?;
+        let has_dv = !dv.is_empty();
+        let mut global_row_id = 0u32;
+        let mut rows_scanned = 0u64;
+        let mut out_rows = Vec::new();
+
+        for rb in &batches {
+            let n = rb.num_rows();
+            for row_idx in 0..n {
+                let cur_id = global_row_id;
+                global_row_id += 1;
+                if has_dv && dv.contains(cur_id) {
+                    self.store.rows_skipped_by_dv.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                rows_scanned += 1;
+                if !eval_arrow_filter_row(rb, row_idx, pred) {
+                    continue;
+                }
+                let mut row = BTreeMap::new();
+                for (ci, field) in rb.schema().fields().iter().enumerate() {
+                    let arr = rb.column(ci);
+                    let val = if arr.is_null(row_idx) {
+                        ScalarValue::Null
+                    } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                        ScalarValue::Int64(a.value(row_idx))
+                    } else if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                        ScalarValue::Float64(a.value(row_idx))
+                    } else if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+                        ScalarValue::Bool(a.value(row_idx))
+                    } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                        let s = a.value(row_idx);
+                        if matches!(
+                            schema_types.get(field.name().as_str()),
+                            Some(rustlakedb_catalog::ColumnType::Variant)
+                        ) {
+                            serde_json::from_str::<serde_json::Value>(s)
+                                .map(ScalarValue::Json)
+                                .unwrap_or_else(|_| ScalarValue::Utf8(s.to_string()))
+                        } else {
+                            ScalarValue::Utf8(s.to_string())
+                        }
+                    } else {
+                        ScalarValue::Null
+                    };
+                    row.insert(field.name().clone(), val);
+                }
+                out_rows.push(row);
+            }
+        }
+
+        self.vectorized_rows_processed
+            .fetch_add(rows_scanned, Ordering::Relaxed);
+        Ok(Some(out_rows))
+    }
+
     /// Wave 1 Vectorized Arrow Partial-Aggregate & Shredded-JSON Zero-Parse Fast Path:
     /// Scans Parquet splits directly as columnar Arrow `RecordBatch`es with `ProjectionMask`,
     /// resolves `JsonPath` expressions directly to shredded `__shred_<col>_<path>` columns
@@ -1621,6 +1984,7 @@ impl WorkerNode {
             for a in aggs {
                 match &a.func {
                     AggFunc::Count => phys_agg_cols.push(None),
+                    AggFunc::CountDistinct(_) => return Ok(None),
                     AggFunc::Sum(c)
                     | AggFunc::Avg(c)
                     | AggFunc::Min(c)
@@ -1780,6 +2144,7 @@ impl WorkerNode {
                             }
                         }
                     }
+                    AggFunc::CountDistinct(_) => {}
                 }
             }
         }
@@ -1933,6 +2298,7 @@ impl WorkerNode {
                             acc.max_val.unwrap_or(ScalarValue::Null),
                         );
                     }
+                    AggFunc::CountDistinct(_) => {}
                 }
             }
             row
@@ -2038,6 +2404,7 @@ impl WorkerNode {
         for a in aggs {
             match &a.func {
                 AggFunc::Count => agg_cols_names.push(None),
+                AggFunc::CountDistinct(_) => return Ok(None),
                 AggFunc::Sum(c) | AggFunc::Avg(c) | AggFunc::Min(c) | AggFunc::Max(c) => {
                     agg_cols_names.push(Some(c.clone()));
                     probe_needed.insert(c.clone());
@@ -2230,6 +2597,7 @@ impl WorkerNode {
                                                 Some(acc.max_val.map_or(v, |m| m.max(v)));
                                         }
                                     }
+                                    AggFunc::CountDistinct(_) => {}
                                 }
                             }
                         }
@@ -2292,6 +2660,7 @@ impl WorkerNode {
                                 .unwrap_or(ScalarValue::Null),
                         );
                     }
+                    AggFunc::CountDistinct(_) => {}
                 }
             }
             out_rows.push(row);
@@ -2300,10 +2669,9 @@ impl WorkerNode {
         Ok(Some(RowBatch::new(out_cols, out_rows)))
     }
 
-    /// Wave 9 Vectorized Arrow Top-N Pushdown Fast Path:
+    /// Wave 9 + Wave 12 Multi-Column Vectorized Arrow Top-N Pushdown Fast Path:
     /// Scans Parquet splits directly as columnar Arrow `RecordBatch`es and maintains a bounded
-    /// top-K selection over native `Float64Array`/`Int64Array`/`StringArray` slices, materializing
-    /// ONLY the winning `k` rows instead of allocating `BTreeMap`s for all 1M+ rows!
+    /// top-K selection over single- or multi-column `ORDER BY k1, k2, ...` Arrow slices!
     async fn try_eval_vectorized_topn(
         &self,
         table_name: &str,
@@ -2312,10 +2680,9 @@ impl WorkerNode {
         k: usize,
         task: &TaskSpec,
     ) -> Result<Option<RowBatch>> {
-        if task.assigned_splits.is_empty() || keys.len() != 1 || k == 0 {
+        if task.assigned_splits.is_empty() || keys.is_empty() || k == 0 {
             return Ok(None);
         }
-        let sort_key = &keys[0];
         let meta = self.catalog.get_table(table_name).await?;
         let schema_types: HashMap<&str, &rustlakedb_catalog::ColumnType> = meta
             .schema
@@ -2333,26 +2700,28 @@ impl WorkerNode {
                 .cloned()
                 .collect()
         };
-        if !proj_cols.contains(&sort_key.column) {
-            if !schema_types.contains_key(sort_key.column.as_str()) {
-                return Ok(None);
+        for sk in keys {
+            if !proj_cols.contains(&sk.column) {
+                if !schema_types.contains_key(sk.column.as_str()) {
+                    return Ok(None);
+                }
+                proj_cols.push(sk.column.clone());
             }
-            proj_cols.push(sort_key.column.clone());
         }
 
-        // Keep the top-K candidates in a tiny sorted Vec (length <= k).
-        // Each entry holds `(sort_scalar, materialized_row)`.
-        let mut top_k: Vec<(ScalarValue, BTreeMap<String, ScalarValue>)> = Vec::with_capacity(k + 1);
-        let mut rows_scanned = 0u64;
-
-        let is_better = |cand: &ScalarValue, worst: &ScalarValue| -> bool {
-            let ord = compare_scalar(cand, worst);
-            if sort_key.descending {
-                ord == CmpOrdering::Greater
-            } else {
-                ord == CmpOrdering::Less
+        let cmp_key_tuples = |a: &[ScalarValue], b: &[ScalarValue]| -> CmpOrdering {
+            for (idx, sk) in keys.iter().enumerate() {
+                let ord = compare_scalar(&a[idx], &b[idx]);
+                if ord != CmpOrdering::Equal {
+                    return if sk.descending { ord.reverse() } else { ord };
+                }
             }
+            CmpOrdering::Equal
         };
+
+        let mut top_k: Vec<(Vec<ScalarValue>, BTreeMap<String, ScalarValue>)> =
+            Vec::with_capacity(k + 1);
+        let mut rows_scanned = 0u64;
 
         for split in &task.assigned_splits {
             let (batches, dv) = self
@@ -2363,26 +2732,14 @@ impl WorkerNode {
             let mut global_row_id = 0u32;
 
             for rb in &batches {
-                let Ok(sort_idx) = rb.schema().index_of(&sort_key.column) else {
-                    return Ok(None);
-                };
-                let sort_arr = rb.column(sort_idx);
-                let n = rb.num_rows();
-
-                enum SortArr<'a> {
-                    F64(&'a Float64Array),
-                    I64(&'a Int64Array),
-                    Str(&'a StringArray),
+                let mut key_col_indices = Vec::with_capacity(keys.len());
+                for sk in keys {
+                    let Ok(idx) = rb.schema().index_of(&sk.column) else {
+                        return Ok(None);
+                    };
+                    key_col_indices.push(idx);
                 }
-                let typed = if let Some(a) = sort_arr.as_any().downcast_ref::<Float64Array>() {
-                    SortArr::F64(a)
-                } else if let Some(a) = sort_arr.as_any().downcast_ref::<Int64Array>() {
-                    SortArr::I64(a)
-                } else if let Some(a) = sort_arr.as_any().downcast_ref::<StringArray>() {
-                    SortArr::Str(a)
-                } else {
-                    return Ok(None);
-                };
+                let n = rb.num_rows();
 
                 for row_idx in 0..n {
                     let cur_id = global_row_id;
@@ -2393,31 +2750,28 @@ impl WorkerNode {
                     }
                     rows_scanned += 1;
 
-                    let sv = match typed {
-                        SortArr::F64(a) => {
-                            if a.is_null(row_idx) {
-                                ScalarValue::Null
-                            } else {
-                                ScalarValue::Float64(a.value(row_idx))
-                            }
-                        }
-                        SortArr::I64(a) => {
-                            if a.is_null(row_idx) {
-                                ScalarValue::Null
-                            } else {
-                                ScalarValue::Int64(a.value(row_idx))
-                            }
-                        }
-                        SortArr::Str(a) => {
-                            if a.is_null(row_idx) {
-                                ScalarValue::Null
-                            } else {
-                                ScalarValue::Utf8(a.value(row_idx).to_string())
-                            }
-                        }
-                    };
+                    let mut key_vals = Vec::with_capacity(key_col_indices.len());
+                    for &ki in &key_col_indices {
+                        let arr = rb.column(ki);
+                        let sv = if arr.is_null(row_idx) {
+                            ScalarValue::Null
+                        } else if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                            ScalarValue::Float64(a.value(row_idx))
+                        } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                            ScalarValue::Int64(a.value(row_idx))
+                        } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                            ScalarValue::Utf8(a.value(row_idx).to_string())
+                        } else if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+                            ScalarValue::Bool(a.value(row_idx))
+                        } else {
+                            return Ok(None);
+                        };
+                        key_vals.push(sv);
+                    }
 
-                    if top_k.len() == k && !is_better(&sv, &top_k[k - 1].0) {
+                    if top_k.len() == k
+                        && cmp_key_tuples(&key_vals, &top_k[k - 1].0) != CmpOrdering::Less
+                    {
                         continue;
                     }
 
@@ -2451,11 +2805,8 @@ impl WorkerNode {
                         row.insert(field.name().clone(), val);
                     }
 
-                    top_k.push((sv, row));
-                    top_k.sort_by(|a, b| {
-                        let ord = compare_scalar(&a.0, &b.0);
-                        if sort_key.descending { ord.reverse() } else { ord }
-                    });
+                    top_k.push((key_vals, row));
+                    top_k.sort_by(|a, b| cmp_key_tuples(&a.0, &b.0));
                     if top_k.len() > k {
                         top_k.truncate(k);
                     }

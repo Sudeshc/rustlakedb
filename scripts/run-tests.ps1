@@ -8,7 +8,7 @@
   .\scripts\run-tests.ps1 -StartMinio
 #>
 param(
-    [ValidateSet("all", "unit", "sql", "chaos", "acid", "pgwire", "dbeaver", "network", "persistence", "production", "wave1", "wave2", "wave3", "wave4", "wave5", "wave6", "wave7", "wave8", "wave9", "wave10", "live", "bench")]
+    [ValidateSet("all", "unit", "sql", "chaos", "acid", "pgwire", "dbeaver", "network", "persistence", "production", "wave1", "wave2", "wave3", "wave4", "wave5", "wave6", "wave7", "wave8", "wave9", "wave10", "wave11", "wave12", "wave13", "tpch", "live", "bench")]
     [string]$Suite = "all",
     [switch]$Offline,
     [switch]$StartMinio
@@ -53,6 +53,10 @@ switch ($Suite) {
     "wave8"       { & cargo @CommonArgs -p rustlakedb-testkit --test wave8_topn_imv_hnsw_bm25 -- --nocapture }
     "wave9"       { & cargo @CommonArgs -p rustlakedb-testkit --test wave9_vectorized_topn_dbt_autoloader -- --nocapture }
     "wave10"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave10_tls_sts_udfs -- --nocapture }
+    "wave11"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave11_ha_snapshots_s3_interop -- --nocapture }
+    "wave12"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave12_vectorized_spill_and_sql -- --nocapture }
+    "wave13"      { & cargo @CommonArgs -p rustlakedb-testkit --test wave13_cdc_tracing_and_tpch -- --nocapture }
+    "tpch"        { & cargo @CommonArgs -p rustlakedb-testkit --test wave13_cdc_tracing_and_tpch tpch -- --nocapture }
     "live"        { & cargo @CommonArgs -p rustlakedb-testkit --test live_multiprocess }
     "bench"       { & cargo @CommonArgs -p rustlakedb-testkit --test benchmarks -- --nocapture }
 }

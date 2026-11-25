@@ -86,6 +86,19 @@ pub struct ActiveQueryInfo {
     pub started_ms: u64,
 }
 
+/// OpenTelemetry-compatible distributed execution trace span (Wave 13).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceSpan {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub service: String,
+    pub start_ms: u64,
+    pub duration_ms: u64,
+    pub attributes: std::collections::BTreeMap<String, String>,
+}
+
 /// Enterprise Governance, RBAC, RLS, Dynamic Masking, WLM & Observability Engine (Waves 3–4).
 pub struct GovernanceState {
     roles: RwLock<HashSet<String>>,
@@ -111,6 +124,10 @@ pub struct GovernanceState {
     udfs: RwLock<HashMap<String, (String, String)>>,
     /// Logical schemas created via `CREATE SCHEMA` (Wave 9 dbt compat)
     schemas: RwLock<HashSet<String>>,
+    /// OpenTelemetry-compatible distributed trace spans ring buffer (Wave 13)
+    trace_spans: RwLock<VecDeque<TraceSpan>>,
+    /// Exactly-once CDC stream watermarks: `table::stream_id` -> last committed offset (Wave 13)
+    cdc_offsets: RwLock<HashMap<String, u64>>,
     /// Prometheus metrics counters
     pub queries_total: AtomicU64,
     pub query_errors_total: AtomicU64,
@@ -140,6 +157,8 @@ impl Default for GovernanceState {
             ),
             udfs: RwLock::new(HashMap::new()),
             schemas: RwLock::new(HashSet::from(["public".to_string(), "default".to_string()])),
+            trace_spans: RwLock::new(VecDeque::with_capacity(512)),
+            cdc_offsets: RwLock::new(HashMap::new()),
             queries_total: AtomicU64::new(0),
             query_errors_total: AtomicU64::new(0),
             query_duration_ms_sum: AtomicU64::new(0),
@@ -488,6 +507,33 @@ impl GovernanceState {
             }
         }
         cur
+    }
+
+    // ---- Wave 13: OpenTelemetry Trace Spans & Exactly-Once CDC Offsets ----
+    pub fn record_span(&self, span: TraceSpan) {
+        let mut q = self.trace_spans.write();
+        if q.len() >= 500 {
+            q.pop_front();
+        }
+        q.push_back(span);
+    }
+
+    pub fn traces_snapshot(&self) -> Vec<TraceSpan> {
+        self.trace_spans.read().iter().cloned().collect()
+    }
+
+    pub fn get_cdc_offset(&self, table: &str, stream_id: &str) -> u64 {
+        self.cdc_offsets
+            .read()
+            .get(&format!("{table}::{stream_id}"))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn set_cdc_offset(&self, table: &str, stream_id: &str, offset: u64) {
+        self.cdc_offsets
+            .write()
+            .insert(format!("{table}::{stream_id}"), offset);
     }
 }
 
