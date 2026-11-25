@@ -4,27 +4,63 @@ image:
   pullPolicy: IfNotPresent
 
 warehouse:
+  # Cloud object storage URI: s3://<bucket>, gs://<bucket>, or az://<container>
   uri: "s3://rustlakedb-warehouse"
   awsEndpointUrl: ""
   awsRegion: "us-east-1"
+  awsAllowHttp: "false"
+  # Optional Kubernetes Secret name containing AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+  # (leave empty when using IRSA / Workload Identity / Managed Identity)
+  credentialsSecretName: ""
+  # Optional STS Vended Credentials for external Iceberg REST clients (Spark/Trino/PyIceberg)
+  vendedCredentialsSecretName: ""
 
 auth:
   jwtSecret: ""
+  # Enterprise OIDC Discovery Issuer (Okta, Entra ID, Auth0, Google) -> auto-discovers /.well-known/openid-configuration & rotates JWKS
+  oidcIssuer: ""
+  oidcAudience: "rustlakedb"
   oidcJwksUrl: ""
+  # Optional Kubernetes Secret name containing RUSTLAKEDB_PASSWORD for PGWire SCRAM-SHA-256
+  pgPasswordSecretName: ""
+
+tls:
+  # TLS 1.3 for client-facing PGWire (:5432) using cert-manager / external PEM Secret (tls.crt, tls.key)
+  enabled: false
+  secretName: "rustlakedb-pgwire-tls"
 
 mtls:
+  # Strict mutual TLS between Coordinator <-> Worker RPC (:7001)
   enabled: false
   secretName: "rustlakedb-cluster-mtls"
 
 coordinator:
-  replicas: 1
+  # Production default: 3-node Raft HA Quorum behind an L4 NLB
+  replicas: 3
+  raft:
+    enabled: true
+    port: 9001
+    storageClassName: ""
+    walSize: "20Gi"
   pgPort: 5432
   controlPlanePort: 8181
   flightPort: 8815
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: "external"
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+  pdb:
+    enabled: true
+    minAvailable: 2
   resources:
     requests:
-      cpu: "1000m"
-      memory: "1Gi"
+      cpu: "2000m"
+      memory: "4Gi"
+    limits:
+      cpu: "4000m"
+      memory: "8Gi"
 
 workers:
   replicas: 3
@@ -32,11 +68,27 @@ workers:
   maxReplicas: 32
   targetCpuUtilizationPercentage: 70
   rpcPort: 7001
+  nvmeSpillSizeLimit: "100Gi"
   spotTolerations: true
   resources:
     requests:
-      cpu: "2000m"
-      memory: "4Gi"
+      cpu: "4000m"
+      memory: "8Gi"
+    limits:
+      cpu: "8000m"
+      memory: "16Gi"
 
 maintainer:
   enabled: true
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: "15s"
+  prometheusRule:
+    enabled: true
+    runbookBaseUrl: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md"

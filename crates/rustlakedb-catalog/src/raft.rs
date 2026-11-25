@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::{
-    Catalog, ColumnStats, ColumnType, DataFileEntry, EqualityDeleteFile, GovernanceOp,
-    IcebergTableMetadata, InMemoryRaftCatalog, PersistedGovernanceState, PuffinIndexSpec,
-    TableCommitProposal, ViewDefinition,
+    Catalog, ColumnStats, ColumnType, DataFileEntry, EqualityDeleteFile, FullCatalogSnapshot,
+    GovernanceOp, IcebergTableMetadata, InMemoryRaftCatalog, PersistedGovernanceState,
+    PuffinIndexSpec, RaftTelemetry, TableCommitProposal, ViewDefinition,
 };
 use async_trait::async_trait;
 use axum::extract::State;
@@ -157,6 +157,23 @@ pub struct AppendEntriesResp {
     pub term: u64,
     pub success: bool,
     pub match_index: u64,
+    #[serde(default)]
+    pub needs_snapshot: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReq {
+    pub term: u64,
+    pub leader_id: u64,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub snapshot: FullCatalogSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResp {
+    pub term: u64,
+    pub success: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +220,9 @@ pub struct RaftCatalogNode {
     state_machine: Arc<InMemoryRaftCatalog>,
     wal_path: Option<PathBuf>,
     snapshot_threshold: std::sync::atomic::AtomicUsize,
+    leader_changes: std::sync::atomic::AtomicU64,
+    propose_lock: tokio::sync::Mutex<()>,
+    apply_lock: tokio::sync::Mutex<()>,
     http: reqwest::Client,
     shutdown: AtomicBool,
 }
@@ -281,6 +301,9 @@ impl RaftCatalogNode {
             state_machine,
             wal_path,
             snapshot_threshold: std::sync::atomic::AtomicUsize::new(64),
+            leader_changes: std::sync::atomic::AtomicU64::new(0),
+            propose_lock: tokio::sync::Mutex::new(()),
+            apply_lock: tokio::sync::Mutex::new(()),
             http,
             shutdown: AtomicBool::new(false),
         })
@@ -397,7 +420,9 @@ impl RaftCatalogNode {
             .route("/raft/status", get(handle_status))
             .route("/raft/request_vote", post(handle_request_vote))
             .route("/raft/append_entries", post(handle_append_entries))
+            .route("/raft/install_snapshot", post(handle_install_snapshot))
             .route("/raft/client_write", post(handle_client_write))
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
             .with_state(node.clone());
 
         tokio::spawn(async move {
@@ -510,6 +535,7 @@ impl RaftCatalogNode {
                 }
             };
             if became_leader {
+                self.leader_changes.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(node = self.node_id, term = req.term, "Raft node elected LEADER");
                 self.replicate_to_peers().await;
             }
@@ -546,20 +572,23 @@ impl RaftCatalogNode {
             let http = self.http.clone();
             let body = req.clone();
             async move {
-                http.post(format!("{url}/raft/append_entries"))
+                let resp = http
+                    .post(format!("{url}/raft/append_entries"))
                     .json(&body)
                     .send()
                     .await
                     .ok()?
                     .json::<AppendEntriesResp>()
                     .await
-                    .ok()
+                    .ok()?;
+                Some((url, resp))
             }
         });
 
         let results = futures::future::join_all(futs).await;
         let mut acks = 1usize; // self
-        for resp in results.into_iter().flatten() {
+        let mut snapshot_peers = Vec::new();
+        for (url, resp) in results.into_iter().flatten() {
             if resp.term > req.term {
                 let mut c = self.core.write();
                 if resp.term > c.current_term {
@@ -570,8 +599,50 @@ impl RaftCatalogNode {
                 }
                 return 0;
             }
-            if resp.success {
+            if resp.needs_snapshot {
+                snapshot_peers.push(url);
+            } else if resp.success {
                 acks += 1;
+            }
+        }
+
+        // Raft §7 InstallSnapshot: catch up any lagging/rejoining follower whose state is behind our compacted WAL!
+        if !snapshot_peers.is_empty() {
+            let snap_req = {
+                let c = self.core.read();
+                let last_idx = c.last_applied;
+                let last_term = c
+                    .log
+                    .iter()
+                    .find(|e| e.index == last_idx)
+                    .map(|e| e.term)
+                    .unwrap_or(c.snapshot_term.max(c.current_term));
+                InstallSnapshotReq {
+                    term: c.current_term,
+                    leader_id: self.node_id,
+                    last_included_index: last_idx,
+                    last_included_term: last_term,
+                    snapshot: self.state_machine.export_snapshot(),
+                }
+            };
+            let snap_futs = snapshot_peers.into_iter().map(|url| {
+                let http = self.http.clone();
+                let body = snap_req.clone();
+                async move {
+                    http.post(format!("{url}/raft/install_snapshot"))
+                        .json(&body)
+                        .send()
+                        .await
+                        .ok()?
+                        .json::<InstallSnapshotResp>()
+                        .await
+                        .ok()
+                }
+            });
+            for sr in futures::future::join_all(snap_futs).await.into_iter().flatten() {
+                if sr.success {
+                    acks += 1;
+                }
             }
         }
         acks
@@ -613,33 +684,48 @@ impl RaftCatalogNode {
     }
 
     pub async fn on_append_entries(&self, req: AppendEntriesReq) -> AppendEntriesResp {
+        let _apply_guard = self.apply_lock.lock().await;
         let (resp, to_apply) = {
             let mut c = self.core.write();
             if req.term < c.current_term {
                 return AppendEntriesResp {
                     term: c.current_term,
                     success: false,
-                    match_index: c.log.len() as u64,
+                    match_index: c.last_applied,
+                    needs_snapshot: false,
                 };
             }
             c.current_term = req.term;
             c.role = RaftRole::Follower;
+            if c.leader_id != Some(req.leader_id) {
+                self.leader_changes.fetch_add(1, Ordering::Relaxed);
+            }
             c.leader_id = Some(req.leader_id);
             c.last_heartbeat = Instant::now();
 
+            // If leader has already compacted entries beyond what this follower has applied,
+            // request an authoritative Raft InstallSnapshot rather than skipping compacted entries!
+            if req.prev_log_index > c.last_applied {
+                return AppendEntriesResp {
+                    term: c.current_term,
+                    success: false,
+                    match_index: c.last_applied,
+                    needs_snapshot: true,
+                };
+            }
+
             // Replace/merge suffix from leader's authoritative log window
-            let leader_last = req
-                .entries
-                .last()
-                .map(|e| e.index)
-                .unwrap_or(req.prev_log_index);
-            let my_last = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index);
-            if leader_last >= my_last {
-                if req.prev_log_index > c.snapshot_index {
-                    c.snapshot_index = req.prev_log_index;
-                    c.snapshot_term = req.prev_log_term;
-                }
+            if req.prev_log_index >= c.snapshot_index {
+                c.snapshot_index = req.prev_log_index;
+                c.snapshot_term = req.prev_log_term;
                 c.log = req.entries;
+            } else {
+                let snap_idx = c.snapshot_index;
+                c.log = req
+                    .entries
+                    .into_iter()
+                    .filter(|e| e.index > snap_idx)
+                    .collect();
             }
             let max_idx = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index);
             if req.leader_commit > c.commit_index {
@@ -665,6 +751,7 @@ impl RaftCatalogNode {
                     term: c.current_term,
                     success: true,
                     match_index: max_idx,
+                    needs_snapshot: false,
                 },
                 cmds,
             )
@@ -676,12 +763,53 @@ impl RaftCatalogNode {
         resp
     }
 
+    pub async fn on_install_snapshot(&self, req: InstallSnapshotReq) -> InstallSnapshotResp {
+        let _apply_guard = self.apply_lock.lock().await;
+        let term = {
+            let mut c = self.core.write();
+            if req.term < c.current_term {
+                return InstallSnapshotResp {
+                    term: c.current_term,
+                    success: false,
+                };
+            }
+            c.current_term = req.term;
+            c.role = RaftRole::Follower;
+            if c.leader_id != Some(req.leader_id) {
+                self.leader_changes.fetch_add(1, Ordering::Relaxed);
+            }
+            c.leader_id = Some(req.leader_id);
+            c.last_heartbeat = Instant::now();
+            c.current_term
+        };
+        if self.state_machine.install_snapshot(req.snapshot).is_err() {
+            return InstallSnapshotResp {
+                term,
+                success: false,
+            };
+        }
+        {
+            let mut c = self.core.write();
+            c.snapshot_index = req.last_included_index;
+            c.snapshot_term = req.last_included_term;
+            c.commit_index = req.last_included_index;
+            c.last_applied = req.last_included_index;
+            c.log.retain(|e| e.index > req.last_included_index);
+            self.persist_wal_locked(&c);
+        }
+        InstallSnapshotResp {
+            term,
+            success: true,
+        }
+    }
+
     /// Proposes a catalog mutation through the Raft consensus quorum.
     /// If called on a Follower, transparently forwards the command to the current Leader!
     pub async fn propose(&self, cmd: CatalogCommand) -> Result<Value> {
         if self.is_stopped() {
             return Err(RustLakeError::Catalog("Raft node is stopped".into()));
         }
+        let _propose_guard = self.propose_lock.lock().await;
         let (is_leader, leader_url) = {
             let c = self.core.read();
             let peers = self.peers.read();
@@ -690,6 +818,7 @@ impl RaftCatalogNode {
         };
 
         if !is_leader {
+            drop(_propose_guard);
             let url = leader_url.ok_or_else(|| {
                 RustLakeError::Catalog("Raft quorum has no elected leader yet".into())
             })?;
@@ -713,8 +842,9 @@ impl RaftCatalogNode {
         }
 
         // Leader appends entry to log and replicates to majority quorum!
-        let (entry_index, majority) = {
+        let (entry_index, entry_term, majority) = {
             let mut c = self.core.write();
+            // Apply any committed-but-unapplied entries from a previous term first
             let idx = c.log.last().map(|e| e.index).unwrap_or(c.snapshot_index) + 1;
             let term = c.current_term;
             c.log.push(RaftLogEntry {
@@ -723,16 +853,34 @@ impl RaftCatalogNode {
                 command: cmd.clone(),
             });
             let total = self.peers.read().len().max(1);
-            (idx, (total / 2) + 1)
+            (idx, term, (total / 2) + 1)
         };
 
         let acks = self.replicate_to_peers().await;
         if acks < majority {
+            // Roll back uncommitted tail entry so no follower can ever observe a ghost entry!
+            let mut c = self.core.write();
+            if c.commit_index < entry_index {
+                c.log.retain(|e| e.index < entry_index);
+                self.persist_wal_locked(&c);
+            }
             return Err(RustLakeError::Catalog(format!(
                 "Raft quorum lost: received {acks} ACKs, required majority {majority}"
             )));
         }
 
+        let _apply_guard = self.apply_lock.lock().await;
+        let still_leader = {
+            let c = self.core.read();
+            c.role == RaftRole::Leader && c.current_term == entry_term
+        };
+        if !still_leader {
+            return Err(RustLakeError::Catalog(
+                "Raft leadership changed before commit finalized".into(),
+            ));
+        }
+
+        let out = self.apply_command_locally(cmd).await;
         {
             let mut c = self.core.write();
             if entry_index > c.commit_index {
@@ -743,7 +891,6 @@ impl RaftCatalogNode {
         }
         // Broadcast updated commit_index to followers so they apply immediately
         let _ = self.replicate_to_peers().await;
-        let out = self.apply_command_locally(cmd).await;
         // Auto-compact WAL into a snapshot once threshold is reached!
         {
             let mut c = self.core.write();
@@ -1201,6 +1348,18 @@ impl Catalog for RaftCatalogNode {
             .await?;
         Ok(v["snapshot_id"].as_u64().unwrap_or(1))
     }
+
+    fn raft_telemetry(&self) -> Option<RaftTelemetry> {
+        let c = self.core.read();
+        Some(RaftTelemetry {
+            node_id: self.node_id,
+            is_leader: c.role == RaftRole::Leader,
+            term: c.current_term,
+            leader_id: c.leader_id,
+            commit_index: c.commit_index,
+            leader_changes: self.leader_changes.load(Ordering::Relaxed),
+        })
+    }
 }
 
 async fn handle_status(State(node): State<Arc<RaftCatalogNode>>) -> (StatusCode, Json<Value>) {
@@ -1238,6 +1397,20 @@ async fn handle_append_entries(
         );
     }
     let resp = node.on_append_entries(req).await;
+    (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
+}
+
+async fn handle_install_snapshot(
+    State(node): State<Arc<RaftCatalogNode>>,
+    Json(req): Json<InstallSnapshotReq>,
+) -> (StatusCode, Json<Value>) {
+    if node.is_stopped() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "stopped" })),
+        );
+    }
+    let resp = node.on_install_snapshot(req).await;
     (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
 }
 

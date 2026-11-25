@@ -51,6 +51,7 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
     let iceberg_rest = rustlakedb_catalog::rest::build_router(coord.catalog.clone());
     Router::new()
         .route("/", get(web_ui))
+        .route("/readyz", get(healthz_http))
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/cluster/status", get(cluster_status))
         .route("/v1/workers/register", post(register_worker_http))
@@ -370,6 +371,21 @@ async fn cluster_status(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
     }))
 }
 
+async fn healthz_http(State(coord): State<Arc<Coordinator>>) -> (StatusCode, Json<Value>) {
+    let wsnap = coord.workers_snapshot();
+    let healthy_workers = wsnap.iter().filter(|w| w.is_healthy()).count();
+    let raft = coord.catalog.raft_telemetry();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "healthy_workers": healthy_workers,
+            "total_workers": wsnap.len(),
+            "raft": raft,
+        })),
+    )
+}
+
 async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
     let wsnap = coord.workers_snapshot();
     let healthy_workers = wsnap.iter().filter(|w| w.is_healthy()).count();
@@ -380,11 +396,47 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
         .governance
         .query_duration_ms_sum
         .load(Ordering::Relaxed);
+    let rpc_timeouts = coord
+        .governance
+        .worker_rpc_timeouts_total
+        .load(Ordering::Relaxed);
     let pq_read = coord.store.parquet_files_read.load(Ordering::Relaxed);
     let pq_written = coord.store.parquet_files_written.load(Ordering::Relaxed);
     let cache_hits = coord.store.cache_hits.load(Ordering::Relaxed);
     let puffin_pruned = coord.store.files_pruned_by_puffin.load(Ordering::Relaxed);
     let zm_pruned = coord.store.files_pruned_by_zonemap.load(Ordering::Relaxed);
+
+    let (raft_is_leader, raft_term, raft_commit_idx, raft_leader_changes) =
+        match coord.catalog.raft_telemetry() {
+            Some(rt) => (
+                if rt.is_leader { 1 } else { 0 },
+                rt.term,
+                rt.commit_index,
+                rt.leader_changes,
+            ),
+            None => (1, 1, 0, 0),
+        };
+
+    let tables = coord.catalog.list_tables().await.unwrap_or_default();
+    let tables_total = tables.len();
+    let mut max_snapshots = 0usize;
+    for t in &tables {
+        if let Ok(meta) = coord.catalog.get_table(t).await {
+            max_snapshots = max_snapshots.max(meta.snapshots.len());
+        }
+    }
+
+    let mut spill_bytes: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for ent in entries.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.starts_with("arrow_") && name.ends_with(".arw1")
+                && let Ok(md) = ent.metadata()
+            {
+                spill_bytes = spill_bytes.saturating_add(md.len());
+            }
+        }
+    }
 
     let body = format!(
         "# HELP rustlakedb_queries_total Total SQL queries executed\n\
@@ -396,12 +448,36 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
          # HELP rustlakedb_query_duration_ms_sum Cumulative query latency in milliseconds\n\
          # TYPE rustlakedb_query_duration_ms_sum counter\n\
          rustlakedb_query_duration_ms_sum {dur_ms}\n\
+         # HELP rustlakedb_worker_rpc_timeouts_total Total worker RPC failures/timeouts triggering retry\n\
+         # TYPE rustlakedb_worker_rpc_timeouts_total counter\n\
+         rustlakedb_worker_rpc_timeouts_total {rpc_timeouts}\n\
          # HELP rustlakedb_workers_healthy Number of healthy distributed workers\n\
          # TYPE rustlakedb_workers_healthy gauge\n\
          rustlakedb_workers_healthy {healthy_workers}\n\
          # HELP rustlakedb_workers_total Total registered workers\n\
          # TYPE rustlakedb_workers_total gauge\n\
          rustlakedb_workers_total {total_workers}\n\
+         # HELP rustlakedb_raft_is_leader Whether this coordinator is the current Raft quorum leader (1=leader, 0=follower)\n\
+         # TYPE rustlakedb_raft_is_leader gauge\n\
+         rustlakedb_raft_is_leader {raft_is_leader}\n\
+         # HELP rustlakedb_raft_term Current Raft consensus term\n\
+         # TYPE rustlakedb_raft_term gauge\n\
+         rustlakedb_raft_term {raft_term}\n\
+         # HELP rustlakedb_raft_commit_index Highest Raft log index committed by quorum\n\
+         # TYPE rustlakedb_raft_commit_index gauge\n\
+         rustlakedb_raft_commit_index {raft_commit_idx}\n\
+         # HELP rustlakedb_raft_leader_changes_total Total Raft leadership changes observed on this coordinator\n\
+         # TYPE rustlakedb_raft_leader_changes_total counter\n\
+         rustlakedb_raft_leader_changes_total {raft_leader_changes}\n\
+         # HELP rustlakedb_catalog_tables_total Total Iceberg tables registered in catalog\n\
+         # TYPE rustlakedb_catalog_tables_total gauge\n\
+         rustlakedb_catalog_tables_total {tables_total}\n\
+         # HELP rustlakedb_catalog_max_snapshots Maximum retained snapshots on any table (detects VACUUM backlog)\n\
+         # TYPE rustlakedb_catalog_max_snapshots gauge\n\
+         rustlakedb_catalog_max_snapshots {max_snapshots}\n\
+         # HELP rustlakedb_nvme_spill_bytes Active NVMe out-of-core Arrow spill bytes on disk\n\
+         # TYPE rustlakedb_nvme_spill_bytes gauge\n\
+         rustlakedb_nvme_spill_bytes {spill_bytes}\n\
          # HELP rustlakedb_parquet_files_read_total Parquet files read\n\
          # TYPE rustlakedb_parquet_files_read_total counter\n\
          rustlakedb_parquet_files_read_total {pq_read}\n\

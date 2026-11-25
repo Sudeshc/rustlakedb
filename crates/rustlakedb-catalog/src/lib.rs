@@ -453,9 +453,24 @@ pub enum GovernanceOp {
     RecordLineage(PersistedLineageEdge),
 }
 
+/// Live Raft consensus telemetry exported to `/healthz` and Prometheus `/metrics`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftTelemetry {
+    pub node_id: u64,
+    pub is_leader: bool,
+    pub term: u64,
+    pub leader_id: Option<u64>,
+    pub commit_index: u64,
+    pub leader_changes: u64,
+}
+
 /// Persists `ANALYZE TABLE` column-level statistics into catalog metadata (Wave 26).
 #[async_trait]
 pub trait Catalog: Send + Sync {
+    /// Returns live Raft consensus telemetry when backed by a multi-node `RaftCatalogNode`.
+    fn raft_telemetry(&self) -> Option<RaftTelemetry> {
+        None
+    }
     async fn create_table(&self, metadata: IcebergTableMetadata) -> Result<()>;
     async fn drop_table(&self, table_name: &str) -> Result<()>;
     async fn get_table(&self, table_name: &str) -> Result<IcebergTableMetadata>;
@@ -502,6 +517,15 @@ pub trait Catalog: Send + Sync {
         eq_delete: EqualityDeleteFile,
         upserted_files: Vec<DataFileEntry>,
     ) -> Result<u64>;
+}
+
+/// Atomic point-in-time catalog state snapshot used by Raft `InstallSnapshot` RPCs
+/// when a partitioned or restarted follower lags behind the leader's WAL compaction index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullCatalogSnapshot {
+    pub tables: HashMap<String, IcebergTableMetadata>,
+    pub views: HashMap<String, ViewDefinition>,
+    pub governance: PersistedGovernanceState,
 }
 
 /// Embedded Iceberg v3 catalog modeling the `openraft` state machine (RFC-002).
@@ -618,6 +642,35 @@ impl InMemoryRaftCatalog {
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
             *self.last_governance_stamp.write() = file_stamp(path);
+        }
+        Ok(())
+    }
+
+    /// Exports an atomic point-in-time snapshot of tables, views, and governance for Raft `InstallSnapshot`.
+    pub fn export_snapshot(&self) -> FullCatalogSnapshot {
+        FullCatalogSnapshot {
+            tables: self.tables.read().clone(),
+            views: self.views.read().clone(),
+            governance: self.governance.read().clone(),
+        }
+    }
+
+    /// Atomically installs an authoritative Raft `InstallSnapshot` state onto this follower and persists it.
+    pub fn install_snapshot(&self, snap: FullCatalogSnapshot) -> Result<()> {
+        {
+            let mut t = self.tables.write();
+            *t = snap.tables;
+            self.persist_locked(&t)?;
+        }
+        {
+            let mut v = self.views.write();
+            *v = snap.views;
+            self.persist_views_locked(&v)?;
+        }
+        {
+            let mut g = self.governance.write();
+            *g = snap.governance;
+            self.persist_governance_locked(&g)?;
         }
         Ok(())
     }

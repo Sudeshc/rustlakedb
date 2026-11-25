@@ -1,3 +1,233 @@
+{{- $coordReplicas := int .Values.coordinator.replicas -}}
+{{- $raftPort := .Values.coordinator.raft.port -}}
+{{- $cpPort := .Values.coordinator.controlPlanePort -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustlakedb-coordinators
+  labels:
+    app: rustlakedb-coordinator
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: rustlakedb-coordinator
+  ports:
+    - name: raft
+      port: {{ $raftPort }}
+      targetPort: {{ $raftPort }}
+    - name: control-plane
+      port: {{ $cpPort }}
+      targetPort: {{ $cpPort }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustlakedb-coordinator
+  labels:
+    app: rustlakedb-coordinator
+  {{- with .Values.coordinator.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.coordinator.service.type }}
+  selector:
+    app: rustlakedb-coordinator
+  ports:
+    - name: pgwire
+      port: {{ .Values.coordinator.pgPort }}
+      targetPort: {{ .Values.coordinator.pgPort }}
+    - name: control-plane
+      port: {{ $cpPort }}
+      targetPort: {{ $cpPort }}
+    - name: flight-sql
+      port: {{ .Values.coordinator.flightPort }}
+      targetPort: {{ .Values.coordinator.flightPort }}
+---
+{{- if .Values.coordinator.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rustlakedb-coordinator-pdb
+spec:
+  minAvailable: {{ .Values.coordinator.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app: rustlakedb-coordinator
+{{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rustlakedb-coordinator
+spec:
+  serviceName: rustlakedb-coordinators
+  podManagementPolicy: Parallel
+  replicas: {{ $coordReplicas }}
+  selector:
+    matchLabels:
+      app: rustlakedb-coordinator
+  template:
+    metadata:
+      labels:
+        app: rustlakedb-coordinator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "{{ $cpPort }}"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: rustlakedb-coordinator
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: coordinator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "/bin/sh"
+            - "-ec"
+            - |
+              ORDINAL="${POD_NAME##*-}"
+              NODE_ID=$((ORDINAL + 1))
+              PEERS=""
+              for i in $(seq 0 $(({{ $coordReplicas }} - 1))); do
+                PID=$((i + 1))
+                ENTRY="${PID}=http://rustlakedb-coordinator-${i}.rustlakedb-coordinators:{{ $raftPort }}"
+                PEERS="${PEERS:+${PEERS},}${ENTRY}"
+              done
+              exec rustlakedb \
+                --mode coordinator \
+                --pg-addr "0.0.0.0:{{ .Values.coordinator.pgPort }}" \
+                --rest-addr "0.0.0.0:{{ $cpPort }}" \
+                --flight-addr "0.0.0.0:{{ .Values.coordinator.flightPort }}" \
+                --storage-uri "{{ .Values.warehouse.uri }}" \
+                --data-dir "/var/lib/rustlakedb" \
+                {{- if .Values.coordinator.raft.enabled }}
+                --raft-node-id "${NODE_ID}" \
+                --raft-bind "0.0.0.0:{{ $raftPort }}" \
+                --raft-peers "${PEERS}" \
+                {{- end }}
+                {{- if .Values.auth.oidcIssuer }}
+                --oidc-issuer "{{ .Values.auth.oidcIssuer }}" \
+                --oidc-audience "{{ .Values.auth.oidcAudience }}"
+                {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AWS_REGION
+              value: "{{ .Values.warehouse.awsRegion }}"
+            - name: AWS_ALLOW_HTTP
+              value: "{{ .Values.warehouse.awsAllowHttp }}"
+            {{- if .Values.warehouse.awsEndpointUrl }}
+            - name: AWS_ENDPOINT_URL
+              value: "{{ .Values.warehouse.awsEndpointUrl }}"
+            {{- end }}
+            {{- if .Values.auth.oidcJwksUrl }}
+            - name: RUSTLAKEDB_OIDC_JWKS_URL
+              value: "{{ .Values.auth.oidcJwksUrl }}"
+            {{- end }}
+            {{- if .Values.auth.jwtSecret }}
+            - name: RUSTLAKEDB_JWT_SECRET
+              value: "{{ .Values.auth.jwtSecret }}"
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: RUSTLAKEDB_TLS_CERT
+              value: "/etc/rustlakedb/tls/tls.crt"
+            - name: RUSTLAKEDB_TLS_KEY
+              value: "/etc/rustlakedb/tls/tls.key"
+            {{- end }}
+            {{- if .Values.mtls.enabled }}
+            - name: RUSTLAKEDB_MTLS_CA
+              value: "/etc/rustlakedb/mtls/ca.crt"
+            - name: RUSTLAKEDB_MTLS_CERT
+              value: "/etc/rustlakedb/mtls/client.crt"
+            - name: RUSTLAKEDB_MTLS_KEY
+              value: "/etc/rustlakedb/mtls/client.key"
+            {{- end }}
+          {{- if or .Values.warehouse.credentialsSecretName .Values.warehouse.vendedCredentialsSecretName .Values.auth.pgPasswordSecretName }}
+          envFrom:
+            {{- if .Values.warehouse.credentialsSecretName }}
+            - secretRef:
+                name: {{ .Values.warehouse.credentialsSecretName }}
+            {{- end }}
+            {{- if .Values.warehouse.vendedCredentialsSecretName }}
+            - secretRef:
+                name: {{ .Values.warehouse.vendedCredentialsSecretName }}
+            {{- end }}
+            {{- if .Values.auth.pgPasswordSecretName }}
+            - secretRef:
+                name: {{ .Values.auth.pgPasswordSecretName }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: pgwire
+              containerPort: {{ .Values.coordinator.pgPort }}
+            - name: control-plane
+              containerPort: {{ $cpPort }}
+            - name: flight-sql
+              containerPort: {{ .Values.coordinator.flightPort }}
+            - name: raft
+              containerPort: {{ $raftPort }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ $cpPort }}
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ $cpPort }}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+          volumeMounts:
+            - name: raft-wal
+              mountPath: /var/lib/rustlakedb
+            {{- if .Values.tls.enabled }}
+            - name: pgwire-tls
+              mountPath: /etc/rustlakedb/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.mtls.enabled }}
+            - name: mtls-certs
+              mountPath: /etc/rustlakedb/mtls
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.tls.enabled }}
+        - name: pgwire-tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        {{- if .Values.mtls.enabled }}
+        - name: mtls-certs
+          secret:
+            secretName: {{ .Values.mtls.secretName }}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: raft-wal
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.coordinator.raft.storageClassName }}
+        storageClassName: {{ .Values.coordinator.raft.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.coordinator.raft.walSize }}
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -28,29 +258,47 @@ spec:
       labels:
         app: rustlakedb-worker
     spec:
+      {{- if .Values.workers.spotTolerations }}
+      tolerations:
+        - key: "kubernetes.io/lifecycle"
+          operator: "Equal"
+          value: "spot"
+          effect: "NoSchedule"
+      {{- end }}
       containers:
         - name: worker
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          args:
-            - "--mode"
-            - "worker"
-            - "--worker-id"
-            - "$(POD_NAME)"
-            - "--bind"
-            - "0.0.0.0:{{ .Values.workers.rpcPort }}"
-            - "--advertise-url"
-            - "{{ if .Values.mtls.enabled }}https{{ else }}http{{ end }}://$(POD_NAME).rustlakedb-workers:{{ .Values.workers.rpcPort }}"
-            - "--coordinator-url"
-            - "http://rustlakedb-coordinator:{{ .Values.coordinator.controlPlanePort }}"
-            - "--storage-uri"
-            - "{{ .Values.warehouse.uri }}"
-            - "--data-dir"
-            - "/var/lib/rustlakedb"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "/bin/sh"
+            - "-ec"
+            - |
+              COORDS=""
+              for i in $(seq 0 $(({{ $coordReplicas }} - 1))); do
+                URL="http://rustlakedb-coordinator-${i}.rustlakedb-coordinators:{{ $cpPort }}"
+                COORDS="${COORDS:+${COORDS},}${URL}"
+              done
+              exec rustlakedb \
+                --mode worker \
+                --worker-id "${POD_NAME}" \
+                --bind "0.0.0.0:{{ .Values.workers.rpcPort }}" \
+                --advertise-url "{{ if .Values.mtls.enabled }}https{{ else }}http{{ end }}://${POD_NAME}.rustlakedb-workers:{{ .Values.workers.rpcPort }}" \
+                --coordinator-urls "${COORDS}" \
+                --storage-uri "{{ .Values.warehouse.uri }}" \
+                --data-dir "/var/lib/rustlakedb"
           env:
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: AWS_REGION
+              value: "{{ .Values.warehouse.awsRegion }}"
+            - name: AWS_ALLOW_HTTP
+              value: "{{ .Values.warehouse.awsAllowHttp }}"
+            {{- if .Values.warehouse.awsEndpointUrl }}
+            - name: AWS_ENDPOINT_URL
+              value: "{{ .Values.warehouse.awsEndpointUrl }}"
+            {{- end }}
             {{- if .Values.mtls.enabled }}
             - name: RUSTLAKEDB_MTLS_CA
               value: "/etc/rustlakedb/mtls/ca.crt"
@@ -59,6 +307,11 @@ spec:
             - name: RUSTLAKEDB_MTLS_KEY
               value: "/etc/rustlakedb/mtls/server.key"
             {{- end }}
+          {{- if .Values.warehouse.credentialsSecretName }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.warehouse.credentialsSecretName }}
+          {{- end }}
           ports:
             - containerPort: {{ .Values.workers.rpcPort }}
           readinessProbe:
@@ -67,18 +320,25 @@ spec:
               port: {{ .Values.workers.rpcPort }}
               scheme: {{ if .Values.mtls.enabled }}HTTPS{{ else }}HTTP{{ end }}
             periodSeconds: 5
-          {{- if .Values.mtls.enabled }}
+          resources:
+            {{- toYaml .Values.workers.resources | nindent 12 }}
           volumeMounts:
+            - name: nvme-spill
+              mountPath: /tmp
+            {{- if .Values.mtls.enabled }}
             - name: mtls-certs
               mountPath: /etc/rustlakedb/mtls
               readOnly: true
-          {{- end }}
-      {{- if .Values.mtls.enabled }}
+            {{- end }}
       volumes:
+        - name: nvme-spill
+          emptyDir:
+            sizeLimit: {{ .Values.workers.nvmeSpillSizeLimit }}
+        {{- if .Values.mtls.enabled }}
         - name: mtls-certs
           secret:
             secretName: {{ .Values.mtls.secretName }}
-      {{- end }}
+        {{- end }}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -99,87 +359,46 @@ spec:
           type: Utilization
           averageUtilization: {{ .Values.workers.targetCpuUtilizationPercentage }}
 ---
+{{- if .Values.maintainer.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rustlakedb-coordinator
+  name: rustlakedb-maintainer
 spec:
-  replicas: {{ .Values.coordinator.replicas }}
+  replicas: 1
   selector:
     matchLabels:
-      app: rustlakedb-coordinator
+      app: rustlakedb-maintainer
   template:
     metadata:
       labels:
-        app: rustlakedb-coordinator
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/path: "/metrics"
-        prometheus.io/port: "{{ .Values.coordinator.controlPlanePort }}"
+        app: rustlakedb-maintainer
     spec:
       containers:
-        - name: coordinator
+        - name: maintainer
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--mode"
-            - "coordinator"
-            - "--pg-addr"
-            - "0.0.0.0:{{ .Values.coordinator.pgPort }}"
-            - "--rest-addr"
-            - "0.0.0.0:{{ .Values.coordinator.controlPlanePort }}"
-            - "--flight-addr"
-            - "0.0.0.0:{{ .Values.coordinator.flightPort }}"
+            - "maintainer"
             - "--storage-uri"
             - "{{ .Values.warehouse.uri }}"
             - "--data-dir"
             - "/var/lib/rustlakedb"
           env:
-            {{- if .Values.auth.oidcJwksUrl }}
-            - name: RUSTLAKEDB_OIDC_JWKS_URL
-              value: "{{ .Values.auth.oidcJwksUrl }}"
+            - name: AWS_REGION
+              value: "{{ .Values.warehouse.awsRegion }}"
+            - name: AWS_ALLOW_HTTP
+              value: "{{ .Values.warehouse.awsAllowHttp }}"
+            {{- if .Values.warehouse.awsEndpointUrl }}
+            - name: AWS_ENDPOINT_URL
+              value: "{{ .Values.warehouse.awsEndpointUrl }}"
             {{- end }}
-            {{- if .Values.mtls.enabled }}
-            - name: RUSTLAKEDB_MTLS_CA
-              value: "/etc/rustlakedb/mtls/ca.crt"
-            - name: RUSTLAKEDB_MTLS_CERT
-              value: "/etc/rustlakedb/mtls/client.crt"
-            - name: RUSTLAKEDB_MTLS_KEY
-              value: "/etc/rustlakedb/mtls/client.key"
-            {{- end }}
-          ports:
-            - name: pgwire
-              containerPort: {{ .Values.coordinator.pgPort }}
-            - name: control-plane
-              containerPort: {{ .Values.coordinator.controlPlanePort }}
-            - name: flight-sql
-              containerPort: {{ .Values.coordinator.flightPort }}
-          {{- if .Values.mtls.enabled }}
-          volumeMounts:
-            - name: mtls-certs
-              mountPath: /etc/rustlakedb/mtls
-              readOnly: true
+          {{- if .Values.warehouse.credentialsSecretName }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.warehouse.credentialsSecretName }}
           {{- end }}
-      {{- if .Values.mtls.enabled }}
-      volumes:
-        - name: mtls-certs
-          secret:
-            secretName: {{ .Values.mtls.secretName }}
-      {{- end }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: rustlakedb-coordinator
-spec:
-  selector:
-    app: rustlakedb-coordinator
-  ports:
-    - name: pgwire
-      port: {{ .Values.coordinator.pgPort }}
-      targetPort: {{ .Values.coordinator.pgPort }}
-    - name: control-plane
-      port: {{ .Values.coordinator.controlPlanePort }}
-      targetPort: {{ .Values.coordinator.controlPlanePort }}
-    - name: flight-sql
-      port: {{ .Values.coordinator.flightPort }}
-      targetPort: {{ .Values.coordinator.flightPort }}
+          resources:
+            {{- toYaml .Values.maintainer.resources | nindent 12 }}
+{{- end }}

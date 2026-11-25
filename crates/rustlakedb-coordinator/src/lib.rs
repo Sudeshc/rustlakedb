@@ -3531,6 +3531,19 @@ impl Coordinator {
             let max_retries = self.max_task_retries;
             let spec_threshold_ms = self.speculative_threshold_ms.load(Ordering::Relaxed);
             let workers_ref = &workers_snap;
+
+            // Fetch stage table metadata ONCE per stage; each task embeds ONLY the compact schema +
+            // DataFileEntries for its own assigned splits (O(1) bytes per task, zero O(N^2) RAM amplification!).
+            let mut stage_tables = Vec::new();
+            collect_plan_tables(stage_plan, &mut stage_tables);
+            let mut stage_metas: HashMap<String, rustlakedb_catalog::IcebergTableMetadata> =
+                HashMap::new();
+            for tbl in stage_tables {
+                if let Ok(meta) = self.catalog.get_table(&tbl).await {
+                    stage_metas.insert(tbl, meta);
+                }
+            }
+            let stage_metas_ref = &stage_metas;
             // Billion-row OOM protection: cap concurrent in-flight split tasks to 4 per worker so
             // 200..20,000-split tables stream smoothly with flat worker RAM instead of spiking OOM.
             let max_inflight = (workers_ref.len() * 4).clamp(4, 32);
@@ -3582,6 +3595,88 @@ impl Coordinator {
                                 .expect("worker exists")
                                 .clone();
 
+                            let mut task_meta_json: HashMap<String, serde_json::Value> =
+                                HashMap::new();
+                            if !stage_metas_ref.is_empty() {
+                                let pt_paths: std::collections::HashSet<&str> =
+                                    pt.splits.iter().map(|s| s.file_path.as_str()).collect();
+                                for (tbl, full_meta) in stage_metas_ref {
+                                    let mut slim = full_meta.clone();
+                                    let latest_sid = slim.snapshots.keys().next_back().copied();
+                                    let eq_deletes = latest_sid
+                                        .and_then(|sid| slim.snapshots.get(&sid))
+                                        .map(|s| s.equality_deletes.clone())
+                                        .unwrap_or_default();
+                                    let mut matched_by_first_sid: std::collections::BTreeMap<
+                                        u64,
+                                        Vec<rustlakedb_catalog::DataFileEntry>,
+                                    > = std::collections::BTreeMap::new();
+                                    let mut seen_paths = std::collections::HashSet::new();
+                                    // Record earliest snapshot_id for each split (preserving Equality Delete sequence ordering)
+                                    // while taking the latest DataFileEntry (for latest dv_path & stats).
+                                    let mut first_sid_map: HashMap<String, u64> = HashMap::new();
+                                    for (&sid, snap) in &slim.snapshots {
+                                        for df in &snap.data_files {
+                                            if pt_paths.contains(df.file_path.as_str()) {
+                                                first_sid_map
+                                                    .entry(df.file_path.clone())
+                                                    .or_insert(sid);
+                                            }
+                                        }
+                                    }
+                                    for snap in slim.snapshots.values().rev() {
+                                        for df in &snap.data_files {
+                                            if pt_paths.contains(df.file_path.as_str())
+                                                && seen_paths.insert(df.file_path.clone())
+                                            {
+                                                let fsid = first_sid_map
+                                                    .get(&df.file_path)
+                                                    .copied()
+                                                    .or(latest_sid)
+                                                    .unwrap_or(1);
+                                                matched_by_first_sid
+                                                    .entry(fsid)
+                                                    .or_default()
+                                                    .push(df.clone());
+                                            }
+                                        }
+                                        if seen_paths.len() == pt_paths.len() {
+                                            break;
+                                        }
+                                    }
+                                    slim.snapshots.clear();
+                                    for (fsid, files) in matched_by_first_sid {
+                                        slim.snapshots.insert(
+                                            fsid,
+                                            rustlakedb_catalog::IcebergSnapshot {
+                                                snapshot_id: fsid,
+                                                parent_snapshot_id: None,
+                                                timestamp_ms: 0,
+                                                data_files: files,
+                                                equality_deletes: Vec::new(),
+                                                summary: HashMap::new(),
+                                            },
+                                        );
+                                    }
+                                    if let Some(sid) = latest_sid {
+                                        slim.snapshots
+                                            .entry(sid)
+                                            .or_insert_with(|| rustlakedb_catalog::IcebergSnapshot {
+                                                snapshot_id: sid,
+                                                parent_snapshot_id: None,
+                                                timestamp_ms: 0,
+                                                data_files: Vec::new(),
+                                                equality_deletes: Vec::new(),
+                                                summary: HashMap::new(),
+                                            })
+                                            .equality_deletes = eq_deletes;
+                                    }
+                                    if let Ok(v) = serde_json::to_value(&slim) {
+                                        task_meta_json.insert(tbl.clone(), v);
+                                    }
+                                }
+                            }
+
                             let task_spec = TaskSpec {
                                 attempt_id: TaskAttemptId {
                                     query_id,
@@ -3595,6 +3690,7 @@ impl Coordinator {
                                 output_partitioning: stage_out_part.clone(),
                                 output_shuffle_mode: stage_shuf_mode,
                                 assigned_reduce_partitions: pt.reduce_parts.clone(),
+                                table_metadata_json: task_meta_json,
                             };
 
                             local_executed += 1;
@@ -3637,6 +3733,9 @@ impl Coordinator {
                                     return Ok((rep, local_executed, local_retried, local_hedged))
                                 }
                                 Err(RustLakeError::WorkerFailed { worker_id, reason }) => {
+                                    self.governance
+                                        .worker_rpc_timeouts_total
+                                        .fetch_add(1, Ordering::Relaxed);
                                     tracing::warn!(
                                         stage = stage_id,
                                         partition = pt.partition_id,
@@ -3768,6 +3867,36 @@ fn collect_leaf_splits(node: &PhysicalNode) -> Vec<IcebergSplit> {
             inputs.iter().flat_map(collect_leaf_splits).collect()
         }
         PhysicalNode::ShuffleRead { .. } => vec![],
+    }
+}
+
+fn collect_plan_tables(node: &PhysicalNode, out: &mut Vec<String>) {
+    match node {
+        PhysicalNode::IcebergScan { table_name, .. } => {
+            if !out.contains(table_name) {
+                out.push(table_name.clone());
+            }
+        }
+        PhysicalNode::Filter { input, .. }
+        | PhysicalNode::Project { input, .. }
+        | PhysicalNode::Distinct { input }
+        | PhysicalNode::Sort { input, .. }
+        | PhysicalNode::Limit { input, .. }
+        | PhysicalNode::TopN { input, .. }
+        | PhysicalNode::HashAggregate { input, .. }
+        | PhysicalNode::Window { input, .. }
+        | PhysicalNode::Exchange { input, .. } => collect_plan_tables(input, out),
+        PhysicalNode::HashJoin { left, right, .. }
+        | PhysicalNode::SetOp { left, right, .. } => {
+            collect_plan_tables(left, out);
+            collect_plan_tables(right, out);
+        }
+        PhysicalNode::UnionAll { inputs, .. } => {
+            for i in inputs {
+                collect_plan_tables(i, out);
+            }
+        }
+        PhysicalNode::ShuffleRead { .. } => {}
     }
 }
 

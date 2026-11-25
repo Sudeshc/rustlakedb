@@ -687,6 +687,10 @@ pub struct TaskSpec {
     /// Optional explicit reduce partition IDs assigned by AQE Dynamic Partition Coalescing (RFC-001).
     #[serde(default)]
     pub assigned_reduce_partitions: Vec<usize>,
+    /// Self-contained Iceberg table metadata pushed down by the Coordinator so stateless cloud/K8s
+    /// workers never need local Raft WAL access when executing distributed stages over S3/GCS/ADLS.
+    #[serde(default)]
+    pub table_metadata_json: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -166,6 +166,7 @@ pub struct GovernanceState {
     pub queries_total: AtomicU64,
     pub query_errors_total: AtomicU64,
     pub query_duration_ms_sum: AtomicU64,
+    pub worker_rpc_timeouts_total: AtomicU64,
     pub max_concurrent_queries: AtomicUsize,
 }
 
@@ -204,6 +205,7 @@ impl Default for GovernanceState {
             queries_total: AtomicU64::new(0),
             query_errors_total: AtomicU64::new(0),
             query_duration_ms_sum: AtomicU64::new(0),
+            worker_rpc_timeouts_total: AtomicU64::new(0),
             max_concurrent_queries: AtomicUsize::new(64),
         }
     }

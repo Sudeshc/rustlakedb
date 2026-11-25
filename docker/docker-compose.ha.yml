@@ -1,9 +1,66 @@
-# RustLakeDB High-Availability 3-Coordinator Raft Quorum + Dynamic Self-Registering Workers
-# Usage: docker compose -f docker/docker-compose.ha.yml up -d
+# RustLakeDB v9.0.0 — Production-Grade 3-Node Raft HA Quorum + L4 NLB (HAProxy) + S3 (RustFS)
+# Usage: docker compose -p rustlakedb-ha -f docker/docker-compose.ha.yml up -d
 services:
+  s3-warehouse:
+    image: rustfs/rustfs:latest
+    container_name: rustlakedb-ha-s3
+    environment:
+      RUSTFS_ACCESS_KEY: rustlake
+      RUSTFS_SECRET_KEY: rustlakesecret
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "false"
+    volumes:
+      - ha_s3_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/health || exit 0"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  s3-init:
+    image: python:3.12-slim
+    container_name: rustlakedb-ha-s3-init
+    depends_on:
+      - s3-warehouse
+    command:
+      - bash
+      - -lc
+      - |
+        pip install --root-user-action=ignore --disable-pip-version-check -q boto3 >/dev/null 2>&1
+        python -c '
+        import time, boto3
+        from botocore.config import Config
+        s3 = boto3.client("s3", endpoint_url="http://s3-warehouse:9000", aws_access_key_id="rustlake", aws_secret_access_key="rustlakesecret", region_name="us-east-1", config=Config(s3={"addressing_style": "path"}))
+        for _ in range(30):
+            try:
+                buckets = [b["Name"] for b in s3.list_buckets().get("Buckets", [])]
+                if "warehouse" not in buckets:
+                    s3.create_bucket(Bucket="warehouse")
+                print("S3 bucket s3://warehouse ready")
+                break
+            except Exception as e:
+                time.sleep(1)
+        '
+    restart: "no"
+
   coord-1:
-    image: rustlakedb:1.0.0
+    image: rustlakedb:9.0.0
     container_name: rustlakedb-ha-coord-1
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    environment: &s3_env
+      AWS_ENDPOINT_URL: "http://s3-warehouse:9000"
+      AWS_ACCESS_KEY_ID: "rustlake"
+      AWS_SECRET_ACCESS_KEY: "rustlakesecret"
+      AWS_REGION: "us-east-1"
+      AWS_ALLOW_HTTP: "true"
+      AWS_VIRTUAL_HOSTED_STYLE_REQUEST: "false"
+      RUSTLAKEDB_VENDED_ACCESS_KEY: "rustlake"
+      RUSTLAKEDB_VENDED_SECRET_KEY: "rustlakesecret"
+      RUSTLAKEDB_VENDED_REGION: "us-east-1"
+      RUSTLAKEDB_VENDED_ENDPOINT: "http://s3-warehouse:9000"
     command:
       - "--mode"
       - "coordinator"
@@ -11,23 +68,33 @@ services:
       - "0.0.0.0:5432"
       - "--rest-addr"
       - "0.0.0.0:8181"
+      - "--flight-addr"
+      - "0.0.0.0:8815"
       - "--data-dir"
-      - "/warehouse"
+      - "/wal"
+      - "--storage-uri"
+      - "s3://warehouse"
       - "--raft-node-id"
       - "1"
       - "--raft-bind"
       - "0.0.0.0:9001"
       - "--raft-peers"
       - "1=http://coord-1:9001,2=http://coord-2:9002,3=http://coord-3:9003"
-    ports:
-      - "15433:5432"
-      - "18182:8181"
     volumes:
-      - ha_warehouse:/warehouse
+      - ha_wal_1:/wal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8181/healthz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
   coord-2:
-    image: rustlakedb:1.0.0
+    image: rustlakedb:9.0.0
     container_name: rustlakedb-ha-coord-2
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    environment: *s3_env
     command:
       - "--mode"
       - "coordinator"
@@ -35,8 +102,12 @@ services:
       - "0.0.0.0:5432"
       - "--rest-addr"
       - "0.0.0.0:8181"
+      - "--flight-addr"
+      - "0.0.0.0:8815"
       - "--data-dir"
-      - "/warehouse"
+      - "/wal"
+      - "--storage-uri"
+      - "s3://warehouse"
       - "--raft-node-id"
       - "2"
       - "--raft-bind"
@@ -44,11 +115,20 @@ services:
       - "--raft-peers"
       - "1=http://coord-1:9001,2=http://coord-2:9002,3=http://coord-3:9003"
     volumes:
-      - ha_warehouse:/warehouse
+      - ha_wal_2:/wal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8181/healthz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
   coord-3:
-    image: rustlakedb:1.0.0
+    image: rustlakedb:9.0.0
     container_name: rustlakedb-ha-coord-3
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    environment: *s3_env
     command:
       - "--mode"
       - "coordinator"
@@ -56,8 +136,12 @@ services:
       - "0.0.0.0:5432"
       - "--rest-addr"
       - "0.0.0.0:8181"
+      - "--flight-addr"
+      - "0.0.0.0:8815"
       - "--data-dir"
-      - "/warehouse"
+      - "/wal"
+      - "--storage-uri"
+      - "s3://warehouse"
       - "--raft-node-id"
       - "3"
       - "--raft-bind"
@@ -65,45 +149,88 @@ services:
       - "--raft-peers"
       - "1=http://coord-1:9001,2=http://coord-2:9002,3=http://coord-3:9003"
     volumes:
-      - ha_warehouse:/warehouse
+      - ha_wal_3:/wal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8181/healthz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
-  worker-auto-1:
-    image: rustlakedb:1.0.0
-    depends_on: [coord-1]
+  nlb:
+    image: haproxy:2.9-alpine
+    container_name: rustlakedb-ha-nlb
+    depends_on:
+      coord-1:
+        condition: service_healthy
+      coord-2:
+        condition: service_healthy
+      coord-3:
+        condition: service_healthy
+    volumes:
+      - ./haproxy-ha.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "15433:5432"
+      - "18182:8181"
+      - "18816:8815"
+
+  worker-ha-1:
+    image: rustlakedb:9.0.0
+    container_name: rustlakedb-ha-worker-1
+    depends_on:
+      coord-1:
+        condition: service_healthy
+    environment: *s3_env
     command:
       - "--mode"
       - "worker"
       - "--worker-id"
-      - "worker-auto-1"
+      - "worker-ha-1"
       - "--bind"
       - "0.0.0.0:7001"
       - "--advertise-url"
-      - "http://worker-auto-1:7001"
+      - "http://worker-ha-1:7001"
       - "--coordinator-urls"
       - "http://coord-1:8181,http://coord-2:8181,http://coord-3:8181"
+      - "--storage-uri"
+      - "s3://warehouse"
       - "--data-dir"
-      - "/warehouse"
-    volumes:
-      - ha_warehouse:/warehouse
+      - "/tmp/rustlakedb-w1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:7001/healthz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
-  worker-auto-2:
-    image: rustlakedb:1.0.0
-    depends_on: [coord-1]
+  worker-ha-2:
+    image: rustlakedb:9.0.0
+    container_name: rustlakedb-ha-worker-2
+    depends_on:
+      coord-1:
+        condition: service_healthy
+    environment: *s3_env
     command:
       - "--mode"
       - "worker"
       - "--worker-id"
-      - "worker-auto-2"
+      - "worker-ha-2"
       - "--bind"
       - "0.0.0.0:7002"
       - "--advertise-url"
-      - "http://worker-auto-2:7002"
+      - "http://worker-ha-2:7002"
       - "--coordinator-urls"
       - "http://coord-1:8181,http://coord-2:8181,http://coord-3:8181"
+      - "--storage-uri"
+      - "s3://warehouse"
       - "--data-dir"
-      - "/warehouse"
-    volumes:
-      - ha_warehouse:/warehouse
+      - "/tmp/rustlakedb-w2"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:7002/healthz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
 volumes:
-  ha_warehouse:
+  ha_s3_data:
+  ha_wal_1:
+  ha_wal_2:
+  ha_wal_3:

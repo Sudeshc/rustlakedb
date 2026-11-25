@@ -1,0 +1,105 @@
+# RustLakeDB v9.0.0 — 72-Hour Staging Soak + Jepsen Network Partition Chaos Mesh Suite
+# Apply in a staging namespace running the 3-node Raft HA Helm chart + Chaos Mesh:
+#   kubectl apply -n rustlakedb-staging -f deploy/chaos/chaos-mesh-jepsen.yaml
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: rustlakedb-jepsen-raft-partition
+  labels:
+    suite: rustlakedb-72h-soak
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  type: NetworkChaos
+  networkChaos:
+    action: partition
+    mode: one
+    selector:
+      labelSelectors:
+        app: rustlakedb-coordinator
+    direction: both
+    target:
+      mode: all
+      selector:
+        labelSelectors:
+          app: rustlakedb-coordinator
+    duration: "90s"
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: rustlakedb-jepsen-asymmetric-packet-loss
+  labels:
+    suite: rustlakedb-72h-soak
+spec:
+  schedule: "15 * * * *"
+  concurrencyPolicy: Forbid
+  type: NetworkChaos
+  networkChaos:
+    action: loss
+    mode: one
+    selector:
+      labelSelectors:
+        app: rustlakedb-coordinator
+    loss:
+      loss: "35"
+      correlation: "25"
+    duration: "2m"
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: rustlakedb-chaos-worker-sigkill
+  labels:
+    suite: rustlakedb-72h-soak
+spec:
+  schedule: "*/20 * * * *"
+  concurrencyPolicy: Forbid
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      labelSelectors:
+        app: rustlakedb-worker
+    gracePeriod: 0
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: rustlakedb-chaos-coordinator-sigkill
+  labels:
+    suite: rustlakedb-72h-soak
+spec:
+  schedule: "45 */2 * * *"
+  concurrencyPolicy: Forbid
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      labelSelectors:
+        app: rustlakedb-coordinator
+    gracePeriod: 0
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: rustlakedb-chaos-worker-memory-pressure
+  labels:
+    suite: rustlakedb-72h-soak
+spec:
+  schedule: "0 */4 * * *"
+  concurrencyPolicy: Forbid
+  type: StressChaos
+  stressChaos:
+    mode: one
+    selector:
+      labelSelectors:
+        app: rustlakedb-worker
+    stressors:
+      memory:
+        workers: 2
+        size: "2GiB"
+    duration: "3m"

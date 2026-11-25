@@ -200,7 +200,7 @@ impl WorkerNode {
                     projection,
                     ..
                 } => {
-                    let meta = self.catalog.get_table(table_name).await?;
+                    let meta = self.resolve_table_meta(task, table_name).await?;
                     let mut all_cols: Vec<String> =
                         meta.schema.iter().map(|f| f.name.clone()).collect();
                     let file_stats: HashMap<&str, &rustlakedb_catalog::DataFileEntry> = meta
@@ -668,7 +668,7 @@ impl WorkerNode {
                         splits,
                         ..
                     } = input.as_ref()
-                        && let Ok(meta) = self.catalog.get_table(table_name).await
+                        && let Ok(meta) = self.resolve_table_meta(task, table_name).await
                         && meta.column_aliases.is_empty()
                     {
                         let effective_splits = if !task.assigned_splits.is_empty() {
@@ -2598,7 +2598,7 @@ impl WorkerNode {
             return Ok(None);
         }
         // Fast path handles pure column projections and simple expressions over existing columns
-        let meta = self.catalog.get_table(table_name).await?;
+        let meta = self.resolve_table_meta(task, table_name).await?;
         let schema_types: HashMap<&str, &rustlakedb_catalog::ColumnType> = meta
             .schema
             .iter()
@@ -2689,7 +2689,7 @@ impl WorkerNode {
             return Ok(None);
         }
 
-        let meta_opt = self.catalog.get_table(table_name).await.ok();
+        let meta_opt = self.resolve_table_meta(task, table_name).await.ok();
         if meta_opt
             .as_ref()
             .and_then(|m| m.snapshots.values().next_back())
@@ -3647,6 +3647,20 @@ impl WorkerNode {
     /// Wave 9 + Wave 12 Multi-Column Vectorized Arrow Top-N Pushdown Fast Path:
     /// Scans Parquet splits directly as columnar Arrow `RecordBatch`es and maintains a bounded
     /// top-K selection over single- or multi-column `ORDER BY k1, k2, ...` Arrow slices!
+    async fn resolve_table_meta(
+        &self,
+        task: &TaskSpec,
+        table_name: &str,
+    ) -> Result<rustlakedb_catalog::IcebergTableMetadata> {
+        if let Some(val) = task.table_metadata_json.get(table_name)
+            && let Ok(meta) =
+                serde_json::from_value::<rustlakedb_catalog::IcebergTableMetadata>(val.clone())
+        {
+            return Ok(meta);
+        }
+        self.catalog.get_table(table_name).await
+    }
+
     async fn try_eval_vectorized_topn(
         &self,
         table_name: &str,
@@ -3658,7 +3672,7 @@ impl WorkerNode {
         if task.assigned_splits.is_empty() || keys.is_empty() || k == 0 {
             return Ok(None);
         }
-        let meta = self.catalog.get_table(table_name).await?;
+        let meta = self.resolve_table_meta(task, table_name).await?;
         let schema_types: HashMap<&str, &rustlakedb_catalog::ColumnType> = meta
             .schema
             .iter()

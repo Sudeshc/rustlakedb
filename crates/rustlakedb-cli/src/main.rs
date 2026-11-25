@@ -131,6 +131,14 @@ struct Args {
     /// Landing directory to watch for `--mode autoloader`.
     #[arg(long)]
     landing_dir: Option<PathBuf>,
+
+    /// Enterprise OIDC Issuer URL for automatic `/.well-known/openid-configuration` discovery + JWKS rotation (e.g. Okta / Entra ID / Auth0 / Google).
+    #[arg(long)]
+    oidc_issuer: Option<String>,
+
+    /// Optional expected JWT `aud` claim when `--oidc-issuer` is configured.
+    #[arg(long)]
+    oidc_audience: Option<String>,
 }
 
 #[tokio::main]
@@ -302,6 +310,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 },
             ));
+            let oidc_issuer = args
+                .oidc_issuer
+                .clone()
+                .or_else(|| std::env::var("RUSTLAKEDB_OIDC_ISSUER").ok())
+                .filter(|s| !s.trim().is_empty());
+            let oidc_audience = args
+                .oidc_audience
+                .clone()
+                .or_else(|| std::env::var("RUSTLAKEDB_OIDC_AUDIENCE").ok())
+                .filter(|s| !s.trim().is_empty());
+            if let Some(issuer) = oidc_issuer {
+                match coord
+                    .governance
+                    .configure_oidc_discovery(&issuer, oidc_audience.clone())
+                    .await
+                {
+                    Ok(keys) => println!(
+                        "OIDC Discovery enabled for {issuer} (loaded {keys} JWKS keys, aud={:?})",
+                        oidc_audience
+                    ),
+                    Err(e) => tracing::warn!(
+                        issuer = %issuer,
+                        error = %e,
+                        "OIDC discovery failed at startup; will retry on JWT verification"
+                    ),
+                }
+            }
             if let Ok(jwks_url) = std::env::var("RUSTLAKEDB_OIDC_JWKS_URL")
                 && !jwks_url.trim().is_empty()
             {

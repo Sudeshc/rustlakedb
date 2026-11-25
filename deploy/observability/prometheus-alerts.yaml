@@ -1,27 +1,100 @@
 groups:
-  - name: rustlakedb.rules
+  - name: rustlakedb.slo.burnrate
     rules:
-      - alert: RustLakeDBWorkerDown
-        expr: rustlakedb_workers_healthy < rustlakedb_workers_total
-        for: 1m
+      # 99.9% Query Availability SLO — Multi-Window Multi-Burn-Rate (Google SRE Workbook)
+      - alert: RustLakeDBQueryErrorBurnRateCritical
+        expr: |
+          (
+            sum(rate(rustlakedb_query_errors_total[5m])) / clamp_min(sum(rate(rustlakedb_queries_total[5m])), 1) > (14.4 * 0.001)
+            and
+            sum(rate(rustlakedb_query_errors_total[1h])) / clamp_min(sum(rate(rustlakedb_queries_total[1h])), 1) > (14.4 * 0.001)
+          )
+        for: 2m
         labels:
           severity: critical
+          page: "true"
         annotations:
-          summary: "One or more RustLakeDB workers are unhealthy"
-          description: "Healthy workers ({{ $value }}) < total registered workers for > 1m."
+          summary: "Critical SLO error budget burn (14.4x) on RustLakeDB queries"
+          description: "Query error ratio is burning >2% of the 30-day 99.9% SLO error budget per hour."
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#high-error-burn"
 
-      - alert: RustLakeDBHighQueryErrorRate
-        expr: rate(rustlakedb_query_errors_total[5m]) / clamp_min(rate(rustlakedb_queries_total[5m]), 1) > 0.05
-        for: 2m
+      - alert: RustLakeDBQueryErrorBurnRateWarning
+        expr: |
+          (
+            sum(rate(rustlakedb_query_errors_total[30m])) / clamp_min(sum(rate(rustlakedb_queries_total[30m])), 1) > (6 * 0.001)
+            and
+            sum(rate(rustlakedb_query_errors_total[6h])) / clamp_min(sum(rate(rustlakedb_queries_total[6h])), 1) > (6 * 0.001)
+          )
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "RustLakeDB query error rate exceeds 5%"
+          summary: "Elevated SLO error budget burn (6x) on RustLakeDB queries"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#high-error-burn"
+
+      - alert: RustLakeDBWorkerRpcTimeoutSurge
+        expr: sum(rate(rustlakedb_worker_rpc_timeouts_total[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          page: "true"
+        annotations:
+          summary: "RustLakeDB worker RPC timeouts surging ({{ $value | printf \"%.2f\" }}/s)"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#worker-rpc-timeouts"
+
+      - alert: RustLakeDBRaftNoLeader
+        expr: sum(rustlakedb_raft_is_leader) != 1
+        for: 30s
+        labels:
+          severity: critical
+          page: "true"
+        annotations:
+          summary: "RustLakeDB Raft quorum has {{ $value }} leaders (expected exactly 1)"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#raft-no-leader"
+
+      - alert: RustLakeDBRaftLeaderChurn
+        expr: sum(increase(rustlakedb_raft_leader_changes_total[15m])) >= 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RustLakeDB Raft leadership flapping ({{ $value }} changes in 15m)"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#raft-leader-churn"
+
+      - alert: RustLakeDBNvmeSpillPressure
+        expr: max(rustlakedb_nvme_spill_bytes) > 53687091200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RustLakeDB NVMe out-of-core spill exceeds 50 GiB"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#nvme-spill-pressure"
+
+      - alert: RustLakeDBSnapshotBacklogHigh
+        expr: max(rustlakedb_catalog_max_snapshots) > 250
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Iceberg table snapshot backlog exceeds 250 retained snapshots"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#snapshot-backlog"
+
+      - alert: RustLakeDBWorkerDown
+        expr: min(rustlakedb_workers_healthy) < max(rustlakedb_workers_total)
+        for: 1m
+        labels:
+          severity: critical
+          page: "true"
+        annotations:
+          summary: "One or more RustLakeDB workers are unhealthy"
+          description: "Healthy workers ({{ $value }}) < total registered workers for > 1m."
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#worker-down"
 
       - alert: RustLakeDBHighQueryLatency
-        expr: rate(rustlakedb_query_duration_ms_sum[5m]) / clamp_min(rate(rustlakedb_queries_total[5m]), 1) > 2000
+        expr: sum(rate(rustlakedb_query_duration_ms_sum[5m])) / clamp_min(sum(rate(rustlakedb_queries_total[5m])), 1) > 2000
         for: 3m
         labels:
           severity: warning
         annotations:
           summary: "RustLakeDB average query latency exceeds 2000ms"
+          runbook_url: "https://github.com/Sudeshc/rustlakedb/blob/main/docs/SRE_RUNBOOKS.md#high-latency"
