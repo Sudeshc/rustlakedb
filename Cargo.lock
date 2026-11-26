@@ -2182,6 +2182,7 @@ dependencies = [
  "bytes",
  "hyper",
  "hyper-util",
+ "reqwest",
  "roaring",
  "rustlakedb-catalog",
  "rustlakedb-common",

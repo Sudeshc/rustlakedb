@@ -28,6 +28,8 @@ pub enum ColumnType {
     },
     /// Apache Iceberg v3 VARIANT type (supports automatic Parquet sub-column shredding, RFC-003).
     Variant,
+    /// Native fixed-dimension Float32 embedding vector (`VECTOR(N)` stored as Arrow `FixedSizeList<Float32>`, Wave 42).
+    Vector(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,8 +460,37 @@ pub struct PersistedLineageEdge {
     pub timestamp_ms: u64,
 }
 
+/// Raft-persisted ML Model Registry entry with training dataset snapshot lineage (Wave 42).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredModelVersion {
+    pub name: String,
+    pub version: u64,
+    /// Lifecycle stage: `dev`, `staging`, `production`, `archived`
+    pub stage: String,
+    pub artifact_uri: String,
+    pub framework: String,
+    pub training_table: Option<String>,
+    pub training_snapshot_id: Option<u64>,
+    #[serde(default)]
+    pub metrics: BTreeMap<String, f64>,
+    pub created_by: String,
+    pub created_ms: u64,
+}
+
+/// Raft-persisted ML Feature View definition for point-in-time feature serving (Wave 42).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureViewDef {
+    pub name: String,
+    pub entity_key: String,
+    pub timestamp_col: String,
+    pub source_table: String,
+    pub query_sql: String,
+    pub created_by: String,
+    pub created_ms: u64,
+}
+
 /// Crash-safe, Raft-replicated Enterprise Governance State (RBAC, Role Hierarchy, Column Grants,
-/// RLS, Dynamic & Tag-ABAC Masking, Lineage, Audit, Access History & External Catalogs, Waves 29 + 40).
+/// RLS, Dynamic & Tag-ABAC Masking, Lineage, Audit, Access History, External Catalogs, Model Registry & Feature Views, Waves 29 + 40 + 42).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedGovernanceState {
     #[serde(default)]
@@ -494,9 +525,15 @@ pub struct PersistedGovernanceState {
     /// Durable Snowflake-style table/column access history
     #[serde(default)]
     pub access_history: Vec<PersistedAccessEntry>,
+    /// ML Model Registry versions (Wave 42)
+    #[serde(default)]
+    pub models: Vec<RegisteredModelVersion>,
+    /// ML Feature Store views (Wave 42)
+    #[serde(default)]
+    pub feature_views: Vec<FeatureViewDef>,
 }
 
-/// Replicated governance mutation committed through the Raft WAL (Waves 29 + 40).
+/// Replicated governance mutation committed through the Raft WAL (Waves 29 + 40 + 42).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceOp {
     CreateRole(String),
@@ -538,6 +575,13 @@ pub enum GovernanceOp {
     RecordLineage(PersistedLineageEdge),
     RecordAudit(PersistedAuditEntry),
     RecordAccess(PersistedAccessEntry),
+    RegisterModel(RegisteredModelVersion),
+    SetModelStage {
+        name: String,
+        version: u64,
+        stage: String,
+    },
+    RegisterFeatureView(FeatureViewDef),
 }
 
 /// Live Raft consensus telemetry exported to `/healthz` and Prometheus `/metrics`.
@@ -1598,6 +1642,26 @@ impl Catalog for InMemoryRaftCatalog {
                     g.access_history.remove(0);
                 }
                 g.access_history.push(entry);
+            }
+            GovernanceOp::RegisterModel(m) => {
+                g.models
+                    .retain(|x| !(x.name == m.name && x.version == m.version));
+                g.models.push(m);
+            }
+            GovernanceOp::SetModelStage {
+                name,
+                version,
+                stage,
+            } => {
+                for m in &mut g.models {
+                    if m.name == name && m.version == version {
+                        m.stage = stage.clone();
+                    }
+                }
+            }
+            GovernanceOp::RegisterFeatureView(fv) => {
+                g.feature_views.retain(|x| x.name != fv.name);
+                g.feature_views.push(fv);
             }
         }
         self.persist_governance_locked(&g)?;

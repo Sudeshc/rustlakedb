@@ -5,12 +5,12 @@ pub mod hnsw;
 pub mod iceberg_avro;
 
 use arrow_array::builder::{
-    BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, Int64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeListBuilder, Float32Builder,
+    Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
-    StringArray, TimestampMicrosecondArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
@@ -139,6 +139,7 @@ pub struct IcebergObjectStore {
     pub files_pruned_by_puffin: AtomicU64,
     pub files_pruned_by_zonemap: AtomicU64,
     pub files_pruned_by_partition: AtomicU64,
+    pub hnsw_index_hits: AtomicU64,
     pub rows_skipped_by_dv: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
@@ -186,6 +187,7 @@ impl IcebergObjectStore {
             files_pruned_by_puffin: AtomicU64::new(0),
             files_pruned_by_zonemap: AtomicU64::new(0),
             files_pruned_by_partition: AtomicU64::new(0),
+            hnsw_index_hits: AtomicU64::new(0),
             rows_skipped_by_dv: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -1109,6 +1111,7 @@ impl IcebergObjectStore {
                         format!("decimal({precision},{scale})")
                     }
                     ColumnType::Variant => "variant".into(),
+                    ColumnType::Vector(dim) => format!("vector({dim})"),
                 };
                 serde_json::json!({
                     "id": f.field_id,
@@ -1568,6 +1571,51 @@ fn row_batch_to_arrow_and_puffin(
                     .insert(col.name.clone(), distinct.len() as u64);
                 arrays.push(Arc::new(b.finish()));
             }
+            ColumnType::Vector(dim) => {
+                let d = dim.max(1) as i32;
+                let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+                fields.push(Field::new(
+                    &col.name,
+                    DataType::FixedSizeList(item_field.clone(), d),
+                    col.nullable,
+                ));
+                let mut lb = FixedSizeListBuilder::new(Float32Builder::new(), d)
+                    .with_field(item_field);
+                for r in &batch.rows {
+                    let parsed: Option<Vec<f32>> = match r.get(&col.name) {
+                        Some(ScalarValue::Json(serde_json::Value::Array(arr))) => {
+                            Some(arr.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect())
+                        }
+                        Some(ScalarValue::Utf8(s)) => {
+                            let inner = s.trim().trim_start_matches('[').trim_end_matches(']');
+                            if inner.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    inner
+                                        .split(',')
+                                        .filter_map(|p| p.trim().parse::<f32>().ok())
+                                        .collect(),
+                                )
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(vals) = parsed {
+                        for idx in 0..dim.max(1) {
+                            lb.values()
+                                .append_value(vals.get(idx).copied().unwrap_or(0.0));
+                        }
+                        lb.append(true);
+                    } else {
+                        for _ in 0..dim.max(1) {
+                            lb.values().append_null();
+                        }
+                        lb.append(false);
+                    }
+                }
+                arrays.push(Arc::new(lb.finish()));
+            }
             ColumnType::Variant => {
                 fields.push(Field::new(&col.name, DataType::Utf8, col.nullable));
                 let mut b = StringBuilder::new();
@@ -1764,6 +1812,23 @@ fn extract_scalar(
     }
     if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
         return ScalarValue::Bool(a.value(row_idx));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
+        let vals = a.value(row_idx);
+        if let Some(fa) = vals.as_any().downcast_ref::<Float32Array>() {
+            let nums: Vec<serde_json::Value> = (0..fa.len())
+                .map(|i| {
+                    if fa.is_null(i) {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Number::from_f64(fa.value(i) as f64)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                })
+                .collect();
+            return ScalarValue::Json(serde_json::Value::Array(nums));
+        }
     }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
         let s = a.value(row_idx);

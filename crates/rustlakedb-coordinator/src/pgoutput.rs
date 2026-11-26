@@ -639,7 +639,7 @@ fn parse_text_scalar(s: &str, dt: &ColumnType) -> ScalarValue {
             .map(ScalarValue::Float64)
             .unwrap_or_else(|_| ScalarValue::Utf8(s.to_string())),
         ColumnType::Bool => ScalarValue::Bool(matches!(s, "t" | "true" | "TRUE" | "1")),
-        ColumnType::Variant => ScalarValue::Json(
+        ColumnType::Variant | ColumnType::Vector(_) => ScalarValue::Json(
             serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string())),
         ),
         _ => ScalarValue::Utf8(s.to_string()),

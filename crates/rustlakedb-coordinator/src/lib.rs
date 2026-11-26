@@ -465,6 +465,79 @@ impl Coordinator {
             .sum()
     }
 
+    /// Auto-builds & persists `.hnsw.json` sidecars for newly written or compacted Parquet files
+    /// whenever the table has a registered `PuffinIndexType::Hnsw` index (Wave 42).
+    async fn auto_build_hnsw_for_files(
+        &self,
+        meta: &IcebergTableMetadata,
+        files: &[rustlakedb_catalog::DataFileEntry],
+    ) {
+        let Some(hnsw_spec) = meta
+            .indexes
+            .iter()
+            .find(|idx| idx.index_type == PuffinIndexType::Hnsw)
+        else {
+            return;
+        };
+        let idx_col = &hnsw_spec.column;
+        for df in files {
+            if let Ok(fb) = self
+                .store
+                .read_data_file_with_dv(&df.file_path, df.dv_path.as_deref(), &meta.schema, None)
+                .await
+            {
+                let mut hnsw = rustlakedb_storage::hnsw::HnswIndex::new(8, 32);
+                for (row_idx, row) in fb.rows.iter().enumerate() {
+                    let vec_opt = match row.get(idx_col) {
+                        Some(ScalarValue::Json(serde_json::Value::Array(arr))) => {
+                            Some(arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>())
+                        }
+                        Some(ScalarValue::Utf8(s)) => {
+                            let t = s.trim().trim_start_matches('[').trim_end_matches(']');
+                            let v: Vec<f64> = t
+                                .split(',')
+                                .filter_map(|p| p.trim().parse::<f64>().ok())
+                                .collect();
+                            if v.is_empty() { None } else { Some(v) }
+                        }
+                        _ => None,
+                    };
+                    if let Some(v) = vec_opt
+                        && !v.is_empty()
+                    {
+                        hnsw.insert(row_idx as u32, v);
+                    }
+                }
+                let _ = self.store.write_hnsw_index(&df.file_path, &hnsw).await;
+            }
+        }
+    }
+
+    /// Reads all active (non-deleted) rows of a table on `branch` (used by `ASOF JOIN`, Wave 42).
+    async fn read_full_table_rows(
+        &self,
+        meta: &IcebergTableMetadata,
+        branch: &str,
+    ) -> Result<Vec<BTreeMap<String, ScalarValue>>> {
+        let snap = meta.current_snapshot(branch)?;
+        let mut out = Vec::new();
+        for df in &snap.data_files {
+            let fb = self
+                .store
+                .read_data_file_with_aliases_and_dv(
+                    &df.file_path,
+                    df.dv_path.as_deref(),
+                    &meta.schema,
+                    &meta.column_aliases,
+                    None,
+                    None,
+                )
+                .await?;
+            out.extend(fb.rows);
+        }
+        Ok(out)
+    }
+
     /// Graceful Day-2 Ops Node Drain (Wave 41):
     /// 1. Marks node as draining (`/readyz` -> 503, rejects new SQL/ingest requests)
     /// 2. Flushes all pending streaming micro-batch buffers so zero rows are lost
@@ -751,6 +824,15 @@ impl Coordinator {
                 ),
                 stats: QueryExecutionStats::default(),
             });
+        }
+
+        // Wave 42: `system.models` & `system.feature_views` ML Registry virtual tables
+        if lower.contains("system.models") && lower.starts_with("select ") {
+            return Box::pin(self.execute_sql_traced("SHOW MODELS", branch, session, trace_id)).await;
+        }
+        if lower.contains("system.feature_views") && lower.starts_with("select ") {
+            return Box::pin(self.execute_sql_traced("SHOW FEATURE VIEWS", branch, session, trace_id))
+                .await;
         }
 
         // Wave 37: `SHOW VIEWS` catalog inspection
@@ -1664,6 +1746,7 @@ impl Coordinator {
                 let added_files = self
                     .write_partitioned_data_files(&meta, "part", &batch)
                     .await?;
+                self.auto_build_hnsw_for_files(&meta, &added_files).await;
                 let prop = TableCommitProposal {
                     table_name: table_name.clone(),
                     branch: branch.to_string(),
@@ -1907,6 +1990,7 @@ impl Coordinator {
 
                 let new_count = added_files.len();
                 let old_count = removed_paths.len();
+                self.auto_build_hnsw_for_files(&meta, &added_files).await;
                 self.catalog
                     .commit_table(TableCommitProposal {
                         table_name: table_name.clone(),
@@ -3362,6 +3446,440 @@ impl Coordinator {
                     stats: QueryExecutionStats::default(),
                 })
             }
+            PlannedCommand::AsofJoinQuery {
+                left_table,
+                left_alias,
+                right_table,
+                right_alias,
+                entity_left_col,
+                entity_right_col,
+                ts_left_col,
+                ts_right_col,
+                is_left_outer,
+                select_items,
+                order_by_col,
+                limit,
+            } => {
+                // Wave 42: Point-in-time leakage-free ML Feature Store ASOF JOIN!
+                self.governance.check_access(session, &left_table, "SELECT")?;
+                self.governance.check_access(session, &right_table, "SELECT")?;
+                let left_meta = self.catalog.get_table(&left_table).await?;
+                let right_meta = self.catalog.get_table(&right_table).await?;
+
+                let mut left_rows = self.read_full_table_rows(&left_meta, branch).await?;
+                let mut right_rows = self.read_full_table_rows(&right_meta, branch).await?;
+
+                // Apply RLS if configured
+                if let Some(pred) = self.governance.get_rls_policy(session, &left_table) {
+                    left_rows.retain(|r| rustlakedb_worker::eval_filter(r, &pred));
+                }
+                if let Some(pred) = self.governance.get_rls_policy(session, &right_table) {
+                    right_rows.retain(|r| rustlakedb_worker::eval_filter(r, &pred));
+                }
+
+                // Group right feature rows by entity key, sorted ascending by timestamp
+                type AsofRowEntry = (f64, String, BTreeMap<String, ScalarValue>);
+                let mut right_by_entity: HashMap<String, Vec<AsofRowEntry>> = HashMap::new();
+                for rr in right_rows {
+                    let ek = rr
+                        .get(&entity_right_col)
+                        .and_then(|v| v.to_pg_text())
+                        .unwrap_or_default();
+                    let (ts_num, ts_str) = scalar_asof_ts(rr.get(&ts_right_col));
+                    right_by_entity
+                        .entry(ek)
+                        .or_default()
+                        .push((ts_num, ts_str, rr));
+                }
+                for list in right_by_entity.values_mut() {
+                    list.sort_by(|a, b| {
+                        a.0.partial_cmp(&b.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.1.cmp(&b.1))
+                    });
+                }
+
+                let mut joined_rows = Vec::new();
+                for lr in left_rows {
+                    let ek = lr
+                        .get(&entity_left_col)
+                        .and_then(|v| v.to_pg_text())
+                        .unwrap_or_default();
+                    let (lts_num, lts_str) = scalar_asof_ts(lr.get(&ts_left_col));
+                    let matched_right = right_by_entity.get(&ek).and_then(|list| {
+                        // Latest right row strictly <= left timestamp (zero future data leakage!)
+                        list.iter()
+                            .rev()
+                            .find(|(rnum, rstr, _)| {
+                                if lts_num.is_finite() && rnum.is_finite() {
+                                    *rnum <= lts_num
+                                } else {
+                                    rstr <= &lts_str
+                                }
+                            })
+                            .map(|(_, _, r)| r)
+                    });
+                    if matched_right.is_none() && !is_left_outer {
+                        continue;
+                    }
+                    let mut out = BTreeMap::new();
+                    for (src_expr, alias) in &select_items {
+                        if src_expr == "*" {
+                            for (k, v) in &lr {
+                                out.insert(k.clone(), v.clone());
+                            }
+                            if let Some(rr) = matched_right {
+                                for (k, v) in rr {
+                                    out.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                            }
+                            continue;
+                        }
+                        let val = if let Some((pfx, col)) = src_expr.split_once('.') {
+                            let c = col.trim_matches('"');
+                            if pfx.eq_ignore_ascii_case(&left_alias)
+                                || pfx.eq_ignore_ascii_case(&left_table)
+                            {
+                                lr.get(c).cloned().unwrap_or(ScalarValue::Null)
+                            } else if pfx.eq_ignore_ascii_case(&right_alias)
+                                || pfx.eq_ignore_ascii_case(&right_table)
+                            {
+                                matched_right
+                                    .and_then(|r| r.get(c).cloned())
+                                    .unwrap_or(ScalarValue::Null)
+                            } else {
+                                lr.get(c)
+                                    .cloned()
+                                    .or_else(|| matched_right.and_then(|r| r.get(c).cloned()))
+                                    .unwrap_or(ScalarValue::Null)
+                            }
+                        } else {
+                            let c = src_expr.trim_matches('"');
+                            lr.get(c)
+                                .cloned()
+                                .or_else(|| matched_right.and_then(|r| r.get(c).cloned()))
+                                .unwrap_or(ScalarValue::Null)
+                        };
+                        out.insert(alias.clone(), val);
+                    }
+                    joined_rows.push(out);
+                }
+
+                if let Some((ref ocol, desc)) = order_by_col {
+                    joined_rows.sort_by(|a, b| {
+                        let av = a.get(ocol);
+                        let bv = b.get(ocol);
+                        let ord = match (av.and_then(|v| v.as_f64()), bv.and_then(|v| v.as_f64())) {
+                            (Some(af), Some(bf)) => {
+                                af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+                            }
+                            _ => av
+                                .and_then(|v| v.to_pg_text())
+                                .cmp(&bv.and_then(|v| v.to_pg_text())),
+                        };
+                        if desc { ord.reverse() } else { ord }
+                    });
+                }
+                if let Some(lim) = limit {
+                    joined_rows.truncate(lim);
+                }
+                let cols: Vec<String> = if select_items.iter().any(|(s, _)| s == "*") {
+                    joined_rows
+                        .first()
+                        .map(|r| r.keys().cloned().collect())
+                        .unwrap_or_default()
+                } else {
+                    select_items.iter().map(|(_, a)| a.clone()).collect()
+                };
+                let mut batch = RowBatch::new(cols.clone(), joined_rows);
+                let accessed = vec![left_table.clone(), right_table.clone()];
+                self.governance.apply_masking(session, &accessed, &mut batch);
+                let mut ttags = HashMap::new();
+                if !left_meta.tags.is_empty() {
+                    ttags.insert(left_table.clone(), left_meta.tags.clone());
+                }
+                if !right_meta.tags.is_empty() {
+                    ttags.insert(right_table.clone(), right_meta.tags.clone());
+                }
+                self.governance.apply_tag_masking(session, &ttags, &mut batch);
+                for tbl in &accessed {
+                    let entry = self.governance.record_access(
+                        "asof-join",
+                        session,
+                        tbl,
+                        cols.clone(),
+                        "SELECT",
+                        "SQL",
+                    );
+                    let _ = self
+                        .catalog
+                        .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAccess(entry))
+                        .await;
+                }
+                let n = batch.num_rows();
+                Ok(QueryExecutionResult {
+                    command_tag: format!("SELECT {n}"),
+                    dag: None,
+                    batch,
+                    stats: QueryExecutionStats {
+                        stages_executed: 1,
+                        tasks_executed: 1,
+                        ..Default::default()
+                    },
+                })
+            }
+            PlannedCommand::RegisterModel {
+                name,
+                version,
+                framework,
+                artifact_uri,
+                training_table,
+                metrics,
+                stage,
+            } => {
+                if stage.eq_ignore_ascii_case("production") {
+                    self.governance.require_security_admin(
+                        session,
+                        "REGISTER PRODUCTION MODEL",
+                        &format!("{name}:v{version}"),
+                    )?;
+                }
+                let training_snapshot_id = match training_table.as_deref() {
+                    Some(tbl) => self
+                        .catalog
+                        .get_table(tbl)
+                        .await
+                        .ok()
+                        .and_then(|m| m.current_snapshot(branch).ok().map(|s| s.snapshot_id)),
+                    None => None,
+                };
+                let model = rustlakedb_catalog::RegisteredModelVersion {
+                    name: name.clone(),
+                    version,
+                    stage: stage.to_lowercase(),
+                    artifact_uri,
+                    framework,
+                    training_table: training_table.clone(),
+                    training_snapshot_id,
+                    metrics,
+                    created_by: session.user.clone(),
+                    created_ms: security::epoch_ms(),
+                };
+                self.governance.register_model(model.clone());
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RegisterModel(model))
+                    .await;
+                if let Some(ref src_tbl) = training_table {
+                    let tgt = format!("model:{name}:v{version}");
+                    self.governance
+                        .record_lineage(src_tbl, &tgt, "MODEL_TRAINING", &session.user);
+                    let _ = self
+                        .catalog
+                        .apply_governance(rustlakedb_catalog::GovernanceOp::RecordLineage(
+                            rustlakedb_catalog::PersistedLineageEdge {
+                                source_table: src_tbl.clone(),
+                                target_table: tgt,
+                                operation: "MODEL_TRAINING".into(),
+                                user: session.user.clone(),
+                                timestamp_ms: security::epoch_ms(),
+                            },
+                        ))
+                        .await;
+                }
+                self.governance.record_audit(
+                    &session.user,
+                    "REGISTER MODEL",
+                    &format!("{name}:v{version}"),
+                    "OK",
+                );
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                        security::make_persisted_audit(
+                            session,
+                            "REGISTER MODEL",
+                            &format!("{name}:v{version}"),
+                            "OK",
+                            "SQL",
+                        ),
+                    ))
+                    .await;
+                Ok(QueryExecutionResult {
+                    command_tag: format!("REGISTER MODEL {name}:v{version}"),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::AlterModelStage {
+                name,
+                version,
+                stage,
+            } => {
+                if stage.eq_ignore_ascii_case("production") {
+                    self.governance.require_security_admin(
+                        session,
+                        "PROMOTE MODEL",
+                        &format!("{name}:v{version}"),
+                    )?;
+                }
+                if let Ok(gov) = self.catalog.get_governance().await {
+                    self.governance.hydrate_from_catalog(gov);
+                }
+                if !self.governance.set_model_stage(&name, version, &stage) {
+                    return Err(RustLakeError::Catalog(format!(
+                        "model '{name}' version {version} not found"
+                    )));
+                }
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::SetModelStage {
+                        name: name.clone(),
+                        version,
+                        stage: stage.clone(),
+                    })
+                    .await;
+                self.governance.record_audit(
+                    &session.user,
+                    "ALTER MODEL STAGE",
+                    &format!("{name}:v{version} -> {stage}"),
+                    "OK",
+                );
+                Ok(QueryExecutionResult {
+                    command_tag: format!("ALTER MODEL {name}:v{version} STAGE={stage}"),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::ShowModels => {
+                if let Ok(gov) = self.catalog.get_governance().await {
+                    self.governance.hydrate_from_catalog(gov);
+                }
+                let models = self.governance.list_models();
+                let cols = vec![
+                    "model_name".into(),
+                    "version".into(),
+                    "stage".into(),
+                    "framework".into(),
+                    "artifact_uri".into(),
+                    "training_table".into(),
+                    "training_snapshot_id".into(),
+                    "metrics".into(),
+                    "created_by".into(),
+                ];
+                let rows: Vec<BTreeMap<String, ScalarValue>> = models
+                    .into_iter()
+                    .map(|m| {
+                        BTreeMap::from([
+                            ("model_name".into(), ScalarValue::Utf8(m.name)),
+                            ("version".into(), ScalarValue::Int64(m.version as i64)),
+                            ("stage".into(), ScalarValue::Utf8(m.stage)),
+                            ("framework".into(), ScalarValue::Utf8(m.framework)),
+                            ("artifact_uri".into(), ScalarValue::Utf8(m.artifact_uri)),
+                            (
+                                "training_table".into(),
+                                m.training_table
+                                    .map(ScalarValue::Utf8)
+                                    .unwrap_or(ScalarValue::Null),
+                            ),
+                            (
+                                "training_snapshot_id".into(),
+                                m.training_snapshot_id
+                                    .map(|s| ScalarValue::Int64(s as i64))
+                                    .unwrap_or(ScalarValue::Null),
+                            ),
+                            (
+                                "metrics".into(),
+                                ScalarValue::Json(serde_json::to_value(&m.metrics).unwrap_or(serde_json::Value::Null)),
+                            ),
+                            ("created_by".into(), ScalarValue::Utf8(m.created_by)),
+                        ])
+                    })
+                    .collect();
+                let n = rows.len();
+                Ok(QueryExecutionResult {
+                    command_tag: format!("SELECT {n}"),
+                    dag: None,
+                    batch: RowBatch::new(cols, rows),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::CreateFeatureView {
+                name,
+                entity_key,
+                timestamp_col,
+                source_table,
+                query_sql,
+            } => {
+                let fv = rustlakedb_catalog::FeatureViewDef {
+                    name: name.clone(),
+                    entity_key,
+                    timestamp_col,
+                    source_table: source_table.clone(),
+                    query_sql: query_sql.clone(),
+                    created_by: session.user.clone(),
+                    created_ms: security::epoch_ms(),
+                };
+                self.governance.register_feature_view(fv.clone());
+                let _ = self
+                    .catalog
+                    .apply_governance(rustlakedb_catalog::GovernanceOp::RegisterFeatureView(fv))
+                    .await;
+                self.governance.record_lineage(
+                    &source_table,
+                    &format!("feature_view:{name}"),
+                    "FEATURE_VIEW",
+                    &session.user,
+                );
+                self.governance.record_audit(
+                    &session.user,
+                    "CREATE FEATURE VIEW",
+                    &name,
+                    "OK",
+                );
+                Ok(QueryExecutionResult {
+                    command_tag: format!("CREATE FEATURE VIEW {name}"),
+                    dag: None,
+                    batch: RowBatch::default(),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
+            PlannedCommand::ShowFeatureViews => {
+                if let Ok(gov) = self.catalog.get_governance().await {
+                    self.governance.hydrate_from_catalog(gov);
+                }
+                let fvs = self.governance.list_feature_views();
+                let cols = vec![
+                    "feature_view".into(),
+                    "entity_key".into(),
+                    "timestamp_col".into(),
+                    "source_table".into(),
+                    "query_sql".into(),
+                    "created_by".into(),
+                ];
+                let rows: Vec<BTreeMap<String, ScalarValue>> = fvs
+                    .into_iter()
+                    .map(|f| {
+                        BTreeMap::from([
+                            ("feature_view".into(), ScalarValue::Utf8(f.name)),
+                            ("entity_key".into(), ScalarValue::Utf8(f.entity_key)),
+                            ("timestamp_col".into(), ScalarValue::Utf8(f.timestamp_col)),
+                            ("source_table".into(), ScalarValue::Utf8(f.source_table)),
+                            ("query_sql".into(), ScalarValue::Utf8(f.query_sql)),
+                            ("created_by".into(), ScalarValue::Utf8(f.created_by)),
+                        ])
+                    })
+                    .collect();
+                let n = rows.len();
+                Ok(QueryExecutionResult {
+                    command_tag: format!("SELECT {n}"),
+                    dag: None,
+                    batch: RowBatch::new(cols, rows),
+                    stats: QueryExecutionStats::default(),
+                })
+            }
             PlannedCommand::ShowQueries => {
                 let active = self.governance.active_queries_snapshot();
                 let cols = vec![
@@ -4091,9 +4609,11 @@ impl Coordinator {
                         .parse::<bool>()
                         .map(ScalarValue::Bool)
                         .map_err(|e| e.to_string()),
-                    ColumnType::Variant => serde_json::from_str::<serde_json::Value>(trimmed)
-                        .map(ScalarValue::Json)
-                        .map_err(|e| e.to_string()),
+                    ColumnType::Variant | ColumnType::Vector(_) => {
+                        serde_json::from_str::<serde_json::Value>(trimmed)
+                            .map(ScalarValue::Json)
+                            .map_err(|e| e.to_string())
+                    }
                     ColumnType::Date => rustlakedb_protocol::parse_iso_date_days(trimmed)
                         .map(ScalarValue::Date)
                         .ok_or_else(|| format!("invalid DATE literal '{trimmed}'")),
@@ -4975,7 +5495,7 @@ fn coerce_json_value(
             .as_bool()
             .map(ScalarValue::Bool)
             .ok_or_else(|| format!("expected bool, got {val}")),
-        ColumnType::Variant => Ok(ScalarValue::Json(val.clone())),
+        ColumnType::Variant | ColumnType::Vector(_) => Ok(ScalarValue::Json(val.clone())),
         ColumnType::Date => val
             .as_str()
             .and_then(rustlakedb_protocol::parse_iso_date_days)
@@ -6096,6 +6616,27 @@ fn rewrite_virtual_views_sql(trimmed: &str, ctes: &[String]) -> String {
         format!("{prefix} WITH {cte_list} {body}")
     } else {
         format!("WITH {cte_list} {trimmed}")
+    }
+}
+
+/// Extracts a sortable `(numeric_ts, string_ts)` key for point-in-time `ASOF JOIN` comparisons (Wave 42).
+fn scalar_asof_ts(v: Option<&ScalarValue>) -> (f64, String) {
+    match v {
+        Some(ScalarValue::Int64(i)) => (*i as f64, i.to_string()),
+        Some(ScalarValue::Float64(f)) => (*f, f.to_string()),
+        Some(ScalarValue::Date(d)) => (*d as f64, rustlakedb_protocol::format_iso_date_days(*d)),
+        Some(ScalarValue::Utf8(s)) => {
+            if let Ok(n) = s.parse::<f64>() {
+                (n, s.clone())
+            } else {
+                (f64::NAN, s.clone())
+            }
+        }
+        Some(other) => (
+            other.as_f64().unwrap_or(f64::NAN),
+            other.to_pg_text().unwrap_or_default(),
+        ),
+        None => (f64::NEG_INFINITY, String::new()),
     }
 }
 

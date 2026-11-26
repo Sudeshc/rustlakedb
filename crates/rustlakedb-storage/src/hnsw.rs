@@ -118,6 +118,94 @@ impl HnswIndex {
         best.truncate(top_k);
         best
     }
+
+    /// Greedy beam search over the HNSW graph returning top-K `(row_id, l2_distance)` (ascending).
+    pub fn search_l2(&self, query: &[f64], top_k: usize) -> Vec<(u32, f64)> {
+        if self.vectors.is_empty() || top_k == 0 {
+            return vec![];
+        }
+        let mut visited = HashSet::with_capacity(self.ef_search * 2);
+        let mut frontier = BinaryHeap::new();
+        let mut best: Vec<(u32, f64)> = Vec::new();
+
+        let entry_d = l2_dist(query, &self.vectors[0].1);
+        visited.insert(0usize);
+        frontier.push(ScoredIdx {
+            score: -entry_d,
+            idx: 0,
+        });
+
+        let mut steps = 0usize;
+        while let Some(cur) = frontier.pop() {
+            best.push((self.vectors[cur.idx].0, -cur.score));
+            steps += 1;
+            if steps >= self.ef_search && best.len() >= top_k {
+                break;
+            }
+            for &nb in &self.neighbors[cur.idx] {
+                if visited.insert(nb) {
+                    let d = l2_dist(query, &self.vectors[nb].1);
+                    frontier.push(ScoredIdx { score: -d, idx: nb });
+                }
+            }
+        }
+        best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        best.truncate(top_k);
+        best
+    }
+
+    /// Greedy beam search over the HNSW graph returning top-K `(row_id, dot_product)` (descending).
+    pub fn search_dot(&self, query: &[f64], top_k: usize) -> Vec<(u32, f64)> {
+        if self.vectors.is_empty() || top_k == 0 {
+            return vec![];
+        }
+        let mut visited = HashSet::with_capacity(self.ef_search * 2);
+        let mut frontier = BinaryHeap::new();
+        let mut best: Vec<(u32, f64)> = Vec::new();
+
+        let entry_s = dot_product(query, &self.vectors[0].1);
+        visited.insert(0usize);
+        frontier.push(ScoredIdx {
+            score: entry_s,
+            idx: 0,
+        });
+
+        let mut steps = 0usize;
+        while let Some(cur) = frontier.pop() {
+            best.push((self.vectors[cur.idx].0, cur.score));
+            steps += 1;
+            if steps >= self.ef_search && best.len() >= top_k {
+                break;
+            }
+            for &nb in &self.neighbors[cur.idx] {
+                if visited.insert(nb) {
+                    let s = dot_product(query, &self.vectors[nb].1);
+                    frontier.push(ScoredIdx { score: s, idx: nb });
+                }
+            }
+        }
+        best.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        best.truncate(top_k);
+        best
+    }
+}
+
+pub fn dot_product(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+pub fn l2_dist(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return f64::MAX;
+    }
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
 }
 
 pub fn cosine_sim(a: &[f64], b: &[f64]) -> f64 {

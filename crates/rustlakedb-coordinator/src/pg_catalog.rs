@@ -25,6 +25,10 @@ pub async fn try_handle_pg_compat(
         let param = rest.trim().trim_matches('"');
         if param == "tables"
             || param == "queries"
+            || param == "models"
+            || param == "feature views"
+            || param == "views"
+            || param == "external catalogs"
             || param.starts_with("snapshots")
             || param.starts_with("tags")
         {
@@ -229,7 +233,7 @@ pub fn column_type_to_pg_oid(dt: &ColumnType) -> i64 {
         ColumnType::Date => 1082,
         ColumnType::TimestampTz => 1184,
         ColumnType::Decimal { .. } => 1700,
-        ColumnType::Variant => 3802, // jsonb
+        ColumnType::Variant | ColumnType::Vector(_) => 3802, // jsonb / pgvector text representation
     }
 }
 

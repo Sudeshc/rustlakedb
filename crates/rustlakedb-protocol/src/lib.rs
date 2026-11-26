@@ -247,11 +247,12 @@ impl RowBatch {
     }
 }
 
-/// Distance metric for hybrid Vector + SQL + JSONB search (Wave 4).
+/// Distance metric for hybrid Vector + SQL + JSONB search (Waves 4 & 42).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VectorMetric {
     L2,
     Cosine,
+    Dot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +360,26 @@ pub enum ColumnExpr {
         expr: Box<ColumnExpr>,
         alias: String,
     },
+    /// Reciprocal Rank Fusion (`RRF(expr1, expr2 [, k])`) combining BM25 + Vector ranks across a batch (Wave 42).
+    RrfScore {
+        inputs: Vec<ColumnExpr>,
+        k: f64,
+        alias: String,
+    },
+    /// Governed in-SQL AI / LLM inference (`AI_EMBED`, `AI_COMPLETE`, `AI_CLASSIFY`, `AI_QUERY`, Wave 42).
+    AiFunction {
+        func: AiFunc,
+        args: Vec<ColumnExpr>,
+        alias: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AiFunc {
+    Embed,
+    Complete,
+    Classify,
+    Query,
 }
 
 impl ColumnExpr {
@@ -378,7 +399,9 @@ impl ColumnExpr {
             | ColumnExpr::Now { alias }
             | ColumnExpr::Bm25Score { alias, .. }
             | ColumnExpr::CaseExpr { alias, .. }
-            | ColumnExpr::Extract { alias, .. } => alias.clone(),
+            | ColumnExpr::Extract { alias, .. }
+            | ColumnExpr::RrfScore { alias, .. }
+            | ColumnExpr::AiFunction { alias, .. } => alias.clone(),
         }
     }
 }

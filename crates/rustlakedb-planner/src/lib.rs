@@ -6,7 +6,7 @@ use rustlakedb_catalog::{
 };
 use rustlakedb_common::{QueryId, Result, RustLakeError};
 use rustlakedb_protocol::{
-    AggExpr, AggFunc, ArithOp, ColumnExpr, Distribution, FilterExpr, JoinType, MathFunc,
+    AggExpr, AggFunc, AiFunc, ArithOp, ColumnExpr, Distribution, FilterExpr, JoinType, MathFunc,
     Partitioning, PhysicalNode, QueryStage, RowBatch, ScalarValue, SetOpKind, ShuffleMode, SortKey,
     StageDag, StringFunc, VectorMetric, WindowFunc, WindowSpec,
 };
@@ -251,6 +251,45 @@ pub enum PlannedCommand {
         remote_namespace: String,
         remote_table: String,
     },
+    /// Point-in-time leakage-free ML Feature Store `ASOF JOIN` (Wave 42).
+    AsofJoinQuery {
+        left_table: String,
+        left_alias: String,
+        right_table: String,
+        right_alias: String,
+        entity_left_col: String,
+        entity_right_col: String,
+        ts_left_col: String,
+        ts_right_col: String,
+        is_left_outer: bool,
+        select_items: Vec<(String, String)>, // (source_expr, output_alias)
+        order_by_col: Option<(String, bool)>, // (col, desc)
+        limit: Option<usize>,
+    },
+    /// Raft-persisted ML Model Registry registration (`CREATE MODEL` / `REGISTER MODEL`, Wave 42).
+    RegisterModel {
+        name: String,
+        version: u64,
+        framework: String,
+        artifact_uri: String,
+        training_table: Option<String>,
+        metrics: BTreeMap<String, f64>,
+        stage: String,
+    },
+    AlterModelStage {
+        name: String,
+        version: u64,
+        stage: String,
+    },
+    ShowModels,
+    CreateFeatureView {
+        name: String,
+        entity_key: String,
+        timestamp_col: String,
+        source_table: String,
+        query_sql: String,
+    },
+    ShowFeatureViews,
     ShowTables,
     ShowQueries,
     InformationSchemaTables,
@@ -321,6 +360,24 @@ impl DistributedPlanner {
         }
         if upper == "SHOW TABLES" {
             return Ok(PlannedCommand::ShowTables);
+        }
+        if upper == "SHOW MODELS" {
+            return Ok(PlannedCommand::ShowModels);
+        }
+        if upper == "SHOW FEATURE VIEWS" {
+            return Ok(PlannedCommand::ShowFeatureViews);
+        }
+        if upper.starts_with("CREATE MODEL ") || upper.starts_with("REGISTER MODEL ") {
+            return parse_register_model(trimmed);
+        }
+        if upper.starts_with("ALTER MODEL ") && upper.contains(" SET STAGE ") {
+            return parse_alter_model_stage(trimmed);
+        }
+        if upper.starts_with("CREATE FEATURE VIEW ") {
+            return parse_create_feature_view(trimmed);
+        }
+        if upper.starts_with("SELECT ") && upper.contains(" ASOF JOIN ") {
+            return parse_asof_join(trimmed);
         }
         if upper == "SHOW QUERIES" {
             return Ok(PlannedCommand::ShowQueries);
@@ -1551,7 +1608,18 @@ impl DistributedPlanner {
                 let orders_by_computed_alias = order_keys
                     .iter()
                     .any(|k| computed_aliases.contains(&k.column));
+                let has_rrf = projected_exprs
+                    .iter()
+                    .any(|e| matches!(e, ColumnExpr::RrfScore { .. }));
                 if orders_by_computed_alias {
+                    // Wave 42: Reciprocal Rank Fusion (`RRF`) requires global ranking across all splits!
+                    if has_rrf {
+                        node = PhysicalNode::Exchange {
+                            input: Box::new(node),
+                            target_partitioning: Partitioning::Single,
+                            mode: self.config.shuffle_mode,
+                        };
+                    }
                     // Evaluate computed projections BEFORE `Sort` when ORDER BY references a computed alias
                     // (e.g., `ORDER BY sim DESC` or `ORDER BY bm25 DESC`).
                     node = PhysicalNode::Project {
@@ -1574,6 +1642,13 @@ impl DistributedPlanner {
                             keys: order_keys,
                         };
                     }
+                    if has_rrf {
+                        node = PhysicalNode::Exchange {
+                            input: Box::new(node),
+                            target_partitioning: Partitioning::Single,
+                            mode: self.config.shuffle_mode,
+                        };
+                    }
                     if !projected_exprs.is_empty() {
                         node = PhysicalNode::Project {
                             input: Box::new(node),
@@ -1593,67 +1668,80 @@ impl DistributedPlanner {
                 // Wave 8 Distributed Top-N Pushdown: if LIMIT wraps Sort (or Project(Sort)),
                 // push a bounded local Top-N heap down to every worker before the final Exchange(Single)!
                 if lim < usize::MAX {
-                    match node {
-                        PhysicalNode::Sort { input, keys } => {
-                            let partial_topn = PhysicalNode::TopN {
-                                input,
-                                keys: keys.clone(),
-                                limit: lim,
-                                offset: offset_val,
-                                is_partial: true,
-                            };
-                            node = PhysicalNode::TopN {
-                                input: Box::new(partial_topn),
-                                keys,
-                                limit: lim,
-                                offset: offset_val,
-                                is_partial: false,
-                            };
-                            cbo_notes.push(format!(
-                                "OPT: Distributed Top-N Pushdown (local limit={} before Exchange)",
-                                lim.saturating_add(offset_val)
-                            ));
-                        }
-                        PhysicalNode::Project { input, exprs }
-                            if matches!(input.as_ref(), PhysicalNode::Sort { .. }) =>
-                        {
-                            if let PhysicalNode::Sort {
-                                input: sort_in,
-                                keys,
-                            } = *input
-                            {
+                    let is_rrf_sort = matches!(
+                        &node,
+                        PhysicalNode::Sort { input, .. }
+                            if matches!(input.as_ref(), PhysicalNode::Project { exprs, .. } if exprs.iter().any(|e| matches!(e, ColumnExpr::RrfScore { .. })))
+                    );
+                    if is_rrf_sort {
+                        node = PhysicalNode::Limit {
+                            input: Box::new(node),
+                            limit: lim,
+                            offset: offset_val,
+                        };
+                    } else {
+                        match node {
+                            PhysicalNode::Sort { input, keys } => {
                                 let partial_topn = PhysicalNode::TopN {
-                                    input: sort_in,
+                                    input,
                                     keys: keys.clone(),
                                     limit: lim,
                                     offset: offset_val,
                                     is_partial: true,
                                 };
-                                let final_topn = PhysicalNode::TopN {
+                                node = PhysicalNode::TopN {
                                     input: Box::new(partial_topn),
                                     keys,
                                     limit: lim,
                                     offset: offset_val,
                                     is_partial: false,
                                 };
-                                node = PhysicalNode::Project {
-                                    input: Box::new(final_topn),
-                                    exprs,
-                                };
                                 cbo_notes.push(format!(
                                     "OPT: Distributed Top-N Pushdown (local limit={} before Exchange)",
                                     lim.saturating_add(offset_val)
                                 ));
-                            } else {
-                                unreachable!()
                             }
-                        }
-                        other => {
-                            node = PhysicalNode::Limit {
-                                input: Box::new(other),
-                                limit: lim,
-                                offset: offset_val,
-                            };
+                            PhysicalNode::Project { input, exprs }
+                                if matches!(input.as_ref(), PhysicalNode::Sort { .. }) =>
+                            {
+                                if let PhysicalNode::Sort {
+                                    input: sort_in,
+                                    keys,
+                                } = *input
+                                {
+                                    let partial_topn = PhysicalNode::TopN {
+                                        input: sort_in,
+                                        keys: keys.clone(),
+                                        limit: lim,
+                                        offset: offset_val,
+                                        is_partial: true,
+                                    };
+                                    let final_topn = PhysicalNode::TopN {
+                                        input: Box::new(partial_topn),
+                                        keys,
+                                        limit: lim,
+                                        offset: offset_val,
+                                        is_partial: false,
+                                    };
+                                    node = PhysicalNode::Project {
+                                        input: Box::new(final_topn),
+                                        exprs,
+                                    };
+                                    cbo_notes.push(format!(
+                                        "OPT: Distributed Top-N Pushdown (local limit={} before Exchange)",
+                                        lim.saturating_add(offset_val)
+                                    ));
+                                } else {
+                                    unreachable!()
+                                }
+                            }
+                            other => {
+                                node = PhysicalNode::Limit {
+                                    input: Box::new(other),
+                                    limit: lim,
+                                    offset: offset_val,
+                                };
+                            }
                         }
                     }
                 } else {
@@ -2660,7 +2748,7 @@ fn parse_col_expr(expr: &Expr, alias: Option<String>) -> Result<ColumnExpr> {
                         alias: alias.unwrap_or_else(|| "date_trunc".into()),
                     })
                 }
-                "VECTOR_COSINE" | "VECTOR_L2" => {
+                "VECTOR_COSINE" | "VECTOR_L2" | "VECTOR_DOT" => {
                     let column = extract_fn_arg_ident(args.first())?;
                     let vec_str = match args.get(1) {
                         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
@@ -2672,15 +2760,65 @@ fn parse_col_expr(expr: &Expr, alias: Option<String>) -> Result<ColumnExpr> {
                         _ => return Err(RustLakeError::Plan("vector function requires (col, '[...]')".into())),
                     };
                     let query_vec = parse_vec_f64(&vec_str)?;
-                    let metric = if name == "VECTOR_COSINE" {
-                        VectorMetric::Cosine
-                    } else {
-                        VectorMetric::L2
+                    let metric = match name.as_str() {
+                        "VECTOR_COSINE" => VectorMetric::Cosine,
+                        "VECTOR_DOT" => VectorMetric::Dot,
+                        _ => VectorMetric::L2,
                     };
                     Ok(ColumnExpr::VectorDistance {
                         column,
                         query_vec,
                         metric,
+                        alias: alias.unwrap_or_else(|| name.to_lowercase()),
+                    })
+                }
+                "RRF" => {
+                    let mut inputs = Vec::new();
+                    let mut k = 60.0f64;
+                    for (idx, a) in args.iter().enumerate() {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
+                            if idx >= 2
+                                && let Ok(sv) = parse_scalar(e)
+                                && let Some(kv) = sv.as_f64()
+                            {
+                                k = kv.max(1.0);
+                                continue;
+                            }
+                            inputs.push(parse_col_expr(e, None)?);
+                        }
+                    }
+                    if inputs.is_empty() {
+                        return Err(RustLakeError::Plan(
+                            "RRF requires at least one score expression".into(),
+                        ));
+                    }
+                    Ok(ColumnExpr::RrfScore {
+                        inputs,
+                        k,
+                        alias: alias.unwrap_or_else(|| "rrf_score".into()),
+                    })
+                }
+                "AI_EMBED" | "AI_COMPLETE" | "AI_CLASSIFY" | "AI_QUERY" => {
+                    let af = match name.as_str() {
+                        "AI_EMBED" => AiFunc::Embed,
+                        "AI_COMPLETE" => AiFunc::Complete,
+                        "AI_CLASSIFY" => AiFunc::Classify,
+                        _ => AiFunc::Query,
+                    };
+                    let mut parsed_args = Vec::new();
+                    for a in args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
+                            parsed_args.push(parse_col_expr(e, None)?);
+                        }
+                    }
+                    if parsed_args.is_empty() {
+                        return Err(RustLakeError::Plan(format!(
+                            "{name} requires at least one argument"
+                        )));
+                    }
+                    Ok(ColumnExpr::AiFunction {
+                        func: af,
+                        args: parsed_args,
                         alias: alias.unwrap_or_else(|| name.to_lowercase()),
                     })
                 }
@@ -2743,6 +2881,16 @@ fn map_sql_data_type(dt: &SqlDataType) -> Result<ColumnType> {
         SqlDataType::Timestamp(_, _) | SqlDataType::Datetime(_) => Ok(ColumnType::TimestampTz),
         SqlDataType::JSON | SqlDataType::JSONB | SqlDataType::Array(_) | SqlDataType::Struct(_, _) => {
             Ok(ColumnType::Variant)
+        }
+        SqlDataType::Custom(name, mods)
+            if name.to_string().eq_ignore_ascii_case("VECTOR") =>
+        {
+            let dim = mods
+                .first()
+                .and_then(|m| m.trim().parse::<usize>().ok())
+                .unwrap_or(3)
+                .max(1);
+            Ok(ColumnType::Vector(dim))
         }
         SqlDataType::Custom(name, _)
             if matches!(
@@ -3712,9 +3860,14 @@ fn collect_col_expr_cols(expr: &ColumnExpr, out: &mut HashSet<String>) {
             collect_col_expr_cols(left, out);
             collect_col_expr_cols(right, out);
         }
-        ColumnExpr::StringExpr { args, .. } => {
+        ColumnExpr::StringExpr { args, .. } | ColumnExpr::AiFunction { args, .. } => {
             for a in args {
                 collect_col_expr_cols(a, out);
+            }
+        }
+        ColumnExpr::RrfScore { inputs, .. } => {
+            for inp in inputs {
+                collect_col_expr_cols(inp, out);
             }
         }
         ColumnExpr::MathExpr { arg, .. } | ColumnExpr::Cast { expr: arg, .. } => {
@@ -4655,5 +4808,309 @@ fn parse_create_function(sql: &str) -> Result<PlannedCommand> {
         name,
         param_name,
         body_expr,
+    })
+}
+
+/// Parses `CREATE|REGISTER MODEL <name> [VERSION <n>] [FRAMEWORK '<fw>'] ARTIFACT '<uri>' [FROM TABLE <tbl>] [METRICS ('k'=v, ...)] [STAGE '<stage>']` (Wave 42).
+fn parse_register_model(sql: &str) -> Result<PlannedCommand> {
+    let upper = sql.to_uppercase();
+    let start = if upper.starts_with("CREATE MODEL ") {
+        "CREATE MODEL ".len()
+    } else {
+        "REGISTER MODEL ".len()
+    };
+    let rest = sql[start..].trim();
+    let name = rest
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| RustLakeError::SqlParse("MODEL name required".into()))?
+        .trim_matches('"')
+        .to_string();
+
+    let extract_quoted = |keyword: &str| -> Option<String> {
+        let u = rest.to_uppercase();
+        let pos = u.find(keyword)?;
+        let tail = rest[pos + keyword.len()..].trim();
+        let q = tail.strip_prefix('\'')?;
+        let end = q.find('\'')?;
+        Some(q[..end].to_string())
+    };
+    let version = {
+        let u = rest.to_uppercase();
+        u.find(" VERSION ")
+            .and_then(|pos| {
+                rest[pos + " VERSION ".len()..]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(1)
+    };
+    let framework = extract_quoted(" FRAMEWORK ").unwrap_or_else(|| "onnx".into());
+    let artifact_uri = extract_quoted(" ARTIFACT ")
+        .ok_or_else(|| RustLakeError::SqlParse("CREATE MODEL requires ARTIFACT '<uri>'".into()))?;
+    let stage = extract_quoted(" STAGE ").unwrap_or_else(|| "dev".into());
+    let training_table = {
+        let u = rest.to_uppercase();
+        u.find(" FROM TABLE ").and_then(|pos| {
+            rest[pos + " FROM TABLE ".len()..]
+                .split_whitespace()
+                .next()
+                .map(normalize_table_name)
+        })
+    };
+    let mut metrics = BTreeMap::new();
+    let u = rest.to_uppercase();
+    if let Some(mpos) = u.find(" METRICS ") {
+        let tail = &rest[mpos + " METRICS ".len()..];
+        if let (Some(op), Some(cl)) = (tail.find('('), tail.find(')')) {
+            for pair in tail[op + 1..cl].split(',') {
+                if let Some((k, v)) = pair.split_once('=')
+                    && let Ok(fv) = v.trim().parse::<f64>()
+                {
+                    metrics.insert(k.trim().trim_matches('\'').trim_matches('"').to_string(), fv);
+                }
+            }
+        }
+    }
+    Ok(PlannedCommand::RegisterModel {
+        name,
+        version,
+        framework,
+        artifact_uri,
+        training_table,
+        metrics,
+        stage,
+    })
+}
+
+/// Parses `ALTER MODEL <name> VERSION <v> SET STAGE '<stage>'` (Wave 42).
+fn parse_alter_model_stage(sql: &str) -> Result<PlannedCommand> {
+    let rest = sql["ALTER MODEL ".len()..].trim();
+    let name = rest
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| RustLakeError::SqlParse("ALTER MODEL requires name".into()))?
+        .trim_matches('"')
+        .to_string();
+    let u = rest.to_uppercase();
+    let version = u
+        .find(" VERSION ")
+        .and_then(|pos| {
+            rest[pos + " VERSION ".len()..]
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(1);
+    let spos = u
+        .find(" SET STAGE ")
+        .ok_or_else(|| RustLakeError::SqlParse("ALTER MODEL requires SET STAGE '<stage>'".into()))?;
+    let stage = rest[spos + " SET STAGE ".len()..]
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_lowercase();
+    Ok(PlannedCommand::AlterModelStage {
+        name,
+        version,
+        stage,
+    })
+}
+
+/// Parses `CREATE FEATURE VIEW <name> ENTITY <col> TIMESTAMP <ts_col> AS SELECT ... FROM <src>` (Wave 42).
+fn parse_create_feature_view(sql: &str) -> Result<PlannedCommand> {
+    let rest = sql["CREATE FEATURE VIEW ".len()..].trim();
+    let name = rest
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| RustLakeError::SqlParse("FEATURE VIEW name required".into()))?
+        .trim_matches('"')
+        .to_string();
+    let u = rest.to_uppercase();
+    let entity_key = u
+        .find(" ENTITY ")
+        .and_then(|p| rest[p + " ENTITY ".len()..].split_whitespace().next())
+        .ok_or_else(|| RustLakeError::SqlParse("CREATE FEATURE VIEW requires ENTITY <col>".into()))?
+        .trim_matches('"')
+        .to_string();
+    let timestamp_col = u
+        .find(" TIMESTAMP ")
+        .and_then(|p| rest[p + " TIMESTAMP ".len()..].split_whitespace().next())
+        .ok_or_else(|| RustLakeError::SqlParse("CREATE FEATURE VIEW requires TIMESTAMP <col>".into()))?
+        .trim_matches('"')
+        .to_string();
+    let as_pos = u
+        .find(" AS ")
+        .ok_or_else(|| RustLakeError::SqlParse("CREATE FEATURE VIEW requires AS SELECT ...".into()))?;
+    let query_sql = rest[as_pos + " AS ".len()..].trim().to_string();
+    let qu = query_sql.to_uppercase();
+    let source_table = qu
+        .find(" FROM ")
+        .and_then(|p| query_sql[p + " FROM ".len()..].split_whitespace().next())
+        .map(normalize_table_name)
+        .unwrap_or_else(|| "unknown".into());
+    Ok(PlannedCommand::CreateFeatureView {
+        name,
+        entity_key,
+        timestamp_col,
+        source_table,
+        query_sql,
+    })
+}
+
+/// Parses point-in-time ML Feature Store `ASOF JOIN`:
+/// `SELECT <cols> FROM <left> [l] [LEFT] ASOF JOIN <right> [r] ON <l.entity> = <r.entity> AND <r.ts> <= <l.ts> [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]` (Wave 42).
+fn parse_asof_join(sql: &str) -> Result<PlannedCommand> {
+    let u = sql.to_uppercase();
+    let from_pos = u
+        .find(" FROM ")
+        .ok_or_else(|| RustLakeError::SqlParse("ASOF JOIN missing FROM".into()))?;
+    let select_part = sql["SELECT ".len()..from_pos].trim();
+    let select_items: Vec<(String, String)> = select_part
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|item| {
+            let iu = item.to_uppercase();
+            if let Some(ap) = iu.find(" AS ") {
+                (
+                    item[..ap].trim().to_string(),
+                    item[ap + 4..].trim().trim_matches('"').to_string(),
+                )
+            } else {
+                let col_only = item
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(item)
+                    .trim_matches('"')
+                    .to_string();
+                (item.to_string(), col_only)
+            }
+        })
+        .collect();
+
+    let (join_pos, join_len, is_left_outer) = if let Some(p) = u.find(" LEFT ASOF JOIN ") {
+        (p, " LEFT ASOF JOIN ".len(), true)
+    } else if let Some(p) = u.find(" ASOF JOIN ") {
+        (p, " ASOF JOIN ".len(), false)
+    } else {
+        return Err(RustLakeError::SqlParse("missing ASOF JOIN clause".into()));
+    };
+    let on_pos = u[join_pos + join_len..]
+        .find(" ON ")
+        .map(|rel| join_pos + join_len + rel)
+        .ok_or_else(|| RustLakeError::SqlParse("ASOF JOIN requires ON <eq> AND <ts_cond>".into()))?;
+
+    let left_spec: Vec<&str> = sql[from_pos + " FROM ".len()..join_pos]
+        .split_whitespace()
+        .collect();
+    let left_table = normalize_table_name(left_spec.first().copied().unwrap_or(""));
+    let left_alias = left_spec
+        .get(1)
+        .filter(|s| !s.eq_ignore_ascii_case("AS"))
+        .or_else(|| left_spec.get(2))
+        .copied()
+        .unwrap_or(&left_table)
+        .to_string();
+
+    let right_spec: Vec<&str> = sql[join_pos + join_len..on_pos].split_whitespace().collect();
+    let right_table = normalize_table_name(right_spec.first().copied().unwrap_or(""));
+    let right_alias = right_spec
+        .get(1)
+        .filter(|s| !s.eq_ignore_ascii_case("AS"))
+        .or_else(|| right_spec.get(2))
+        .copied()
+        .unwrap_or(&right_table)
+        .to_string();
+
+    let tail = sql[on_pos + " ON ".len()..].trim();
+    let tu = tail.to_uppercase();
+    let order_pos = tu.find(" ORDER BY ");
+    let limit_pos = tu.find(" LIMIT ");
+    let cond_end = [order_pos, limit_pos]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(tail.len());
+    let on_clause = tail[..cond_end].trim();
+
+    let order_by_col = order_pos.map(|op| {
+        let oend = limit_pos.filter(|&lp| lp > op).unwrap_or(tail.len());
+        let otxt = tail[op + " ORDER BY ".len()..oend].trim();
+        let mut parts = otxt.split_whitespace();
+        let col = parts
+            .next()
+            .unwrap_or("")
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_string();
+        let desc = parts
+            .next()
+            .is_some_and(|d| d.eq_ignore_ascii_case("DESC"));
+        (col, desc)
+    });
+    let limit = limit_pos.and_then(|lp| {
+        tail[lp + " LIMIT ".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+    });
+
+    // Split `ON <entity_eq> AND <ts_ineq>`
+    let ou = on_clause.to_uppercase();
+    let and_pos = ou
+        .find(" AND ")
+        .ok_or_else(|| RustLakeError::SqlParse("ASOF JOIN ON requires '<l.key> = <r.key> AND <r.ts> <= <l.ts>'".into()))?;
+    let c1 = on_clause[..and_pos].trim();
+    let c2 = on_clause[and_pos + " AND ".len()..].trim();
+
+    let resolve_lr = |a: &str, b: &str| -> (String, String) {
+        let a_col = a.rsplit('.').next().unwrap_or(a).trim().trim_matches('"');
+        let b_col = b.rsplit('.').next().unwrap_or(b).trim().trim_matches('"');
+        if a.starts_with(&format!("{right_alias}.")) || a.starts_with(&format!("{right_table}.")) {
+            (b_col.to_string(), a_col.to_string())
+        } else {
+            (a_col.to_string(), b_col.to_string())
+        }
+    };
+
+    let (eq_part, ts_part) = if c1.contains("<=") || c1.contains(">=") {
+        (c2, c1)
+    } else {
+        (c1, c2)
+    };
+    let (eq_a, eq_b) = eq_part
+        .split_once('=')
+        .ok_or_else(|| RustLakeError::SqlParse("ASOF JOIN requires equality join key".into()))?;
+    let (entity_left_col, entity_right_col) = resolve_lr(eq_a.trim(), eq_b.trim());
+
+    let (ts_left_col, ts_right_col) = if let Some((lhs, rhs)) = ts_part.split_once("<=") {
+        // e.g. `f.feature_ts <= e.event_ts` (right <= left) OR `e.event_ts <= f.feature_ts`
+        resolve_lr(lhs.trim(), rhs.trim())
+    } else if let Some((lhs, rhs)) = ts_part.split_once(">=") {
+        // e.g. `e.event_ts >= f.feature_ts` (left >= right)
+        resolve_lr(lhs.trim(), rhs.trim())
+    } else {
+        return Err(RustLakeError::SqlParse(
+            "ASOF JOIN requires timestamp inequality (`<=` or `>=`)".into(),
+        ));
+    };
+
+    Ok(PlannedCommand::AsofJoinQuery {
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        entity_left_col,
+        entity_right_col,
+        ts_left_col,
+        ts_right_col,
+        is_left_outer,
+        select_items,
+        order_by_col,
+        limit,
     })
 }

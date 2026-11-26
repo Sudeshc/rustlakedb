@@ -13,6 +13,7 @@ axum.workspace = true
 bytes.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+reqwest.workspace = true
 roaring.workspace = true
 rustlakedb-catalog = { path = "../rustlakedb-catalog" }
 rustlakedb-common = { path = "../rustlakedb-common" }

@@ -10,8 +10,8 @@ use ring::signature::{
     KeyPair, RsaKeyPair, RsaPublicKeyComponents, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
 };
 use rustlakedb_catalog::{
-    ExternalCatalogConfig, PersistedAccessEntry, PersistedAuditEntry, PersistedTagMaskingRule,
-    TableCommitProposal,
+    ExternalCatalogConfig, FeatureViewDef, PersistedAccessEntry, PersistedAuditEntry,
+    PersistedTagMaskingRule, RegisteredModelVersion, TableCommitProposal,
 };
 use rustlakedb_common::{Result, RustLakeError};
 use rustlakedb_protocol::{FilterExpr, RowBatch, ScalarValue};
@@ -171,6 +171,10 @@ pub struct GovernanceState {
     tag_masking_policies: RwLock<Vec<PersistedTagMaskingRule>>,
     /// Federated external Iceberg catalogs (Snowflake Polaris, Databricks Unity, Glue, BigQuery, Wave 40)
     external_catalogs: RwLock<HashMap<String, ExternalCatalogConfig>>,
+    /// Raft-persisted ML Model Registry versions (Wave 42)
+    models: RwLock<Vec<RegisteredModelVersion>>,
+    /// Raft-persisted ML Feature Store views (Wave 42)
+    feature_views: RwLock<Vec<FeatureViewDef>>,
     /// Ring buffer for `system.query_history`
     query_history: RwLock<VecDeque<QueryHistoryEntry>>,
     /// Ring buffer for `system.audit_log`
@@ -239,6 +243,8 @@ impl Default for GovernanceState {
             masking_policies: RwLock::new(HashMap::new()),
             tag_masking_policies: RwLock::new(Vec::new()),
             external_catalogs: RwLock::new(HashMap::new()),
+            models: RwLock::new(Vec::new()),
+            feature_views: RwLock::new(Vec::new()),
             query_history: RwLock::new(VecDeque::with_capacity(512)),
             audit_log: RwLock::new(VecDeque::with_capacity(512)),
             access_history: RwLock::new(VecDeque::with_capacity(512)),
@@ -516,6 +522,42 @@ impl GovernanceState {
 
     pub fn list_external_catalogs(&self) -> Vec<ExternalCatalogConfig> {
         let mut out: Vec<_> = self.external_catalogs.read().values().cloned().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    pub fn register_model(&self, m: RegisteredModelVersion) {
+        let mut guard = self.models.write();
+        guard.retain(|x| !(x.name == m.name && x.version == m.version));
+        guard.push(m);
+    }
+
+    pub fn set_model_stage(&self, name: &str, version: u64, stage: &str) -> bool {
+        let mut guard = self.models.write();
+        let mut updated = false;
+        for m in guard.iter_mut() {
+            if m.name == name && m.version == version {
+                m.stage = stage.to_string();
+                updated = true;
+            }
+        }
+        updated
+    }
+
+    pub fn list_models(&self) -> Vec<RegisteredModelVersion> {
+        let mut out = self.models.read().clone();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+        out
+    }
+
+    pub fn register_feature_view(&self, fv: FeatureViewDef) {
+        let mut guard = self.feature_views.write();
+        guard.retain(|x| x.name != fv.name);
+        guard.push(fv);
+    }
+
+    pub fn list_feature_views(&self) -> Vec<FeatureViewDef> {
+        let mut out = self.feature_views.read().clone();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -917,6 +959,12 @@ impl GovernanceState {
                     timestamp_ms: e.timestamp_ms,
                 });
             }
+        }
+        if !snap.models.is_empty() {
+            *self.models.write() = snap.models;
+        }
+        if !snap.feature_views.is_empty() {
+            *self.feature_views.write() = snap.feature_views;
         }
     }
 

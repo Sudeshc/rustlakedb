@@ -12,10 +12,10 @@ use roaring::RoaringBitmap;
 use rustlakedb_catalog::{Catalog, FilePuffinIndex};
 use rustlakedb_common::{MemoryPool, Result, RustLakeError, WorkerId};
 use rustlakedb_protocol::{
-    AggExpr, AggFunc, ArithOp, ColumnExpr, FilterExpr, JoinType, MathFunc, PartitionMetrics,
-    Partitioning, PhysicalNode, RowBatch, ScalarValue, SetOpKind, ShuffleBlockLocation,
-    ShuffleMode, ShufflePartitionKey, SortKey, StringFunc, TaskCompletionReport, TaskSpec,
-    VectorMetric, WindowFunc, WindowSpec,
+    AggExpr, AggFunc, AiFunc, ArithOp, ColumnExpr, FilterExpr, JoinType, MathFunc,
+    PartitionMetrics, Partitioning, PhysicalNode, RowBatch, ScalarValue, SetOpKind,
+    ShuffleBlockLocation, ShuffleMode, ShufflePartitionKey, SortKey, StringFunc,
+    TaskCompletionReport, TaskSpec, VectorMetric, WindowFunc, WindowSpec,
 };
 use rustlakedb_shuffle::ShuffleTransport;
 use rustlakedb_storage::IcebergObjectStore;
@@ -371,11 +371,15 @@ impl WorkerNode {
                     Ok(RowBatch::new(batch.columns, rows))
                 }
                 PhysicalNode::Project { input, exprs } => {
-                    if let PhysicalNode::IcebergScan {
-                        table_name,
-                        pushed_filter: None,
-                        ..
-                    } = input.as_ref()
+                    let has_batch_expr = exprs.iter().any(|e| {
+                        matches!(e, ColumnExpr::RrfScore { .. } | ColumnExpr::AiFunction { .. })
+                    });
+                    if !has_batch_expr
+                        && let PhysicalNode::IcebergScan {
+                            table_name,
+                            pushed_filter: None,
+                            ..
+                        } = input.as_ref()
                         && let Some(vec_proj) = self
                             .try_eval_vectorized_scan_project(table_name, exprs, task)
                             .await?
@@ -384,16 +388,51 @@ impl WorkerNode {
                     }
                     let batch = self.eval_node(input, task).await?;
                     let out_cols: Vec<String> = exprs.iter().map(|e| e.output_name()).collect();
-                    let rows = batch
+                    let mut rows: Vec<BTreeMap<String, ScalarValue>> = batch
                         .rows
-                        .into_iter()
+                        .iter()
                         .map(|r| {
                             exprs
                                 .iter()
-                                .map(|e| (e.output_name(), eval_col_expr(&r, e)))
+                                .map(|e| (e.output_name(), eval_col_expr(r, e)))
                                 .collect()
                         })
                         .collect();
+
+                    // Wave 42: Batch-level Reciprocal Rank Fusion (`RRF(expr1, expr2 [, k])`)
+                    for expr in exprs {
+                        if let ColumnExpr::RrfScore { inputs, k, alias } = expr {
+                            let n = batch.rows.len();
+                            let mut rrf_scores = vec![0.0f64; n];
+                            for inp in inputs {
+                                let mut scored: Vec<(usize, f64)> = batch
+                                    .rows
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, r)| {
+                                        (idx, eval_col_expr(r, inp).as_f64().unwrap_or(f64::NEG_INFINITY))
+                                    })
+                                    .collect();
+                                scored.sort_by(|a, b| {
+                                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                for (rank0, (row_idx, _)) in scored.into_iter().enumerate() {
+                                    let rank = (rank0 + 1) as f64;
+                                    rrf_scores[row_idx] += 1.0 / (*k + rank);
+                                }
+                            }
+                            for (idx, row) in rows.iter_mut().enumerate() {
+                                row.insert(alias.clone(), ScalarValue::Float64(rrf_scores[idx]));
+                            }
+                        } else if let ColumnExpr::AiFunction { func, args, alias } = expr {
+                            for (idx, src_row) in batch.rows.iter().enumerate() {
+                                let arg_vals: Vec<ScalarValue> =
+                                    args.iter().map(|a| eval_col_expr(src_row, a)).collect();
+                                let out_val = eval_ai_function(*func, &arg_vals).await;
+                                rows[idx].insert(alias.clone(), out_val);
+                            }
+                        }
+                    }
                     Ok(RowBatch::new(out_cols, rows))
                 }
                 PhysicalNode::Distinct { input } => {
@@ -472,6 +511,41 @@ impl WorkerNode {
                     offset,
                     is_partial,
                 } => {
+                    // Wave 42: Real Worker-Side HNSW ANN Pushdown!
+                    // Detects `TopN(Project(IcebergScan))` ordered by a `VectorDistance` expression
+                    // and probes each split's persisted `.hnsw.json` proximity graph to prune non-candidate rows!
+                    if *is_partial
+                        && let PhysicalNode::Project {
+                            input: proj_in,
+                            exprs,
+                        } = input.as_ref()
+                        && let PhysicalNode::IcebergScan {
+                            table_name,
+                            pushed_filter: None,
+                            projection,
+                            ..
+                        } = proj_in.as_ref()
+                        && let Some(first_key) = keys.first()
+                        && let Some(ColumnExpr::VectorDistance {
+                            query_vec,
+                            metric,
+                            ..
+                        }) = exprs.iter().find(|e| e.output_name() == first_key.column)
+                        && let Some(hnsw_batch) = self
+                            .try_eval_hnsw_ann_topn(
+                                table_name,
+                                projection,
+                                exprs,
+                                query_vec,
+                                *metric,
+                                keys,
+                                limit.saturating_add(*offset),
+                                task,
+                            )
+                            .await?
+                    {
+                        return Ok(hnsw_batch);
+                    }
                     if *is_partial
                         && let PhysicalNode::IcebergScan {
                             table_name,
@@ -935,6 +1009,7 @@ pub fn eval_col_expr(row: &BTreeMap<String, ScalarValue>, expr: &ColumnExpr) -> 
                         dot / (na * nb)
                     }
                 }
+                VectorMetric::Dot => row_vec.iter().zip(query_vec.iter()).map(|(a, b)| a * b).sum(),
             };
             ScalarValue::Float64(score)
         }
@@ -1246,6 +1321,219 @@ pub fn eval_col_expr(row: &BTreeMap<String, ScalarValue>, expr: &ColumnExpr) -> 
                 "DAY" => d.map(ScalarValue::Int64).unwrap_or(ScalarValue::Null),
                 _ => ScalarValue::Null,
             }
+        }
+        ColumnExpr::RrfScore { alias, .. } | ColumnExpr::AiFunction { alias, .. } => {
+            row.get(alias).cloned().unwrap_or(ScalarValue::Null)
+        }
+    }
+}
+
+/// Evaluates governed in-SQL AI/ML functions (`AI_EMBED`, `AI_COMPLETE`, `AI_CLASSIFY`, `AI_QUERY`, Wave 42).
+/// Routes live inference to any OpenAI-compatible / Gemini / Ollama / vLLM endpoint configured via
+/// `RUSTLAKEDB_AI_ENDPOINT` (+ optional `RUSTLAKEDB_AI_API_KEY`), with a deterministic local semantic
+/// engine fallback for air-gapped dev/testing!
+pub async fn eval_ai_function(func: AiFunc, args: &[ScalarValue]) -> ScalarValue {
+    let endpoint = std::env::var("RUSTLAKEDB_AI_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let api_key = std::env::var("RUSTLAKEDB_AI_API_KEY").ok();
+    let arg_str = |idx: usize| -> String {
+        args.get(idx)
+            .and_then(|v| v.to_pg_text())
+            .unwrap_or_default()
+    };
+
+    match func {
+        AiFunc::Embed => {
+            let text = arg_str(0);
+            let model = args
+                .get(1)
+                .and_then(|v| v.to_pg_text())
+                .unwrap_or_else(|| "text-embedding-3-small".into());
+            if let Some(base) = endpoint {
+                let url = if base.ends_with("/embeddings") {
+                    base
+                } else {
+                    format!("{}/v1/embeddings", base.trim_end_matches('/'))
+                };
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                {
+                    let mut req = client.post(&url).json(&serde_json::json!({
+                        "model": model,
+                        "input": text
+                    }));
+                    if let Some(ref k) = api_key {
+                        req = req.bearer_auth(k);
+                    }
+                    if let Ok(resp) = req.send().await
+                        && resp.status().is_success()
+                        && let Ok(v) = resp.json::<serde_json::Value>().await
+                        && let Some(arr) = v["data"][0]["embedding"].as_array()
+                    {
+                        return ScalarValue::Json(serde_json::Value::Array(arr.clone()));
+                    }
+                }
+            }
+            // Deterministic 8-dim L2-normalized semantic token-hash embedding (air-gapped fallback)
+            let mut vec = [0.0f64; 8];
+            for tok in text
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+            {
+                let h = xxhash_rust::xxh3::xxh3_64(tok.to_lowercase().as_bytes());
+                let bucket = (h as usize) % 8;
+                let sign = if (h >> 8) & 1 == 0 { 1.0 } else { -1.0 };
+                vec[bucket] += sign;
+            }
+            let norm = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > 0.0 {
+                for x in &mut vec {
+                    *x = ((*x / norm) * 10_000.0).round() / 10_000.0;
+                }
+            } else {
+                vec[0] = 1.0;
+            }
+            let arr: Vec<serde_json::Value> = vec
+                .iter()
+                .map(|x| {
+                    serde_json::Number::from_f64(*x)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+            ScalarValue::Json(serde_json::Value::Array(arr))
+        }
+        AiFunc::Complete => {
+            let prompt = arg_str(0);
+            let model = args
+                .get(1)
+                .and_then(|v| v.to_pg_text())
+                .unwrap_or_else(|| "gpt-4o-mini".into());
+            if let Some(base) = endpoint {
+                let url = if base.ends_with("/chat/completions") {
+                    base
+                } else {
+                    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+                };
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                {
+                    let mut req = client.post(&url).json(&serde_json::json!({
+                        "model": model,
+                        "messages": [{ "role": "user", "content": prompt }]
+                    }));
+                    if let Some(ref k) = api_key {
+                        req = req.bearer_auth(k);
+                    }
+                    if let Ok(resp) = req.send().await
+                        && resp.status().is_success()
+                        && let Ok(v) = resp.json::<serde_json::Value>().await
+                        && let Some(txt) = v["choices"][0]["message"]["content"].as_str()
+                    {
+                        return ScalarValue::Utf8(txt.to_string());
+                    }
+                }
+            }
+            ScalarValue::Utf8(format!("[{model}] {}", prompt.trim()))
+        }
+        AiFunc::Classify => {
+            let text = arg_str(0);
+            let labels_raw = arg_str(1);
+            let labels: Vec<&str> = labels_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if labels.is_empty() {
+                return ScalarValue::Null;
+            }
+            if let Some(base) = endpoint {
+                let url = if base.ends_with("/chat/completions") {
+                    base
+                } else {
+                    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+                };
+                let model = args
+                    .get(2)
+                    .and_then(|v| v.to_pg_text())
+                    .unwrap_or_else(|| "gpt-4o-mini".into());
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                {
+                    let mut req = client.post(&url).json(&serde_json::json!({
+                        "model": model,
+                        "messages": [{
+                            "role": "user",
+                            "content": format!("Classify into one of [{}]: {}", labels.join(", "), text)
+                        }]
+                    }));
+                    if let Some(ref k) = api_key {
+                        req = req.bearer_auth(k);
+                    }
+                    if let Ok(resp) = req.send().await
+                        && resp.status().is_success()
+                        && let Ok(v) = resp.json::<serde_json::Value>().await
+                        && let Some(txt) = v["choices"][0]["message"]["content"].as_str()
+                    {
+                        return ScalarValue::Utf8(txt.trim().to_string());
+                    }
+                }
+            }
+            // Local zero-shot lexical match fallback
+            let lower = text.to_lowercase();
+            let mut best = labels[0];
+            let mut best_score = 0usize;
+            for lbl in &labels {
+                let l = lbl.to_lowercase();
+                let sc = if lower.contains(&l) {
+                    10
+                } else {
+                    l.split_whitespace()
+                        .filter(|w| lower.contains(w))
+                        .count()
+                };
+                if sc > best_score {
+                    best_score = sc;
+                    best = lbl;
+                }
+            }
+            ScalarValue::Utf8(best.to_string())
+        }
+        AiFunc::Query => {
+            let target = arg_str(0);
+            let payload_text = arg_str(1);
+            let url = if target.starts_with("http://") || target.starts_with("https://") {
+                Some(target.clone())
+            } else {
+                endpoint.map(|b| format!("{}/{}", b.trim_end_matches('/'), target.trim_start_matches('/')))
+            };
+            if let Some(u) = url
+                && let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+            {
+                let mut req = client.post(&u).json(&serde_json::json!({
+                    "endpoint": target,
+                    "input": payload_text
+                }));
+                if let Some(ref k) = api_key {
+                    req = req.bearer_auth(k);
+                }
+                if let Ok(resp) = req.send().await
+                    && resp.status().is_success()
+                    && let Ok(v) = resp.json::<serde_json::Value>().await
+                {
+                    if let Some(s) = v.get("output").or_else(|| v.get("result")).and_then(|x| x.as_str()) {
+                        return ScalarValue::Utf8(s.to_string());
+                    }
+                    return ScalarValue::Json(v);
+                }
+            }
+            ScalarValue::Utf8(format!("ai_query({target}): {payload_text}"))
         }
     }
 }
@@ -3659,6 +3947,83 @@ impl WorkerNode {
             return Ok(meta);
         }
         self.catalog.get_table(table_name).await
+    }
+
+    /// Wave 42: Worker-Side HNSW ANN Pushdown!
+    /// Probes persisted `.hnsw.json` proximity graphs for each split to prune non-candidate rows
+    /// BEFORE reading Parquet data, then projects `exprs`, ranks by `keys`, and keeps top-`limit`.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_eval_hnsw_ann_topn(
+        &self,
+        table_name: &str,
+        projection: &[String],
+        exprs: &[ColumnExpr],
+        query_vec: &[f64],
+        metric: VectorMetric,
+        keys: &[SortKey],
+        limit: usize,
+        task: &TaskSpec,
+    ) -> Result<Option<RowBatch>> {
+        if task.assigned_splits.is_empty() || limit == 0 {
+            return Ok(None);
+        }
+        let meta = self.resolve_table_meta(task, table_name).await?;
+        let probe_k = limit.saturating_mul(4).max(32);
+        let proj_opt = if projection.is_empty() {
+            None
+        } else {
+            Some(projection)
+        };
+        let mut any_hnsw_hit = false;
+        let mut candidate_rows_all = Vec::new();
+        for split in &task.assigned_splits {
+            let Some(hnsw) = self.store.read_hnsw_index(&split.file_path).await? else {
+                // If any split lacks an HNSW sidecar, fall back to exact scan so results are never partial
+                return Ok(None);
+            };
+            any_hnsw_hit = true;
+            let hits = match metric {
+                VectorMetric::Cosine => hnsw.search_cosine(query_vec, probe_k),
+                VectorMetric::L2 => hnsw.search_l2(query_vec, probe_k),
+                VectorMetric::Dot => hnsw.search_dot(query_vec, probe_k),
+            };
+            let mut bm = RoaringBitmap::new();
+            for (rid, _) in hits {
+                bm.insert(rid);
+            }
+            self.store.hnsw_index_hits.fetch_add(1, Ordering::Relaxed);
+            if bm.is_empty() {
+                continue;
+            }
+            let file_batch = self
+                .store
+                .read_data_file_with_aliases_and_dv(
+                    &split.file_path,
+                    split.dv_path.as_deref(),
+                    &meta.schema,
+                    &meta.column_aliases,
+                    proj_opt,
+                    Some(&bm),
+                )
+                .await?;
+            candidate_rows_all.extend(file_batch.rows);
+        }
+        if !any_hnsw_hit {
+            return Ok(None);
+        }
+        let out_cols: Vec<String> = exprs.iter().map(|e| e.output_name()).collect();
+        let mut projected: Vec<BTreeMap<String, ScalarValue>> = candidate_rows_all
+            .iter()
+            .map(|r| {
+                exprs
+                    .iter()
+                    .map(|e| (e.output_name(), eval_col_expr(r, e)))
+                    .collect()
+            })
+            .collect();
+        sort_rows(&mut projected, keys);
+        projected.truncate(limit);
+        Ok(Some(RowBatch::new(out_cols, projected)))
     }
 
     async fn try_eval_vectorized_topn(

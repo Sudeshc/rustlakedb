@@ -299,11 +299,17 @@ fn column_type_to_iceberg_rest(dt: &ColumnType) -> Value {
         ColumnType::TimestampTz => json!("timestamptz"),
         ColumnType::Decimal { precision, scale } => json!(format!("decimal({precision},{scale})")),
         ColumnType::Variant => json!("string"),
+        ColumnType::Vector(dim) => json!(format!("vector({dim})")),
     }
 }
 
 fn parse_iceberg_rest_type(v: &Value) -> ColumnType {
     let raw = v.as_str().unwrap_or("string").trim().to_lowercase();
+    if let Some(inner) = raw.strip_prefix("vector(").and_then(|s| s.strip_suffix(')'))
+        && let Ok(dim) = inner.trim().parse::<usize>()
+    {
+        return ColumnType::Vector(dim.max(1));
+    }
     if let Some(inner) = raw.strip_prefix("decimal(").and_then(|s| s.strip_suffix(')')) {
         let parts: Vec<&str> = inner.split(',').collect();
         if parts.len() == 2

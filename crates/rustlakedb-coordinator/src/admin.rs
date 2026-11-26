@@ -91,6 +91,9 @@ pub fn build_control_plane_router(coord: Arc<Coordinator>) -> Router {
         .route("/v1/admin/drain", post(admin_drain_http))
         .route("/v1/admin/undrain", post(admin_undrain_http))
         .route("/v1/admin/backup-catalog", post(admin_backup_catalog_http))
+        .route("/v1/ml/models", get(get_ml_models_http))
+        .route("/v1/ml/feature-views", get(get_ml_feature_views_http))
+        .route("/v1/mcp", post(mcp_jsonrpc_http))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(coord)
         .merge(iceberg_rest)
@@ -539,6 +542,7 @@ async fn cluster_status(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
             "cache_hits": coord.store.cache_hits.load(Ordering::Relaxed),
             "files_pruned_by_puffin": coord.store.files_pruned_by_puffin.load(Ordering::Relaxed),
             "files_pruned_by_zonemap": coord.store.files_pruned_by_zonemap.load(Ordering::Relaxed),
+            "hnsw_index_hits": coord.store.hnsw_index_hits.load(Ordering::Relaxed),
             "small_files_total": small_files,
             "total_data_files": total_files,
             "total_data_bytes": total_bytes
@@ -603,6 +607,7 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
     let cache_hits = coord.store.cache_hits.load(Ordering::Relaxed);
     let puffin_pruned = coord.store.files_pruned_by_puffin.load(Ordering::Relaxed);
     let zm_pruned = coord.store.files_pruned_by_zonemap.load(Ordering::Relaxed);
+    let hnsw_hits = coord.store.hnsw_index_hits.load(Ordering::Relaxed);
 
     let (raft_is_leader, raft_term, raft_commit_idx, raft_leader_changes) =
         match coord.catalog.raft_telemetry() {
@@ -721,7 +726,10 @@ async fn prometheus_metrics(State(coord): State<Arc<Coordinator>>) -> Response {
          rustlakedb_puffin_pruned_total {puffin_pruned}\n\
          # HELP rustlakedb_zonemap_pruned_total Files pruned by Liquid Clustering zone-maps\n\
          # TYPE rustlakedb_zonemap_pruned_total counter\n\
-         rustlakedb_zonemap_pruned_total {zm_pruned}\n"
+         rustlakedb_zonemap_pruned_total {zm_pruned}\n\
+         # HELP rustlakedb_hnsw_index_hits_total Worker-side HNSW ANN graph pushdown hits\n\
+         # TYPE rustlakedb_hnsw_index_hits_total counter\n\
+         rustlakedb_hnsw_index_hits_total {hnsw_hits}\n"
     );
 
     (
@@ -1109,6 +1117,275 @@ async fn admin_backup_catalog_http(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn get_ml_models_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    if let Ok(gov) = coord.catalog.get_governance().await {
+        coord.governance.hydrate_from_catalog(gov);
+    }
+    let models = coord.governance.list_models();
+    Json(json!({ "count": models.len(), "models": models }))
+}
+
+async fn get_ml_feature_views_http(State(coord): State<Arc<Coordinator>>) -> Json<Value> {
+    if let Ok(gov) = coord.catalog.get_governance().await {
+        coord.governance.hydrate_from_catalog(gov);
+    }
+    let fvs = coord.governance.list_feature_views();
+    Json(json!({ "count": fvs.len(), "feature_views": fvs }))
+}
+
+/// Governed Model Context Protocol (MCP) JSON-RPC 2.0 Endpoint (`POST /v1/mcp`, Wave 42):
+/// Lets AI agents (Gemini, Claude, LangGraph, CrewAI) discover schemas, run SQL, execute
+/// hybrid BM25+Vector RAG search, and inspect registered ML models while automatically
+/// inheriting the caller's OIDC/JWT RBAC, RLS, Tag-ABAC PII masking, and durable audit trail!
+async fn mcp_jsonrpc_http(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let id = req.get("id").cloned().unwrap_or(json!(1));
+    let fallback_user = headers
+        .get("x-rustlakedb-user")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("postgres");
+    let session = match resolve_http_session(&coord, &headers, fallback_user).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32001, "message": e }
+                })),
+            );
+        }
+    };
+
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    match method {
+        "initialize" => (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "rustlakedb-mcp",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            })),
+        ),
+        "tools/list" => (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "list_tables",
+                            "description": "List all Apache Iceberg v3 tables and views in the RustLakeDB catalog.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        },
+                        {
+                            "name": "describe_table",
+                            "description": "Inspect Iceberg schema, governance tags, file health, and snapshot count for a table.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "table": { "type": "string" } },
+                                "required": ["table"]
+                            }
+                        },
+                        {
+                            "name": "query_sql",
+                            "description": "Execute a governed SQL query inheriting caller RBAC, RLS, column grants, and Tag-ABAC PII masking.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "sql": { "type": "string" },
+                                    "branch": { "type": "string" }
+                                },
+                                "required": ["sql"]
+                            }
+                        },
+                        {
+                            "name": "hybrid_search",
+                            "description": "Run Reciprocal Rank Fusion (RRF) hybrid BM25 + Vector Cosine RAG search over a table.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "table": { "type": "string" },
+                                    "text_column": { "type": "string" },
+                                    "vector_column": { "type": "string" },
+                                    "query_text": { "type": "string" },
+                                    "query_vector": { "type": "string" },
+                                    "limit": { "type": "integer" }
+                                },
+                                "required": ["table", "text_column", "vector_column", "query_text", "query_vector"]
+                            }
+                        },
+                        {
+                            "name": "list_models",
+                            "description": "List registered ML models, lifecycle stages, metrics, and Iceberg training snapshot lineage.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        }
+                    ]
+                }
+            })),
+        ),
+        "tools/call" => {
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let tool_result: std::result::Result<Value, String> = match tool_name {
+                "list_tables" => {
+                    let tables = coord.catalog.list_tables().await.unwrap_or_default();
+                    let views: Vec<String> = coord
+                        .catalog
+                        .list_views()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|v| v.name)
+                        .collect();
+                    Ok(json!({ "tables": tables, "views": views }))
+                }
+                "describe_table" => {
+                    let tbl = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                    match coord.governance.check_access(&session, tbl, "SELECT") {
+                        Err(e) => Err(e.to_string()),
+                        Ok(()) => match coord.catalog.get_table(tbl).await {
+                            Ok(meta) => Ok(json!({
+                                "table": meta.table_name,
+                                "tags": meta.tags,
+                                "snapshots": meta.snapshots.len(),
+                                "schema": meta.schema.iter().map(|f| json!({
+                                    "name": f.name, "type": format!("{:?}", f.data_type), "nullable": f.nullable
+                                })).collect::<Vec<_>>()
+                            })),
+                            Err(e) => Err(e.to_string()),
+                        },
+                    }
+                }
+                "query_sql" => {
+                    let sql = args.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+                    let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
+                    match coord.execute_sql_with_session(sql, branch, &session).await {
+                        Ok(res) => {
+                            let rows: Vec<Vec<Value>> = res
+                                .batch
+                                .rows
+                                .iter()
+                                .map(|r| {
+                                    res.batch
+                                        .columns
+                                        .iter()
+                                        .map(|c| {
+                                            r.get(c)
+                                                .and_then(|v| serde_json::to_value(v).ok())
+                                                .unwrap_or(Value::Null)
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                            Ok(json!({
+                                "command_tag": res.command_tag,
+                                "columns": res.batch.columns,
+                                "rows": rows
+                            }))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                "hybrid_search" => {
+                    let tbl = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                    let tcol = args.get("text_column").and_then(|v| v.as_str()).unwrap_or("body");
+                    let vcol = args.get("vector_column").and_then(|v| v.as_str()).unwrap_or("embedding");
+                    let qtxt = args.get("query_text").and_then(|v| v.as_str()).unwrap_or("").replace('\'', "''");
+                    let qvec = args.get("query_vector").and_then(|v| v.as_str()).unwrap_or("[0.0]");
+                    let lim = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 100);
+                    let sql = format!(
+                        "SELECT *, RRF(BM25_SCORE({tcol}, '{qtxt}'), VECTOR_COSINE({vcol}, '{qvec}')) AS rrf_score FROM {tbl} ORDER BY rrf_score DESC LIMIT {lim}"
+                    );
+                    match coord.execute_sql_with_session(&sql, "main", &session).await {
+                        Ok(res) => Ok(json!({
+                            "columns": res.batch.columns,
+                            "row_count": res.batch.num_rows(),
+                            "rows": res.batch.rows
+                        })),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                "list_models" => {
+                    if let Ok(gov) = coord.catalog.get_governance().await {
+                        coord.governance.hydrate_from_catalog(gov);
+                    }
+                    Ok(json!({ "models": coord.governance.list_models() }))
+                }
+                other => Err(format!("unknown MCP tool: '{other}'")),
+            };
+
+            let outcome = if tool_result.is_ok() { "OK" } else { "DENIED/ERROR" };
+            coord.governance.record_audit(
+                &session.user,
+                &format!("MCP:{tool_name}"),
+                "mcp",
+                outcome,
+            );
+            let _ = coord
+                .catalog
+                .apply_governance(rustlakedb_catalog::GovernanceOp::RecordAudit(
+                    crate::security::make_persisted_audit(
+                        &session,
+                        &format!("MCP:{tool_name}"),
+                        "mcp",
+                        outcome,
+                        "MCP",
+                    ),
+                ))
+                .await;
+
+            match tool_result {
+                Ok(data) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": serde_json::to_string(&data).unwrap_or_default() }],
+                            "data": data,
+                            "isError": false
+                        }
+                    })),
+                ),
+                Err(msg) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": msg }],
+                            "isError": true
+                        }
+                    })),
+                ),
+            }
+        }
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("unsupported MCP method: '{other}'") }
+            })),
         ),
     }
 }

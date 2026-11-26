@@ -314,6 +314,7 @@ canvas.spark { width: 100%; height: 110px; display: block; }
     <button class="nav-btn" data-ws="workload" onclick="switchWs('workload')">&#9889; Workload &amp; Traces</button>
     <button class="nav-btn" data-ws="governance" onclick="switchWs('governance')">&#9878; Governance &amp; Audit</button>
     <button class="nav-btn" data-ws="federation" onclick="switchWs('federation')">&#8644; Federation Hub</button>
+    <button class="nav-btn" data-ws="aiml" onclick="switchWs('aiml')">&#10024; AI &amp; ML Hub</button>
     <button class="nav-btn" data-ws="metrics" onclick="switchWs('metrics')">&#9776; Live Prometheus SLIs</button>
   </nav>
   <div class="sidebar-footer">
@@ -558,7 +559,38 @@ canvas.spark { width: 100%; height: 110px; display: block; }
     </div>
   </section>
 
-  <!-- 7. LIVE PROMETHEUS SLIS & DIAGNOSTICS -->
+  <!-- 7. AI & ML HUB (MODEL REGISTRY, FEATURE VIEWS, HNSW & MCP AGENT GATEWAY) -->
+  <section class="workspace" id="ws-aiml">
+    <div class="kpi-grid">
+      <div class="kpi"><div class="kpi-label">Registered ML Models</div><div class="kpi-val" id="kModels">0</div><div class="kpi-sub">Raft-replicated lineage</div></div>
+      <div class="kpi"><div class="kpi-label">Feature Views</div><div class="kpi-val" id="kFvs">0</div><div class="kpi-sub">Point-in-time ASOF ready</div></div>
+      <div class="kpi"><div class="kpi-label">HNSW ANN Index Hits</div><div class="kpi-val" id="kHnsw">0</div><div class="kpi-sub">Worker-side vector pushdown</div></div>
+      <div class="kpi"><div class="kpi-label">Governed MCP Endpoint</div><div class="kpi-val" style="font-size:15px">POST /v1/mcp</div><div class="kpi-sub">JSON-RPC 2.0 + RBAC/ABAC</div></div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">ML Model Registry (system.models)</h3></div>
+        <div class="table-wrap" id="mlModelsTable"></div>
+      </div>
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">ML Feature Store Views (system.feature_views)</h3></div>
+        <div class="table-wrap" id="mlFvsTable"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Governed MCP Agent Playground (POST /v1/mcp)</h3>
+        <div style="display:flex;gap:8px">
+          <button class="btn sm" onclick="mcpCall('tools/list',{})">List MCP Tools</button>
+          <button class="btn sm sec" onclick="mcpCall('tools/call',{name:'list_tables',arguments:{}})">Call list_tables</button>
+          <button class="btn sm sec" onclick="mcpCall('tools/call',{name:'list_models',arguments:{}})">Call list_models</button>
+        </div>
+      </div>
+      <pre class="code" id="mcpOut">Click a button above to test the governed MCP JSON-RPC 2.0 agent endpoint.</pre>
+    </div>
+  </section>
+
+  <!-- 8. LIVE PROMETHEUS SLIS & DIAGNOSTICS -->
   <section class="workspace" id="ws-metrics">
     <div class="card">
       <div class="card-header">
@@ -1064,10 +1096,35 @@ function renderRawMetrics() {
   document.getElementById('rawMetrics').textContent = lines.join('\n');
 }
 
+async function refreshAiMl() {
+  const [mr, fr] = await Promise.all([
+    fetch('/v1/ml/models', { headers: authHeaders() }),
+    fetch('/v1/ml/feature-views', { headers: authHeaders() })
+  ]);
+  const models = (await mr.json()).models || [];
+  const fvs = (await fr.json()).feature_views || [];
+  document.getElementById('kModels').textContent = models.length;
+  document.getElementById('kFvs').textContent = fvs.length;
+  document.getElementById('kHnsw').textContent = (state.status && state.status.storage && state.status.storage.hnsw_index_hits) || 0;
+  document.getElementById('mlModelsTable').innerHTML = '<table class="tbl"><thead><tr><th>Model</th><th>Ver</th><th>Stage</th><th>Framework</th><th>Dataset@Snap</th><th>Metrics</th></tr></thead><tbody>' +
+    (models.map(m => '<tr><td><b>' + esc(m.name) + '</b></td><td>v' + m.version + '</td><td><span class="pill ' + (m.stage === 'production' ? 'green' : 'blue') + '">' + esc(m.stage) + '</span></td><td>' + esc(m.framework) + '</td><td><code>' + esc(m.training_table || '-') + '@' + (m.training_snapshot_id || '-') + '</code></td><td><code>' + esc(JSON.stringify(m.metrics || {})) + '</code></td></tr>').join('') || '<tr><td colspan="6" style="color:var(--muted)">No models registered yet. Use CREATE MODEL ...</td></tr>') + '</tbody></table>';
+  document.getElementById('mlFvsTable').innerHTML = '<table class="tbl"><thead><tr><th>Feature View</th><th>Entity</th><th>Timestamp</th><th>Source Table</th></tr></thead><tbody>' +
+    (fvs.map(f => '<tr><td><b>' + esc(f.name) + '</b></td><td><code>' + esc(f.entity_key) + '</code></td><td><code>' + esc(f.timestamp_col) + '</code></td><td><code>' + esc(f.source_table) + '</code></td></tr>').join('') || '<tr><td colspan="4" style="color:var(--muted)">No feature views defined yet. Use CREATE FEATURE VIEW ...</td></tr>') + '</tbody></table>';
+}
+async function mcpCall(method, params) {
+  const r = await fetch('/v1/mcp', {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json', 'x-rustlakedb-user': currentUser() }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
+  });
+  document.getElementById('mcpOut').textContent = JSON.stringify(await r.json(), null, 2);
+}
+
 function refreshActiveWorkspace(ws) {
   if (ws === 'workload') refreshWorkload();
   else if (ws === 'governance') refreshGovernance();
   else if (ws === 'federation') refreshFederation();
+  else if (ws === 'aiml') refreshAiMl();
   else if (ws === 'metrics') refreshMetrics();
   else if (ws === 'catalog' && state.selectedTable) inspectTable(state.selectedTable);
 }
