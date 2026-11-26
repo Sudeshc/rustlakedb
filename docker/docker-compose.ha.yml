@@ -4,6 +4,7 @@ services:
   s3-warehouse:
     image: rustfs/rustfs:latest
     container_name: rustlakedb-ha-s3
+    restart: unless-stopped
     environment:
       RUSTFS_ACCESS_KEY: rustlake
       RUSTFS_SECRET_KEY: rustlakesecret
@@ -61,6 +62,9 @@ services:
       RUSTLAKEDB_VENDED_SECRET_KEY: "rustlakesecret"
       RUSTLAKEDB_VENDED_REGION: "us-east-1"
       RUSTLAKEDB_VENDED_ENDPOINT: "http://s3-warehouse:9000"
+      RUSTLAKEDB_CACHE_MB: "64"
+      RUSTLAKEDB_MAX_RETAINED_SNAPSHOTS: "16"
+      RUSTLAKEDB_AUTO_MAINTAIN: "true"
     command:
       - "--mode"
       - "coordinator"
@@ -157,8 +161,9 @@ services:
       retries: 20
 
   nlb:
-    image: haproxy:2.9-alpine
+    image: haproxy:3.0-alpine
     container_name: rustlakedb-ha-nlb
+    restart: unless-stopped
     depends_on:
       coord-1:
         condition: service_healthy
@@ -176,6 +181,7 @@ services:
   worker-ha-1:
     image: rustlakedb:9.0.0
     container_name: rustlakedb-ha-worker-1
+    restart: unless-stopped
     depends_on:
       coord-1:
         condition: service_healthy
@@ -204,6 +210,7 @@ services:
   worker-ha-2:
     image: rustlakedb:9.0.0
     container_name: rustlakedb-ha-worker-2
+    restart: unless-stopped
     depends_on:
       coord-1:
         condition: service_healthy

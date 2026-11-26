@@ -47,6 +47,12 @@ fn now_epoch_ms() -> u64 {
 pub trait WorkerClient: Send + Sync {
     fn id(&self) -> &WorkerId;
     fn is_healthy(&self) -> bool;
+    /// Base HTTP URL if this is a remote `HttpWorkerClient` (used to reuse pooled clients on heartbeat).
+    fn base_url(&self) -> Option<&str> {
+        None
+    }
+    /// Clears any tripped circuit-breaker timestamp when a fresh worker heartbeat arrives.
+    fn reset_health(&self) {}
     async fn execute_task(&self, task: TaskSpec) -> Result<TaskCompletionReport>;
 }
 
@@ -164,6 +170,14 @@ impl WorkerClient for HttpWorkerClient {
 
     fn is_healthy(&self) -> bool {
         now_epoch_ms() >= self.unhealthy_until_ms.load(Ordering::Relaxed)
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
+    fn reset_health(&self) {
+        self.unhealthy_until_ms.store(0, Ordering::Relaxed);
     }
 
     async fn execute_task(&self, task: TaskSpec) -> Result<TaskCompletionReport> {
@@ -693,12 +707,19 @@ impl Coordinator {
     }
 
     /// Dynamically registers or refreshes a remote HTTP worker node at runtime (Wave 7 + Wave 9 TTL).
+    /// Reuses the existing pooled `HttpWorkerClient` when `(worker_id, url)` is unchanged so periodic
+    /// 2-second heartbeats allocate ZERO new `reqwest::Client` / `rustls` RootCertStores!
     pub fn register_worker(&self, worker_id: &str, url: &str) -> usize {
+        let clean_url = url.trim_end_matches('/');
         let mut guard = self.workers.write();
         if let Some(pos) = guard.iter().position(|w| w.id().0 == worker_id) {
-            guard[pos] = Arc::new(HttpWorkerClient::new(worker_id, url));
+            if guard[pos].base_url() == Some(clean_url) {
+                guard[pos].reset_health();
+            } else {
+                guard[pos] = Arc::new(HttpWorkerClient::new(worker_id, clean_url));
+            }
         } else {
-            guard.push(Arc::new(HttpWorkerClient::new(worker_id, url)));
+            guard.push(Arc::new(HttpWorkerClient::new(worker_id, clean_url)));
         }
         self.worker_heartbeats
             .write()

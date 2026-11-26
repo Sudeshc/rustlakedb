@@ -1149,7 +1149,12 @@ impl GovernanceState {
 
     /// Marks an active query as cancelled and removes it from active WLM tracking (Wave 21).
     pub fn cancel_query(&self, query_id: &str) -> bool {
-        self.cancelled_queries.write().insert(query_id.to_string());
+        let mut cancelled = self.cancelled_queries.write();
+        if cancelled.len() >= 1_000 {
+            cancelled.clear();
+        }
+        cancelled.insert(query_id.to_string());
+        drop(cancelled);
         self.active_queries.write().remove(query_id).is_some()
     }
 
@@ -1208,13 +1213,12 @@ impl GovernanceState {
 
     pub fn record_hot_json_path(&self, table: &str, column: &str, path: &str) {
         let key = format!("{column}.{path}");
-        *self
-            .hot_json_paths
-            .write()
-            .entry(table.to_string())
-            .or_default()
-            .entry(key)
-            .or_insert(0) += 1;
+        let mut guard = self.hot_json_paths.write();
+        let map = guard.entry(table.to_string()).or_default();
+        if map.len() >= 128 && !map.contains_key(&key) {
+            return;
+        }
+        *map.entry(key).or_insert(0) += 1;
     }
 
     pub fn hot_json_paths_for(&self, table: &str) -> Vec<String> {

@@ -116,11 +116,20 @@ impl BoundedObjectCache {
         self.used_ram_bytes += len;
         self.entries.insert(key.clone(), bytes);
         self.lru_order.push_back(key);
+        // Compact stale ghost keys in `lru_order` so overwritten/invalidated keys never leak memory
+        if self.lru_order.len() > self.entries.len().saturating_mul(2).saturating_add(64) {
+            let live = &self.entries;
+            self.lru_order.retain(|k| live.contains_key(k));
+        }
     }
 
     fn invalidate(&mut self, key: &str) {
         if let Some(old) = self.entries.remove(key) {
             self.used_ram_bytes = self.used_ram_bytes.saturating_sub(old.len());
+        }
+        if self.lru_order.len() > self.entries.len().saturating_mul(2).saturating_add(64) {
+            let live = &self.entries;
+            self.lru_order.retain(|k| live.contains_key(k));
         }
         if let Some(p) = self.nvme_path(key) {
             let _ = std::fs::remove_file(p);
@@ -206,6 +215,13 @@ impl IcebergObjectStore {
         }
         #[cfg(feature = "cloud")]
         {
+            let cache_bytes = std::env::var("RUSTLAKEDB_CACHE_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64)
+                .max(4)
+                * 1024
+                * 1024;
             if let Some(bucket) = uri.strip_prefix("s3://") {
                 let bucket_name = bucket.split('/').next().unwrap_or(bucket);
                 let s3 = object_store::aws::AmazonS3Builder::from_env()
@@ -215,7 +231,7 @@ impl IcebergObjectStore {
                     .map_err(|e| RustLakeError::Execution(format!("S3 object_store init: {e}")))?;
                 return Ok(Self::with_store(
                     Arc::new(s3),
-                    256 * 1024 * 1024,
+                    cache_bytes,
                     None,
                     Some(format!("s3://{bucket_name}")),
                 ));
@@ -228,7 +244,7 @@ impl IcebergObjectStore {
                     .map_err(|e| RustLakeError::Execution(format!("GCS object_store init: {e}")))?;
                 return Ok(Self::with_store(
                     Arc::new(gcs),
-                    256 * 1024 * 1024,
+                    cache_bytes,
                     None,
                     Some(format!("gs://{bucket_name}")),
                 ));
@@ -241,7 +257,7 @@ impl IcebergObjectStore {
                     .map_err(|e| RustLakeError::Execution(format!("Azure object_store init: {e}")))?;
                 return Ok(Self::with_store(
                     Arc::new(az),
-                    256 * 1024 * 1024,
+                    cache_bytes,
                     None,
                     Some(format!("az://{name}")),
                 ));

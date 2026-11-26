@@ -1,6 +1,9 @@
 // Copyright (C) 2026 Sudeshc
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{Parser, ValueEnum};
 use rustlakedb_catalog::rest::IcebergRestServer;
 use rustlakedb_catalog::InMemoryRaftCatalog;

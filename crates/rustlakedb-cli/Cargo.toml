@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+mimalloc.workspace = true
 reqwest.workspace = true
 rustlakedb-catalog = { path = "../rustlakedb-catalog" }
 rustlakedb-common = { path = "../rustlakedb-common" }

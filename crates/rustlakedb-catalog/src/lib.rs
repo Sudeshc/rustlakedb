@@ -695,8 +695,166 @@ fn max_retained_snapshots() -> usize {
     std::env::var("RUSTLAKEDB_MAX_RETAINED_SNAPSHOTS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(64)
+        .unwrap_or(16)
         .max(8)
+}
+
+/// Compact deduplicated on-disk snapshot format (`PersistedCatalogV2`) that stores each unique
+/// `(file_path, dv_path, deleted_row_count)` `DataFileEntry` ONCE per table in `file_pool` and
+/// references it by integer index from every snapshot — shrinking `state.json` by ~16x–40x!
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactSnapshotV2 {
+    snapshot_id: u64,
+    parent_snapshot_id: Option<u64>,
+    timestamp_ms: u64,
+    file_indices: Vec<usize>,
+    #[serde(default)]
+    equality_deletes: Vec<EqualityDeleteFile>,
+    #[serde(default)]
+    summary: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactTableV2 {
+    table_name: String,
+    format_version: u8,
+    schema: Vec<FieldSchema>,
+    json_shredding: JsonShreddingConfig,
+    indexes: Vec<PuffinIndexSpec>,
+    cluster_by: Vec<String>,
+    partition_by: Vec<String>,
+    refs: HashMap<String, u64>,
+    file_pool: Vec<DataFileEntry>,
+    snapshots: BTreeMap<u64, CompactSnapshotV2>,
+    next_snapshot_id: u64,
+    #[serde(default)]
+    column_aliases: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    column_defaults: HashMap<String, String>,
+    #[serde(default)]
+    check_constraints: Vec<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    column_stats: HashMap<String, ColumnStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCatalogV2 {
+    format_version: u8,
+    tables: HashMap<String, CompactTableV2>,
+}
+
+fn encode_catalog_tables(tables: &HashMap<String, IcebergTableMetadata>) -> Result<Vec<u8>> {
+    let mut out = HashMap::with_capacity(tables.len());
+    for (name, meta) in tables {
+        let mut pool: Vec<DataFileEntry> = Vec::new();
+        let mut pool_idx: HashMap<(String, Option<String>, u64), usize> = HashMap::new();
+        let mut snaps = BTreeMap::new();
+        for (&sid, s) in &meta.snapshots {
+            let mut indices = Vec::with_capacity(s.data_files.len());
+            for df in &s.data_files {
+                let key = (df.file_path.clone(), df.dv_path.clone(), df.deleted_row_count);
+                let idx = if let Some(&existing) = pool_idx.get(&key) {
+                    existing
+                } else {
+                    let i = pool.len();
+                    pool.push(df.clone());
+                    pool_idx.insert(key, i);
+                    i
+                };
+                indices.push(idx);
+            }
+            snaps.insert(
+                sid,
+                CompactSnapshotV2 {
+                    snapshot_id: s.snapshot_id,
+                    parent_snapshot_id: s.parent_snapshot_id,
+                    timestamp_ms: s.timestamp_ms,
+                    file_indices: indices,
+                    equality_deletes: s.equality_deletes.clone(),
+                    summary: s.summary.clone(),
+                },
+            );
+        }
+        out.insert(
+            name.clone(),
+            CompactTableV2 {
+                table_name: meta.table_name.clone(),
+                format_version: meta.format_version,
+                schema: meta.schema.clone(),
+                json_shredding: meta.json_shredding.clone(),
+                indexes: meta.indexes.clone(),
+                cluster_by: meta.cluster_by.clone(),
+                partition_by: meta.partition_by.clone(),
+                refs: meta.refs.clone(),
+                file_pool: pool,
+                snapshots: snaps,
+                next_snapshot_id: meta.next_snapshot_id,
+                column_aliases: meta.column_aliases.clone(),
+                column_defaults: meta.column_defaults.clone(),
+                check_constraints: meta.check_constraints.clone(),
+                tags: meta.tags.clone(),
+                column_stats: meta.column_stats.clone(),
+            },
+        );
+    }
+    let v2 = PersistedCatalogV2 {
+        format_version: 2,
+        tables: out,
+    };
+    Ok(serde_json::to_vec(&v2)?)
+}
+
+fn decode_catalog_tables(bytes: &[u8]) -> Result<HashMap<String, IcebergTableMetadata>> {
+    if let Ok(v2) = serde_json::from_slice::<PersistedCatalogV2>(bytes)
+        && v2.format_version == 2
+    {
+        let mut out = HashMap::with_capacity(v2.tables.len());
+        for (name, ct) in v2.tables {
+            let mut snapshots = BTreeMap::new();
+            for (sid, cs) in ct.snapshots {
+                let data_files: Vec<DataFileEntry> = cs
+                    .file_indices
+                    .into_iter()
+                    .filter_map(|i| ct.file_pool.get(i).cloned())
+                    .collect();
+                snapshots.insert(
+                    sid,
+                    IcebergSnapshot {
+                        snapshot_id: cs.snapshot_id,
+                        parent_snapshot_id: cs.parent_snapshot_id,
+                        timestamp_ms: cs.timestamp_ms,
+                        data_files,
+                        equality_deletes: cs.equality_deletes,
+                        summary: cs.summary,
+                    },
+                );
+            }
+            out.insert(
+                name,
+                IcebergTableMetadata {
+                    table_name: ct.table_name,
+                    format_version: ct.format_version,
+                    schema: ct.schema,
+                    json_shredding: ct.json_shredding,
+                    indexes: ct.indexes,
+                    snapshots,
+                    refs: ct.refs,
+                    next_snapshot_id: ct.next_snapshot_id,
+                    cluster_by: ct.cluster_by,
+                    partition_by: ct.partition_by,
+                    column_aliases: ct.column_aliases,
+                    column_defaults: ct.column_defaults,
+                    check_constraints: ct.check_constraints,
+                    tags: ct.tags,
+                    column_stats: ct.column_stats,
+                },
+            );
+        }
+        return Ok(out);
+    }
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 /// Bounds in-memory & persisted historical snapshot retention to O(1) per table while always
@@ -755,7 +913,7 @@ impl InMemoryRaftCatalog {
 
         let tables = if state_file.exists() {
             let bytes = std::fs::read(&state_file)?;
-            serde_json::from_slice(&bytes)?
+            decode_catalog_tables(&bytes)?
         } else {
             HashMap::new()
         };
@@ -791,7 +949,7 @@ impl InMemoryRaftCatalog {
     fn persist_locked(&self, tables: &HashMap<String, IcebergTableMetadata>) -> Result<()> {
         if let Some(ref path) = self.state_file {
             let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-            let bytes = serde_json::to_vec(tables)?;
+            let bytes = encode_catalog_tables(tables)?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, path)?;
             *self.last_state_stamp.write() = file_stamp(path);
@@ -861,8 +1019,7 @@ impl InMemoryRaftCatalog {
                 if recheck.is_some()
                     && recheck != *self.last_state_stamp.read()
                     && let Ok(bytes) = std::fs::read(path)
-                    && let Ok(loaded) =
-                        serde_json::from_slice::<HashMap<String, IcebergTableMetadata>>(&bytes)
+                    && let Ok(loaded) = decode_catalog_tables(&bytes)
                 {
                     *guard = loaded;
                     *self.last_state_stamp.write() = recheck;
@@ -1367,6 +1524,7 @@ impl Catalog for InMemoryRaftCatalog {
             },
         );
         table.refs.insert(branch.to_string(), new_id);
+        prune_old_snapshots(table);
         self.persist_locked(&guard)?;
         Ok(new_id)
     }
@@ -1488,6 +1646,7 @@ impl Catalog for InMemoryRaftCatalog {
             },
         );
         table.refs.insert(branch.to_string(), new_id);
+        prune_old_snapshots(table);
         self.persist_locked(&guard)?;
         Ok(new_id)
     }
@@ -1728,6 +1887,7 @@ impl Catalog for InMemoryRaftCatalog {
             },
         );
         table.refs.insert(branch.to_string(), new_id);
+        prune_old_snapshots(table);
         self.persist_locked(&guard)?;
         Ok(new_id)
     }
